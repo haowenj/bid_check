@@ -225,7 +225,7 @@ class MinerUClient:
 
     @staticmethod
     def _create_run_dir(output_root: Path, stem: str, input_sha256: str) -> Path:
-        output_dir = Path(output_root) / stem
+        output_dir = Path(output_root).resolve() / stem
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         base = output_dir / f"{timestamp}-{input_sha256[:12]}"

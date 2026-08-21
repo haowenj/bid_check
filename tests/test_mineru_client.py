@@ -133,3 +133,22 @@ def test_parse_docx_preserves_zip_and_manifest_for_each_run(tmp_path: Path):
         b"return_md",
     ):
         assert field in body
+
+
+def test_parse_docx_accepts_relative_output_root(tmp_path: Path, monkeypatch):
+    docx_path = tmp_path / "sample.docx"
+    docx_path.write_bytes(b"PK fake docx input")
+    monkeypatch.chdir(tmp_path)
+    server, thread = _running_server()
+
+    try:
+        artifacts = MinerUClient(
+            f"http://127.0.0.1:{server.server_port}", 30
+        ).parse_docx(Path("sample.docx"), Path("outputs"))
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert artifacts.run_dir.is_absolute()
+    assert json.loads(artifacts.manifest_path.read_text())["status"] == "succeeded"
