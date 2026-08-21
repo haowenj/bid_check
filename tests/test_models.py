@@ -1,6 +1,10 @@
 from bid_check.models import BlockType, DocumentBlock, ImageContent, TableContent
 
 
+def test_block_type_includes_index():
+    assert BlockType.INDEX.value == "index"
+
+
 def test_document_block_serializes_nested_dataclasses_and_enum_values():
     block = DocumentBlock(
         id="doc_abcdef123456_b000000",

@@ -92,7 +92,7 @@ CLI 会打印原始结果目录、标准化文件、各 `block_type` 数量、�
   ],
   "page_idx": null,
   "anchor": null,
-  "source_object_index": null,
+  "source_object_index": 4,
   "source_type": "paragraph",
   "table": null,
   "image": null,
@@ -112,17 +112,19 @@ CLI 会打印原始结果目录、标准化文件、各 `block_type` 数量、�
 }
 ```
 
-支持的 `block_type`：`title`、`paragraph`、`list`、`table`、`image`、`formula`、`code`、`chart`、`header`、`footer`、`page_number`、`footnote`、`aside`、`unknown`。实际 3.4.4 fixture 出现的是 title、paragraph、list、table、image；OMML 没有被识别成 formula，所以普通文本不会被硬映射为公式。
+支持的 `block_type`：`title`、`paragraph`、`list`、`index`、`table`、`image`、`formula`、`code`、`chart`、`header`、`footer`、`page_number`、`footnote`、`aside`、`unknown`。生成的契约 fixture 出现 title、paragraph、list、table、image；真实标书还出现 `index`，其 `list_items` 按原顺序提取，并在 metadata 中写入 `default_rag_eligible=false`。该标记只表达后续默认不进入普通正文 RAG，本阶段没有实现 RAG。OMML 没有被识别成 formula，所以普通文本不会被硬映射为公式。
 
 `section_path` 由标题栈派生：标题自身先进入路径；同级标题替换旧标题；回到上级标题时清除更深层；跳级不虚构缺失祖先。示例中“项目经理应具有……”得到三级路径。
 
 表格使用 `table.html`、`table.caption` 等可用引用，二维 `cells` 在本次 DOCX 输出中为 `null`。图片使用相对于运行目录 `raw/` 的安全路径和说明文字。
 
+`source_object_index` 不是 MinerU DOCX 原生字段，而是项目将所选 content list 过滤前的 `flat_index` 固化到公共 schema；即使空块被过滤，索引也不重排，因此可以唯一定位回原始对象。轻量异常检测只向 `metadata.normalization_warnings` 添加说明，不删除或猜测修正 `text`，完整原始 JSON 也始终保留。
+
 ## MinerU 3.4.4 DOCX 实际结构
 
 完整字段、样例和 DOCX/PDF 差异见：[docs/mineru-docx-output-analysis.md](docs/mineru-docx-output-analysis.md)。关键结论：
 
-- `content_list_v2.json` 是外层组列表，块为 `type + content`，本次没有逐块 `page_idx`、`anchor` 或对象索引。
+- `content_list_v2.json` 是外层组列表，块为 `type + content`，本次没有逐块 `page_idx`、`anchor` 或原生对象索引；项目用展平后的 `flat_index` 填充 `source_object_index`。
 - legacy `content_list.json` 是扁平列表；标题文本带 Markdown `**`，列表/表格/图片字段不同。
 - `middle.json` 使用 `_backend="office"`，保留 `pdf_info → para_blocks → lines → spans`、`page_idx` 和显式 `index`，但不与 v2 按数组位置强行合并。
 - DOCX 表格直接提供 HTML；图片引用的最终扩展名由 MinerU 输出决定，本次 PNG 输入得到 JPG 文件。

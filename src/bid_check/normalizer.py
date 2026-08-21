@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Literal, Sequence
@@ -68,6 +69,7 @@ def normalize_docx_output(raw_dir: Path, document_sha256: str) -> NormalizationR
             if source_json == "content_list_v2"
             else _map_legacy_item(source_item, raw_dir)
         )
+        _detect_text_warnings(candidate)
         if candidate.block_type is BlockType.TITLE:
             if candidate.title_level is not None and candidate.title_level > 0:
                 for level in [key for key in headings if key >= candidate.title_level]:
@@ -75,12 +77,13 @@ def normalize_docx_output(raw_dir: Path, document_sha256: str) -> NormalizationR
                 headings[candidate.title_level] = candidate.text
             else:
                 candidate.warnings.append("invalid title level; heading stack unchanged")
-                global_warnings.append(
-                    f"flat_index {candidate.source_position['flat_index']}: invalid title level"
-                )
         section_path = [headings[level] for level in sorted(headings)]
         if not _is_meaningful(candidate):
             continue
+        global_warnings.extend(
+            f"flat_index {candidate.source_position['flat_index']}: {warning}"
+            for warning in candidate.warnings
+        )
         metadata = {
             "source_format": "docx",
             "source_json": source_json,
@@ -88,6 +91,8 @@ def normalize_docx_output(raw_dir: Path, document_sha256: str) -> NormalizationR
             "normalization_warnings": list(candidate.warnings),
             "unmapped_fields": candidate.unmapped_fields,
         }
+        if candidate.block_type is BlockType.INDEX:
+            metadata["default_rag_eligible"] = False
         candidates.append(
             DocumentBlock(
                 id="",
@@ -199,16 +204,13 @@ def _base_candidate(source_item: SourceItem, source_type: str) -> CandidateBlock
     if isinstance(page_idx, bool) or not isinstance(page_idx, int):
         page_idx = None
     anchor = item.get("anchor") if isinstance(item.get("anchor"), str) else None
-    source_object_index = item.get("source_object_index")
-    if source_object_index is None:
-        source_object_index = item.get("object_index")
     return CandidateBlock(
         block_type=BlockType.UNKNOWN,
         text="",
         title_level=None,
         page_idx=page_idx,
         anchor=anchor,
-        source_object_index=source_object_index,
+        source_object_index=source_item.flat_index,
         source_type=source_type,
         table=None,
         image=None,
@@ -236,18 +238,11 @@ def _map_v2_item(source_item: SourceItem, raw_dir: Path) -> CandidateBlock:
         candidate.block_type = BlockType.PARAGRAPH
         candidate.text = _span_text(content.get("paragraph_content"))
         consumed.add("paragraph_content")
-    elif source_type == "list":
-        candidate.block_type = BlockType.LIST
-        items = content.get("list_items")
-        list_text: list[str] = []
-        if isinstance(items, list):
-            for list_item in items:
-                if not isinstance(list_item, dict):
-                    continue
-                value = _span_text(list_item.get("item_content"))
-                prefix = list_item.get("prefix")
-                list_text.append(f"{prefix} {value}".strip() if prefix else value)
-        candidate.text = "\n".join(filter(None, list_text))
+    elif source_type in {"list", "index"}:
+        candidate.block_type = (
+            BlockType.LIST if source_type == "list" else BlockType.INDEX
+        )
+        candidate.text = _v2_list_items_text(content.get("list_items"))
         consumed.update({"list_type", "attribute", "list_items"})
     elif source_type == "table":
         candidate.block_type = BlockType.TABLE
@@ -298,10 +293,11 @@ def _map_legacy_item(source_item: SourceItem, raw_dir: Path) -> CandidateBlock:
         candidate.title_level = title_level
         candidate.text = _clean_legacy_title(item.get("text", ""))
         consumed = {"type", "text", "text_level", "page_idx", "anchor"}
-    elif source_type == "list":
-        candidate.block_type = BlockType.LIST
-        values = item.get("list_items")
-        candidate.text = "\n".join(value.strip() for value in values if isinstance(value, str)) if isinstance(values, list) else ""
+    elif source_type in {"list", "index"}:
+        candidate.block_type = (
+            BlockType.LIST if source_type == "list" else BlockType.INDEX
+        )
+        candidate.text = _legacy_list_items_text(item.get("list_items"))
         consumed = {"type", "list_items", "page_idx", "anchor"}
     elif source_type == "table":
         candidate.block_type = BlockType.TABLE
@@ -334,6 +330,29 @@ def _positive_int(value: Any) -> int | None:
 
 def _span_text(value: Any) -> str:
     return "".join(_span_text_values(value)).strip()
+
+
+def _v2_list_items_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    lines: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        item_text = _span_text(item.get("item_content"))
+        prefix = item.get("prefix") if isinstance(item.get("prefix"), str) else ""
+        line = f"{prefix}{' ' if prefix and item_text else ''}{item_text}".rstrip()
+        if line.strip():
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _legacy_list_items_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    return "\n".join(
+        item.rstrip() for item in value if isinstance(item, str) and item.strip()
+    )
 
 
 def _span_text_list(value: Any) -> list[str]:
@@ -377,6 +396,36 @@ def _clean_legacy_title(value: Any) -> str:
     text = value.strip() if isinstance(value, str) else ""
     match = _LEGACY_TITLE_MARKDOWN.match(text)
     return match.group("text").strip() if match else text
+
+
+def _detect_text_warnings(candidate: CandidateBlock) -> None:
+    text = candidate.text
+    stripped = text.strip()
+    if (
+        stripped
+        and len(stripped) <= 8
+        and not any(character.isalnum() for character in stripped)
+        and all(
+            unicodedata.category(character)[0] in {"P", "S", "Z"}
+            for character in stripped
+        )
+    ):
+        candidate.warnings.append("text consists only of isolated special symbols")
+
+    if candidate.block_type is not BlockType.TITLE:
+        return
+    suspicious = [
+        character
+        for character in text
+        if character == "\ufffd"
+        or (
+            unicodedata.category(character) in {"Cc", "Cf", "Co", "Cs"}
+            and character not in {"\t", "\n", "\r"}
+        )
+    ]
+    if suspicious:
+        codepoints = ", ".join(f"U+{ord(character):04X}" for character in suspicious)
+        candidate.warnings.append(f"title contains suspicious title characters: {codepoints}")
 
 
 def _normalize_image_path(

@@ -11,6 +11,7 @@ class BlockType(str, Enum):
     TITLE = "title"
     PARAGRAPH = "paragraph"
     LIST = "list"
+    INDEX = "index"
     TABLE = "table"
     IMAGE = "image"
     FORMULA = "formula"

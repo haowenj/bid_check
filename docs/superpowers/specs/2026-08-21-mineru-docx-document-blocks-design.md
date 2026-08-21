@@ -143,7 +143,7 @@ outputs/<docx-stem>/<run-id>/
   ],
   "page_idx": null,
   "anchor": null,
-  "source_object_index": null,
+  "source_object_index": 4,
   "source_type": "paragraph",
   "table": null,
   "image": null,
@@ -172,7 +172,7 @@ outputs/<docx-stem>/<run-id>/
 - `section_path: list[str]`：当前标题层级路径。
 - `page_idx: int | null`：只保留 MinerU 明确给出的页索引。DOCX 分页语义不得由项目自行推断。
 - `anchor: str | null`：只保留 MinerU 明确给出的 anchor。
-- `source_object_index: int | str | null`：只保留 MinerU 明确给出的对象索引，不用转换器顺序冒充。
+- `source_object_index: int | str | null`：DOCX 使用所选 content list 过滤前的展平 `flat_index`，用于唯一定位原始对象。
 - `source_type: str`：MinerU 原始块类型。
 - `table: TableContent | null`：仅表格块使用。
 - `image: ImageContent | null`：图片或图表块使用。
@@ -186,6 +186,7 @@ outputs/<docx-stem>/<run-id>/
 - `title`
 - `paragraph`
 - `list`
+- `index`
 - `table`
 - `image`
 - `formula`
@@ -248,7 +249,7 @@ outputs/<docx-stem>/<run-id>/
 - `item_index`：所在组中的块序号。
 - `flat_index`：过滤前的全局自然块序号。
 
-`source_object_index` 仅使用实测 MinerU 原生字段。如果实际 Office 输出未提供，稳定输出 `null`，并在结构分析文档中记录。
+DOCX 没有稳定的原生对象索引，因此 `source_object_index` 使用所选 content list 过滤前的 `flat_index`；它与 `metadata.source_position.flat_index` 一致，不尝试冒充 middle 的 `index`。
 
 ### 9.3 文本与结构提取
 
@@ -344,7 +345,7 @@ CLI 输入不是存在的 `.docx`、MinerU 不可用、HTTP 请求失败、响�
 - 空文本、空列表、空未知块被过滤。
 - 有内容的表格和图片即使 `text` 为空也保留。
 - 未知但有意义的类型不被删除。
-- 原生对象索引不存在时 `source_object_index=null`，转换顺序只写入 metadata。
+- 原生对象索引不存在时，`source_object_index` 使用所选 content list 过滤前的 `flat_index`，空块过滤后允许有间隙。
 - v2 不可用时回退 legacy；两者都不支持时明确失败。
 
 ### 11.2 契约测试

@@ -36,6 +36,14 @@ def _write_v2(raw_dir: Path, payload: object) -> None:
     )
 
 
+def _write_legacy(raw_dir: Path, payload: object) -> None:
+    office_dir = raw_dir / "office"
+    office_dir.mkdir(parents=True)
+    (office_dir / "sample_content_list.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def test_real_v2_preserves_order_and_section_paths(tmp_path: Path):
     raw_dir = _copy_contract(tmp_path)
 
@@ -72,7 +80,7 @@ def test_real_v2_preserves_order_and_section_paths(tmp_path: Path):
     ]
     assert result.blocks[7].section_path == ["第四章 商务要求"]
     assert all(block.page_idx is None for block in result.blocks)
-    assert all(block.source_object_index is None for block in result.blocks)
+    assert [block.source_object_index for block in result.blocks] == list(range(15))
 
 
 def test_real_v2_preserves_table_image_and_observed_formula_absence(tmp_path: Path):
@@ -173,6 +181,99 @@ def test_neighbor_links_and_ids_are_assigned_after_empty_filtering(tmp_path: Pat
     assert result.blocks[0].next_id == result.blocks[1].id
     assert result.blocks[1].prev_id == result.blocks[0].id
     assert result.blocks[1].next_id is None
+    assert [block.source_object_index for block in result.blocks] == [1, 2]
+
+
+def test_v2_index_is_preserved_with_list_items_and_rag_marker(tmp_path: Path):
+    raw_dir = tmp_path / "raw"
+    _write_v2(
+        raw_dir,
+        [[
+            {
+                "type": "index",
+                "content": {
+                    "list_type": "text_list",
+                    "list_items": [
+                        {
+                            "item_type": "text",
+                            "ilevel": 0,
+                            "prefix": "-",
+                            "item_content": [{"type": "text", "content": "目录"}],
+                        },
+                        {
+                            "item_type": "text",
+                            "ilevel": 1,
+                            "prefix": "    -",
+                            "item_content": [{"type": "text", "content": "13.1"}],
+                        },
+                    ],
+                },
+            }
+        ]],
+    )
+
+    result = normalize_docx_output(raw_dir, "abcdef1234567890")
+
+    assert len(result.blocks) == 1
+    block = result.blocks[0]
+    assert block.block_type is BlockType.INDEX
+    assert block.text == "- 目录\n    - 13.1"
+    assert block.source_object_index == 0
+    assert block.metadata["default_rag_eligible"] is False
+    assert block.metadata["unmapped_fields"] == {}
+
+
+def test_legacy_index_is_preserved_with_list_items(tmp_path: Path):
+    raw_dir = tmp_path / "raw"
+    _write_legacy(
+        raw_dir,
+        [{"type": "index", "list_items": ["- 目录", "    - 13.1"], "page_idx": 0}],
+    )
+
+    result = normalize_docx_output(raw_dir, "abcdef1234567890")
+
+    assert len(result.blocks) == 1
+    block = result.blocks[0]
+    assert block.block_type is BlockType.INDEX
+    assert block.text == "- 目录\n    - 13.1"
+    assert block.source_object_index == 0
+    assert block.metadata["default_rag_eligible"] is False
+
+
+def test_anomalous_text_adds_warnings_without_changing_raw_text(tmp_path: Path):
+    raw_dir = tmp_path / "raw"
+    payload = [[
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [{"type": "text", "content": "※"}]
+            },
+        },
+        {
+            "type": "title",
+            "content": {
+                "title_content": [{"type": "text", "content": "异常\ufffd标题"}],
+                "level": 1,
+            },
+        },
+        {
+            "type": "title",
+            "content": {
+                "title_content": [{"type": "text", "content": "★资格审查资料"}],
+                "level": 1,
+            },
+        },
+    ]]
+    _write_v2(raw_dir, payload)
+
+    result = normalize_docx_output(raw_dir, "abcdef1234567890")
+
+    assert [block.text for block in result.blocks] == ["※", "异常\ufffd标题", "★资格审查资料"]
+    assert any("isolated special symbols" in warning for warning in result.blocks[0].metadata["normalization_warnings"])
+    assert any("suspicious title characters" in warning for warning in result.blocks[1].metadata["normalization_warnings"])
+    assert result.blocks[2].metadata["normalization_warnings"] == []
+    saved_payload = json.loads((raw_dir / "office/sample_content_list_v2.json").read_text())
+    assert saved_payload == payload
 
 
 def test_legacy_content_list_is_fallback_and_strips_heading_markdown(tmp_path: Path):
