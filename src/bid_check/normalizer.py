@@ -49,6 +49,7 @@ class CandidateBlock:
 
 
 _LEGACY_TITLE_MARKDOWN = re.compile(r"^\*\*(?P<text>.*)\*\*$", re.DOTALL)
+_SUSPICIOUS_TITLE_SYMBOLS = frozenset("©®™℗")
 
 
 def normalize_docx_output(raw_dir: Path, document_sha256: str) -> NormalizationResult:
@@ -426,6 +427,15 @@ def _detect_text_warnings(candidate: CandidateBlock) -> None:
     if suspicious:
         codepoints = ", ".join(f"U+{ord(character):04X}" for character in suspicious)
         candidate.warnings.append(f"title contains suspicious title characters: {codepoints}")
+
+    suspicious_symbols = [
+        character for character in text if character in _SUSPICIOUS_TITLE_SYMBOLS
+    ]
+    if suspicious_symbols:
+        codepoints = ", ".join(
+            f"U+{ord(character):04X}" for character in suspicious_symbols
+        )
+        candidate.warnings.append(f"suspicious symbol in title: {codepoints}")
 
 
 def _normalize_image_path(

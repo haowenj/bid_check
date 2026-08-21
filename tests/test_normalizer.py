@@ -276,6 +276,50 @@ def test_anomalous_text_adds_warnings_without_changing_raw_text(tmp_path: Path):
     assert saved_payload == payload
 
 
+def test_title_symbol_warning_is_conservative_and_preserves_raw_text(tmp_path: Path):
+    raw_dir = tmp_path / "raw"
+    payload = [[
+        {
+            "type": "title",
+            "content": {
+                "title_content": [{"type": "text", "content": "19 投标©（无）"}],
+                "level": 1,
+            },
+        },
+        {
+            "type": "title",
+            "content": {
+                "title_content": [{"type": "text", "content": "★资格审查资料"}],
+                "level": 1,
+            },
+        },
+        {
+            "type": "title",
+            "content": {
+                "title_content": [{"type": "text", "content": "【投标文件】（商务）"}],
+                "level": 1,
+            },
+        },
+    ]]
+    _write_v2(raw_dir, payload)
+
+    result = normalize_docx_output(raw_dir, "abcdef1234567890")
+
+    assert [block.text for block in result.blocks] == [
+        "19 投标©（无）",
+        "★资格审查资料",
+        "【投标文件】（商务）",
+    ]
+    assert any(
+        "suspicious symbol in title" in warning
+        for warning in result.blocks[0].metadata["normalization_warnings"]
+    )
+    assert result.blocks[1].metadata["normalization_warnings"] == []
+    assert result.blocks[2].metadata["normalization_warnings"] == []
+    saved_payload = json.loads((raw_dir / "office/sample_content_list_v2.json").read_text())
+    assert saved_payload == payload
+
+
 def test_legacy_content_list_is_fallback_and_strips_heading_markdown(tmp_path: Path):
     raw_dir = _copy_contract(tmp_path, flavor="legacy")
 
