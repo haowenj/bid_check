@@ -44,6 +44,8 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 
 工作流和要求提取链路使用 Python `logging` 输出详细阶段日志。默认启动命令会在终端显示 `start`、`end`、`retry` 和 `error` 事件，包括文件名、批次、数量、模型名和耗时；不会记录 API Key、完整提示词或招标文件原文。重点事件前缀包括 `workflow.*`、`document.parse.*`、`candidate.filter.*`、`compliance.batch.*`、`llm.call.*` 和 `requirements.normalize.*`。
 
+每个任务的招标文件目录下会生成 `compliance_extraction/`：`execution.jsonl` 保存结构化执行事件，`01_parsed_blocks.json`、`02_candidates.json`、`03_batches.json`、`04_raw_requirements.json`、`05_normalized_requirements.json` 保存阶段产物，`llm/call_NNN_input.json` 和 `llm/call_NNN_output.json` 保存每次调用的批次、脱敏请求、原始响应、解析结果、耗时、finish reason、usage 和错误信息，`summary.json` 保存提取统计，`workflow_summary.json` 保存并行解析、复核和整个任务耗时。阶段文件在成功后立即写入，后续失败不会清理已有文件。
+
 ## 测试
 
 ```bash

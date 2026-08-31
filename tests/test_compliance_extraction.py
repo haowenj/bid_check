@@ -8,7 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 import app.compliance_extraction as extraction_module
-
+from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.compliance_extraction import (
     CandidateWindow,
     ComplianceExtractionError,
@@ -451,9 +451,7 @@ def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_pat
 def test_real_extractor_logs_each_pipeline_stage(tmp_path, caplog):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"tender")
-    blocks = [
-        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)
-    ]
+    blocks = [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)]
 
     class FakeParser:
         def parse(self, path):
@@ -524,3 +522,359 @@ def test_openai_compatible_llm_logs_call_start_and_end(monkeypatch, caplog):
     assert any("llm.call.start" in message for message in messages)
     assert any("llm.call.end" in message for message in messages)
     assert all("test-key" not in message for message in messages)
+
+
+def test_openai_compatible_llm_persists_raw_http_exchange(monkeypatch, tmp_path):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "id": "response-1",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"requirements": []}'},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                }
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        return FakeResponse()
+
+    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
+    recorder = ComplianceExtractionRecorder(tmp_path / "task-001")
+    call_id = recorder.start_llm_call(
+        batch_index=1,
+        batch_count=1,
+        attempt=1,
+        model="test-model",
+        batch=[{"block_ids": ["b0001"], "text": "须提供证明材料"}],
+    )
+    llm = extraction_module.OpenAICompatibleLLM(
+        api_key="test-key",
+        model="test-model",
+    )
+    llm.set_call_context(recorder=recorder, call_id=call_id)
+    result = llm.extract([CandidateWindow(["b0001"], "资格", "须提供证明材料", 1)])
+    assert result == []
+    recorder.complete_llm_call(call_id, parsed_requirements=result, elapsed_ms=2)
+
+    input_payload = json.loads(
+        (recorder.artifact_dir / "llm" / f"{call_id}_input.json").read_text()
+    )
+    output_payload = json.loads(
+        (recorder.artifact_dir / "llm" / f"{call_id}_output.json").read_text()
+    )
+    assert input_payload["request_payload"]["model"] == "test-model"
+    assert "Authorization" not in json.dumps(input_payload)
+    assert output_payload["raw_response"]["id"] == "response-1"
+    assert output_payload["finish_reason"] == "stop"
+    assert output_payload["usage"]["total_tokens"] == 18
+
+
+def test_real_extractor_persists_intermediates_and_summary(tmp_path):
+    task_dir = tmp_path / "task-001"
+    tender = task_dir / "tender.docx"
+    task_dir.mkdir()
+    tender.write_bytes(b"tender")
+    blocks = [
+        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1),
+        StructuredBlock("b0002", "paragraph", "须提供营业执照扫描件。", "资格", 2),
+    ]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    class FakeLLM:
+        def extract(self, batch):
+            return [
+                {
+                    "name": "投标人要求",
+                    "category": "required_field",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "投标人名称应填写。",
+                            "check_type": "required_field",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": [batch[0].block_ids[0]],
+                }
+            ]
+
+    recorder = ComplianceExtractionRecorder(task_dir)
+    result = extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=FakeLLM(),
+        recorder=recorder,
+        max_batches=2,
+    )
+
+    artifact_dir = task_dir / "compliance_extraction"
+    assert result
+    for name in (
+        "01_parsed_blocks.json",
+        "02_candidates.json",
+        "03_batches.json",
+        "04_raw_requirements.json",
+        "05_normalized_requirements.json",
+        "summary.json",
+        "execution.jsonl",
+        "llm/call_001_input.json",
+        "llm/call_001_output.json",
+    ):
+        assert (artifact_dir / name).is_file(), name
+
+    parsed = json.loads((artifact_dir / "01_parsed_blocks.json").read_text())
+    candidates = json.loads((artifact_dir / "02_candidates.json").read_text())
+    batches = json.loads((artifact_dir / "03_batches.json").read_text())
+    input_payload = json.loads((artifact_dir / "llm/call_001_input.json").read_text())
+    output = json.loads((artifact_dir / "llm/call_001_output.json").read_text())
+    raw = json.loads((artifact_dir / "04_raw_requirements.json").read_text())
+    normalized = json.loads(
+        (artifact_dir / "05_normalized_requirements.json").read_text()
+    )
+    summary = json.loads((artifact_dir / "summary.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (artifact_dir / "execution.jsonl").read_text().splitlines()
+    ]
+
+    assert len(parsed["blocks"]) == 2
+    assert candidates["window_count"] == 2
+    assert batches["batch_count"] == 2
+    assert input_payload["batch_index"] == 1
+    assert input_payload["batch"]
+    assert output["status"] == "success"
+    assert output["schema_valid"] is True
+    assert output["elapsed_ms"] is not None
+    assert output["parsed_requirements"] == raw["requirements"][:1]
+    assert normalized["requirements"] == result
+    assert summary["status"] == "complete"
+    assert summary["stats"]["llm_total_calls"] == 2
+    assert summary["stats"]["final_requirements"] == len(result)
+    assert summary["stats"]["cache_elapsed_ms"] is not None
+    assert summary["stats"]["parser_elapsed_ms"] is not None
+    assert summary["stats"]["candidate_filter_elapsed_ms"] is not None
+    assert summary["stats"]["batch_build_elapsed_ms"] is not None
+    assert summary["stats"]["normalization_elapsed_ms"] is not None
+    assert summary["stats"]["total_elapsed_ms"] is not None
+    event_names = [event["event"] for event in events]
+    assert "compliance.extract.start" in event_names
+    assert "llm.call.start" in event_names
+    assert "llm.call.end" in event_names
+    assert "compliance.extract.finalize" in event_names
+
+
+def test_real_extractor_keeps_prior_artifacts_when_later_llm_call_fails(tmp_path):
+    task_dir = tmp_path / "task-001"
+    tender = task_dir / "tender.docx"
+    task_dir.mkdir()
+    tender.write_bytes(b"tender")
+    blocks = [
+        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式一", 1),
+        StructuredBlock("b0002", "paragraph", "营业执照须提供。", "格式二", 2),
+    ]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    class FlakyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, batch):
+            self.calls += 1
+            if self.calls == 2:
+                raise ComplianceExtractionError("模拟第二批失败")
+            return [
+                {
+                    "name": "投标人要求",
+                    "category": "required_field",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "投标人名称应填写。",
+                            "check_type": "required_field",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    recorder = ComplianceExtractionRecorder(task_dir)
+    with pytest.raises(ComplianceExtractionError, match="第二批失败"):
+        extract_compliance_requirements_real(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=FakeParser(),
+            llm=FlakyLLM(),
+            recorder=recorder,
+            max_batches=2,
+            max_retries=0,
+        )
+
+    artifact_dir = task_dir / "compliance_extraction"
+    assert (artifact_dir / "01_parsed_blocks.json").is_file()
+    assert (artifact_dir / "02_candidates.json").is_file()
+    assert (artifact_dir / "03_batches.json").is_file()
+    assert (artifact_dir / "llm/call_001_output.json").is_file()
+    assert (artifact_dir / "llm/call_002_output.json").is_file()
+    summary = json.loads((artifact_dir / "summary.json").read_text())
+    assert summary["status"] == "failed"
+    assert summary["failed_stage"] == "llm"
+    assert summary["stats"]["llm_total_calls"] == 2
+    assert "llm.call.error" in (artifact_dir / "execution.jsonl").read_text()
+
+
+def test_real_extractor_records_retry_attempts_and_call_metadata(tmp_path):
+    task_dir = tmp_path / "task-001"
+    tender = task_dir / "tender.docx"
+    task_dir.mkdir()
+    tender.write_bytes(b"tender")
+    blocks = [StructuredBlock("b0001", "paragraph", "须提供营业执照。", "资格", 1)]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    class FlakyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, batch):
+            self.calls += 1
+            if self.calls == 1:
+                try:
+                    raise TimeoutError("temporary")
+                except TimeoutError as exc:
+                    raise ComplianceExtractionError("请求超时") from exc
+            return [
+                {
+                    "name": "资格材料",
+                    "category": "attachment",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "须提供营业执照。",
+                            "check_type": "attachment_exists",
+                            "evidence_type": "structure",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    recorder = ComplianceExtractionRecorder(task_dir)
+    extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=FlakyLLM(),
+        recorder=recorder,
+        max_retries=1,
+    )
+
+    artifact_dir = task_dir / "compliance_extraction"
+    first = json.loads((artifact_dir / "llm/call_001_output.json").read_text())
+    second_input = json.loads((artifact_dir / "llm/call_002_input.json").read_text())
+    second = json.loads((artifact_dir / "llm/call_002_output.json").read_text())
+    summary = json.loads((artifact_dir / "summary.json").read_text())
+    assert first["status"] == "failed"
+    assert first["error_type"] == "ComplianceExtractionError"
+    assert second_input["attempt"] == 2
+    assert second_input["retry"] is True
+    assert second["status"] == "success"
+    assert summary["stats"]["llm_total_calls"] == 2
+    assert summary["stats"]["llm_retries"] == 1
+    assert summary["stats"]["llm_failed_calls"] == 1
+    assert summary["stats"]["schema_valid_calls"] == 1
+
+
+def test_real_extractor_records_requirement_cache_hit(tmp_path):
+    task_dir = tmp_path / "task-001"
+    tender = task_dir / "tender.docx"
+    task_dir.mkdir()
+    tender.write_bytes(b"tender")
+    blocks = [StructuredBlock("b0001", "paragraph", "须提供营业执照。", "资格", 1)]
+
+    class FakeParser:
+        def __init__(self):
+            self.calls = 0
+
+        def parse(self, path):
+            self.calls += 1
+            return blocks
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, batch):
+            self.calls += 1
+            return [
+                {
+                    "name": "资格材料",
+                    "category": "attachment",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "须提供营业执照。",
+                            "check_type": "attachment_exists",
+                            "evidence_type": "structure",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    cache = InMemoryRequirementCache()
+    parser = FakeParser()
+    llm = FakeLLM()
+    metadata = FileMetadata("招标文件.docx", tender.stat().st_size, str(tender))
+    extract_compliance_requirements_real(
+        metadata,
+        parser=parser,
+        llm=llm,
+        cache=cache,
+        recorder=ComplianceExtractionRecorder(task_dir),
+    )
+
+    second_recorder = ComplianceExtractionRecorder(tmp_path / "task-002")
+    result = extract_compliance_requirements_real(
+        metadata,
+        parser=parser,
+        llm=llm,
+        cache=cache,
+        recorder=second_recorder,
+    )
+
+    summary = json.loads((second_recorder.artifact_dir / "summary.json").read_text())
+    raw = json.loads(
+        (second_recorder.artifact_dir / "04_raw_requirements.json").read_text()
+    )
+    assert result
+    assert parser.calls == 1
+    assert llm.calls == 1
+    assert summary["stats"]["cache_hit"] is True
+    assert summary["stats"]["cache_elapsed_ms"] is not None
+    assert raw["source"] == "requirements_cache"

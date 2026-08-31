@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -102,6 +104,13 @@ def test_parallel_stage_failure_is_persisted(
     assert task.error_message == message
     assert task.review_status == "pending"
     assert review_calls == []
+    artifact_dir = Path(task.tender_file.storage_path).parent / "compliance_extraction"
+    workflow_summary = json.loads(
+        (artifact_dir / "workflow_summary.json").read_text(encoding="utf-8")
+    )
+    assert workflow_summary["status"] == "failed"
+    assert workflow_summary["failed_stage"] == failed_stage
+    assert "workflow.stage.error" in (artifact_dir / "execution.jsonl").read_text()
 
 
 def test_both_parallel_failures_are_recorded_without_overwriting_primary_error(
@@ -188,3 +197,37 @@ def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog
         "workflow.run.end status=complete",
     ):
         assert any(event in message for message in messages), event
+
+
+def test_workflow_persists_task_execution_log_and_summary(task_repository):
+    workflow = make_workflow(
+        task_repository,
+        lambda file_metadata: [{"id": "compliance_001"}],
+        lambda file_metadata: {"status": "success"},
+        [],
+    )
+    try:
+        workflow.run("task-001")
+    finally:
+        workflow.shutdown()
+
+    task = task_repository.get("task-001")
+    assert task is not None
+    artifact_dir = Path(task.tender_file.storage_path).parent / "compliance_extraction"
+    events = [
+        json.loads(line)
+        for line in (artifact_dir / "execution.jsonl").read_text().splitlines()
+    ]
+    event_names = [event["event"] for event in events]
+    assert "workflow.run.start" in event_names
+    assert "workflow.stage.end" in event_names
+    assert "workflow.review.end" in event_names
+    assert "workflow.run.end" in event_names
+    summary = json.loads(
+        (artifact_dir / "workflow_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["status"] == "complete"
+    assert summary["stats"]["requirements_elapsed_ms"] is not None
+    assert summary["stats"]["bid_parse_elapsed_ms"] is not None
+    assert summary["stats"]["review_elapsed_ms"] is not None
+    assert summary["stats"]["total_elapsed_ms"] is not None

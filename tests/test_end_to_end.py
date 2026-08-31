@@ -1,7 +1,6 @@
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
-
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
@@ -60,7 +59,10 @@ def test_upload_to_completed_requirements_result(client):
     assert "检查不通过" not in page_response.text
 
 
-def test_upload_valid_tender_extracts_requirements_from_document_text(client):
+def test_upload_valid_tender_extracts_requirements_from_document_text(
+    client,
+    settings,
+):
     files = {
         "tender_file": ("真实招标文件.docx", real_tender_docx(), DOCX_MIME),
         "bid_file": ("投标文件.docx", b"PK\\x03\\x04bid", DOCX_MIME),
@@ -71,9 +73,8 @@ def test_upload_valid_tender_extracts_requirements_from_document_text(client):
         data={"check_mode": "compliance"},
     )
     assert create_response.status_code == 202
-    payload = client.get(
-        f"/api/bid-check/tasks/{create_response.json()['task_id']}"
-    ).json()
+    task_id = create_response.json()["task_id"]
+    payload = client.get(f"/api/bid-check/tasks/{task_id}").json()
 
     assert payload["status"] == "complete"
     assert payload["requirements"]
@@ -83,3 +84,6 @@ def test_upload_valid_tender_extracts_requirements_from_document_text(client):
     assert "投标人名称：____" in source_text
     assert "法定代表人应签字并加盖公章" in source_text
     assert "商务评分" not in source_text
+    artifact_dir = settings.tasks_dir / task_id / "compliance_extraction"
+    assert (artifact_dir / "summary.json").is_file()
+    assert (artifact_dir / "execution.jsonl").is_file()

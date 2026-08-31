@@ -14,15 +14,15 @@ import urllib.request
 import zipfile
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from xml.etree import ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import FileMetadata
-
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 ComplianceRequirement = dict[str, Any]
@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 
 def _elapsed_ms(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
+
+
+def _serialize_blocks(blocks: Sequence[StructuredBlock]) -> list[dict[str, Any]]:
+    return [asdict(block) for block in blocks]
+
+
+def _serialize_candidates(
+    candidates: Sequence[CandidateWindow],
+) -> list[dict[str, Any]]:
+    return [asdict(candidate) for candidate in candidates]
 
 
 @dataclass(frozen=True)
@@ -307,7 +317,9 @@ class MinerUDocumentParser:
     def parse(self, path: Path) -> list[StructuredBlock]:
         started_at = time.perf_counter()
         parser_name = "mineru" if self.command else "docx"
-        logger.info("document.parse.dispatch.start parser=%s file=%s", parser_name, path.name)
+        logger.info(
+            "document.parse.dispatch.start parser=%s file=%s", parser_name, path.name
+        )
         if not self.command:
             blocks = parse_docx_document(path)
             logger.info(
@@ -573,9 +585,7 @@ def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]
         coerced_fields.append("applicability")
     elif isinstance(applicability, dict):
         applicability_copy = dict(applicability)
-        if not applicability_copy.get("type") and applicability_copy.get(
-            "condition"
-        ):
+        if not applicability_copy.get("type") and applicability_copy.get("condition"):
             applicability_copy["type"] = "conditional"
             coerced_fields.append("applicability.type")
         normalized["applicability"] = applicability_copy
@@ -811,6 +821,18 @@ class OpenAICompatibleLLM:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max(256, min(max_tokens, 8192))
+        self._call_context = threading.local()
+
+    def set_call_context(
+        self,
+        *,
+        recorder: ComplianceExtractionRecorder | None,
+        call_id: str | None,
+    ) -> None:
+        self._call_context.value = {"recorder": recorder, "call_id": call_id}
+
+    def _active_call_context(self) -> dict[str, Any]:
+        return getattr(self._call_context, "value", {})
 
     def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
         started_at = time.perf_counter()
@@ -853,11 +875,54 @@ class OpenAICompatibleLLM:
             },
             method="POST",
         )
+        call_context = self._active_call_context()
+        recorder = call_context.get("recorder")
+        call_id = call_context.get("call_id")
+        if recorder is not None and call_id is not None:
+            try:
+                recorder.attach_llm_input(call_id, payload)
+            except Exception as recorder_error:
+                logger.error(
+                    "artifact.llm.input.error call_id=%s error_type=%s",
+                    call_id,
+                    type(recorder_error).__name__,
+                )
         try:
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds
             ) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+                response_text = response.read().decode("utf-8")
+                try:
+                    response_payload = json.loads(response_text)
+                except json.JSONDecodeError:
+                    if recorder is not None and call_id is not None:
+                        try:
+                            recorder.attach_llm_response(
+                                call_id,
+                                raw_response=response_text,
+                            )
+                        except Exception as recorder_error:
+                            logger.error(
+                                "artifact.llm.output.error call_id=%s error_type=%s",
+                                call_id,
+                                type(recorder_error).__name__,
+                            )
+                    raise
+            if recorder is not None and call_id is not None:
+                try:
+                    choice = response_payload.get("choices", [{}])[0]
+                    recorder.attach_llm_response(
+                        call_id,
+                        raw_response=response_payload,
+                        finish_reason=choice.get("finish_reason"),
+                        usage=response_payload.get("usage"),
+                    )
+                except Exception as recorder_error:
+                    logger.error(
+                        "artifact.llm.output.error call_id=%s error_type=%s",
+                        call_id,
+                        type(recorder_error).__name__,
+                    )
             content = response_payload["choices"][0]["message"]["content"]
             decoded = json.loads(content) if isinstance(content, str) else content
             requirements = (
@@ -926,6 +991,7 @@ def extract_compliance_requirements_real(
     parser: DocumentParser | None = None,
     llm: RequirementLLM | None = None,
     cache: RequirementCache | None = None,
+    recorder: ComplianceExtractionRecorder | None = None,
     max_batches: int = 8,
     max_batch_chars: int = 12000,
     max_retries: int = 2,
@@ -940,14 +1006,101 @@ def extract_compliance_requirements_real(
         cache is not None,
         type(llm).__name__ if llm is not None else "default",
     )
+    path = Path(tender_file.storage_path)
+    active_recorder = recorder
+    blocks: list[StructuredBlock] = []
+    candidates: list[CandidateWindow] = []
+    batches: list[list[CandidateWindow]] = []
+    raw_requirements: list[Any] = []
+    successful_call_ids: list[str] = []
+    stats: dict[str, Any] = {
+        "filename": tender_file.filename,
+        "file_size": tender_file.size,
+        "cache_enabled": cache is not None,
+        "cache_kind": "requirements_result",
+        "cache_hit": False,
+        "cache_elapsed_ms": None,
+        "parser": None,
+        "parser_elapsed_ms": None,
+        "candidate_filter_elapsed_ms": None,
+        "batch_build_elapsed_ms": None,
+        "parsed_blocks": 0,
+        "candidate_selected_blocks": 0,
+        "candidate_windows": 0,
+        "batch_count": 0,
+        "llm_model": None,
+        "llm_total_calls": 0,
+        "llm_completed_calls": 0,
+        "llm_failed_calls": 0,
+        "llm_retries": 0,
+        "raw_requirements": 0,
+        "schema_valid_calls": 0,
+        "normalization_elapsed_ms": None,
+        "final_requirements": 0,
+    }
+    current_stage = "initialization"
+    run_status = "failed"
+    failed_stage: str | None = None
+    failure: Exception | None = None
+
+    def record_event(event: str, **fields: Any) -> None:
+        if active_recorder is None:
+            return
+        try:
+            active_recorder.event(event, **fields)
+        except Exception as recorder_error:
+            logger.error(
+                "artifact.event.error event=%s error_type=%s",
+                event,
+                type(recorder_error).__name__,
+            )
+
+    def persist_artifact(name: str, payload: Any) -> None:
+        if active_recorder is None:
+            return
+        try:
+            active_recorder.write_json(name, payload)
+        except Exception as recorder_error:
+            logger.error(
+                "artifact.write.error name=%s error_type=%s",
+                name,
+                type(recorder_error).__name__,
+            )
+
     try:
         if max_retries < 0:
             raise ValueError("max_retries 不能为负数。")
-        path = Path(tender_file.storage_path)
         if not path.is_file():
             raise FileNotFoundError(path)
+        if active_recorder is None:
+            try:
+                active_recorder = ComplianceExtractionRecorder.from_tender_path(path)
+            except OSError as recorder_error:
+                logger.warning(
+                    "artifact.init.error file=%s error_type=%s",
+                    tender_file.filename,
+                    type(recorder_error).__name__,
+                )
+        if active_recorder is not None:
+            stats["artifact_directory"] = str(active_recorder.artifact_dir)
+            stats["task_id"] = active_recorder.task_dir.name
+        record_event(
+            "compliance.extract.start",
+            file=tender_file.filename,
+            max_batches=max_batches,
+            max_batch_chars=max_batch_chars,
+            max_retries=max_retries,
+            cache_enabled=cache is not None,
+        )
 
         cache_key: str | None = None
+        current_stage = "cache_check"
+        cache_started_at = time.perf_counter()
+        record_event(
+            "cache.check.start",
+            kind="requirements_result",
+            enabled=cache is not None,
+        )
         logger.info(
             "cache.check.start file=%s enabled=%s",
             tender_file.filename,
@@ -958,6 +1111,7 @@ def extract_compliance_requirements_real(
             try:
                 cached = cache.get(cache_key)
             except Exception as exc:
+                stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
                 logger.error(
                     "cache.check.error file=%s error_type=%s",
                     tender_file.filename,
@@ -965,6 +1119,8 @@ def extract_compliance_requirements_real(
                 )
                 raise
             if cached is not None:
+                stats["cache_hit"] = True
+                stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
                 logger.info(
                     "cache.check.end file=%s status=hit requirements=%d",
                     tender_file.filename,
@@ -976,20 +1132,74 @@ def extract_compliance_requirements_real(
                     len(cached),
                     _elapsed_ms(started_at),
                 )
+                record_event(
+                    "cache.check.end",
+                    kind="requirements_result",
+                    status="hit",
+                    requirements=len(cached),
+                    elapsed_ms=stats["cache_elapsed_ms"],
+                )
+                persist_artifact(
+                    "04_raw_requirements.json",
+                    {"source": "requirements_cache", "requirements": cached},
+                )
+                persist_artifact(
+                    "05_normalized_requirements.json",
+                    {"source": "requirements_cache", "requirements": cached},
+                )
+                stats["final_requirements"] = len(cached)
+                run_status = "complete"
+                record_event(
+                    "compliance.extract.end",
+                    status="complete",
+                    source="requirements_cache",
+                    requirements=len(cached),
+                    elapsed_ms=_elapsed_ms(started_at),
+                )
                 return cached
+            stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
             logger.info(
                 "cache.check.end file=%s status=miss key=%s",
                 tender_file.filename,
                 cache_key[:12],
             )
+            record_event(
+                "cache.check.end",
+                kind="requirements_result",
+                status="miss",
+                key=cache_key[:12],
+                elapsed_ms=stats["cache_elapsed_ms"],
+            )
         else:
+            stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
             logger.info(
                 "cache.check.end file=%s status=disabled",
                 tender_file.filename,
             )
+            record_event(
+                "cache.check.end",
+                kind="requirements_result",
+                status="disabled",
+                elapsed_ms=stats["cache_elapsed_ms"],
+            )
 
         active_parser = parser or MinerUDocumentParser()
         parser_name = type(active_parser).__name__
+        parser_mode = (
+            "mineru"
+            if isinstance(active_parser, MinerUDocumentParser) and active_parser.command
+            else "docx"
+            if isinstance(active_parser, MinerUDocumentParser)
+            else parser_name
+        )
+        stats["parser"] = parser_mode
+        current_stage = "document_parse"
+        parse_started_at = time.perf_counter()
+        record_event(
+            "document.parse.start",
+            parser=parser_mode,
+            file=tender_file.filename,
+        )
         logger.info(
             "document.parse.start parser=%s file=%s",
             parser_name,
@@ -1001,6 +1211,7 @@ def extract_compliance_requirements_real(
         try:
             blocks = parse_fn(path)  # type: ignore[operator]
         except Exception as exc:
+            stats["parser_elapsed_ms"] = _elapsed_ms(parse_started_at)
             logger.error(
                 "document.parse.error parser=%s file=%s error_type=%s",
                 parser_name,
@@ -1008,6 +1219,23 @@ def extract_compliance_requirements_real(
                 type(exc).__name__,
             )
             raise
+        stats["parser_elapsed_ms"] = _elapsed_ms(parse_started_at)
+        stats["parsed_blocks"] = len(blocks)
+        persist_artifact(
+            "01_parsed_blocks.json",
+            {
+                "filename": tender_file.filename,
+                "parser": parser_mode,
+                "mineru_configured": parser_mode == "mineru",
+                "blocks": _serialize_blocks(blocks),
+            },
+        )
+        record_event(
+            "document.parse.end",
+            parser=parser_mode,
+            blocks=len(blocks),
+            elapsed_ms=stats["parser_elapsed_ms"],
+        )
         logger.info(
             "document.parse.end parser=%s file=%s blocks=%d",
             parser_name,
@@ -1015,15 +1243,44 @@ def extract_compliance_requirements_real(
             len(blocks),
         )
 
+        candidate_started_at = time.perf_counter()
+        record_event("candidate.filter.start")
         try:
             candidates = select_compliance_candidates(blocks)
         except Exception as exc:
+            stats["candidate_filter_elapsed_ms"] = _elapsed_ms(candidate_started_at)
             logger.error(
                 "candidate.filter.error file=%s error_type=%s",
                 tender_file.filename,
                 type(exc).__name__,
             )
             raise
+        stats["candidate_filter_elapsed_ms"] = _elapsed_ms(candidate_started_at)
+        stats["candidate_selected_blocks"] = sum(
+            len(candidate.block_ids) for candidate in candidates
+        )
+        stats["candidate_windows"] = len(candidates)
+        persist_artifact(
+            "02_candidates.json",
+            {
+                "selected_block_count": stats["candidate_selected_blocks"],
+                "window_count": len(candidates),
+                "candidates": _serialize_candidates(candidates),
+            },
+        )
+        record_event(
+            "candidate.filter.end",
+            selected_blocks=stats["candidate_selected_blocks"],
+            windows=len(candidates),
+            elapsed_ms=stats["candidate_filter_elapsed_ms"],
+        )
+        batch_build_started_at = time.perf_counter()
+        record_event(
+            "batch.build.start",
+            candidates=len(candidates),
+            max_batches=max_batches,
+            max_batch_chars=max_batch_chars,
+        )
         try:
             batches = build_candidate_batches(
                 candidates,
@@ -1031,14 +1288,48 @@ def extract_compliance_requirements_real(
                 max_batch_chars=max_batch_chars,
             )
         except Exception as exc:
+            stats["batch_build_elapsed_ms"] = _elapsed_ms(batch_build_started_at)
             logger.error(
                 "batch.build.error file=%s error_type=%s",
                 tender_file.filename,
                 type(exc).__name__,
             )
             raise
+        stats["batch_build_elapsed_ms"] = _elapsed_ms(batch_build_started_at)
+        stats["batch_count"] = len(batches)
+        persist_artifact(
+            "03_batches.json",
+            {
+                "batch_count": len(batches),
+                "max_batches": max_batches,
+                "max_batch_chars": max_batch_chars,
+                "batches": [
+                    {
+                        "index": index,
+                        "candidate_count": len(batch),
+                        "candidate_chars": sum(
+                            len(candidate.text) for candidate in batch
+                        ),
+                        "candidates": _serialize_candidates(batch),
+                    }
+                    for index, batch in enumerate(batches, start=1)
+                ],
+            },
+        )
+        record_event(
+            "batch.build.end",
+            batches=len(batches),
+            candidate_count=len(candidates),
+            elapsed_ms=stats["batch_build_elapsed_ms"],
+        )
         if not batches:
             empty_result: list[dict[str, Any]] = []
+            persist_artifact("04_raw_requirements.json", {"requirements": []})
+            persist_artifact(
+                "05_normalized_requirements.json",
+                {"requirements": empty_result},
+            )
+            current_stage = "cache_write"
             if cache is not None and cache_key is not None:
                 try:
                     cache.set(cache_key, empty_result)
@@ -1049,6 +1340,17 @@ def extract_compliance_requirements_real(
                         type(exc).__name__,
                     )
                     raise
+            stats["raw_requirements"] = 0
+            stats["final_requirements"] = 0
+            run_status = "complete"
+            record_event(
+                "compliance.extract.end",
+                status="complete",
+                candidates=len(candidates),
+                batches=0,
+                requirements=0,
+                elapsed_ms=_elapsed_ms(started_at),
+            )
             logger.info(
                 "compliance.extract.end file=%s status=empty candidates=%d requirements=0 elapsed_ms=%d",
                 tender_file.filename,
@@ -1059,9 +1361,11 @@ def extract_compliance_requirements_real(
 
         active_llm = llm or DeterministicComplianceLLM()
         llm_name = type(active_llm).__name__
+        llm_model = getattr(active_llm, "model", llm_name)
+        stats["llm_model"] = llm_model
         llm_fn = active_llm.extract if hasattr(active_llm, "extract") else active_llm
-        raw_requirements: list[Any] = []
         retries_remaining = min(max_retries, max(0, 10 - len(batches)))
+        current_stage = "llm"
         for batch_index, batch in enumerate(batches, start=1):
             batch_started_at = time.perf_counter()
             logger.info(
@@ -1073,13 +1377,55 @@ def extract_compliance_requirements_real(
                 sum(len(candidate.text) for candidate in batch),
                 retries_remaining,
             )
+            record_event(
+                "compliance.batch.start",
+                index=batch_index,
+                total=len(batches),
+                model=llm_model,
+                candidates=len(batch),
+                chars=sum(len(candidate.text) for candidate in batch),
+                retries_remaining=retries_remaining,
+            )
             attempts = 0
             while True:
                 attempts += 1
+                stats["llm_total_calls"] += 1
+                if attempts > 1:
+                    stats["llm_retries"] += 1
+                call_started_at = time.perf_counter()
+                call_id: str | None = None
+                if active_recorder is not None:
+                    try:
+                        call_id = active_recorder.start_llm_call(
+                            batch_index=batch_index,
+                            batch_count=len(batches),
+                            attempt=attempts,
+                            model=str(llm_model),
+                            batch=_serialize_candidates(batch),
+                        )
+                    except Exception as recorder_error:
+                        logger.error(
+                            "artifact.llm.start.error batch=%d error_type=%s",
+                            batch_index,
+                            type(recorder_error).__name__,
+                        )
+                if isinstance(active_llm, OpenAICompatibleLLM):
+                    active_llm.set_call_context(
+                        recorder=active_recorder,
+                        call_id=call_id,
+                    )
                 try:
                     batch_output = llm_fn(batch)  # type: ignore[operator]
                     break
                 except ComplianceExtractionError as exc:
+                    stats["llm_failed_calls"] += 1
+                    if call_id is not None and active_recorder is not None:
+                        active_recorder.fail_llm_call(
+                            call_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                            elapsed_ms=_elapsed_ms(call_started_at),
+                        )
                     if retries_remaining and _is_transient_extraction_error(exc):
                         retries_remaining -= 1
                         logger.warning(
@@ -1089,6 +1435,14 @@ def extract_compliance_requirements_real(
                             attempts,
                             retries_remaining,
                             type(exc).__name__,
+                        )
+                        record_event(
+                            "compliance.batch.retry",
+                            index=batch_index,
+                            total=len(batches),
+                            attempt=attempts,
+                            retries_remaining=retries_remaining,
+                            error_type=type(exc).__name__,
                         )
                         continue
                     logger.error(
@@ -1100,13 +1454,59 @@ def extract_compliance_requirements_real(
                         _elapsed_ms(batch_started_at),
                     )
                     raise
+                except Exception as exc:
+                    stats["llm_failed_calls"] += 1
+                    if call_id is not None and active_recorder is not None:
+                        active_recorder.fail_llm_call(
+                            call_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                            elapsed_ms=_elapsed_ms(call_started_at),
+                        )
+                    raise
             if isinstance(batch_output, dict):
                 batch_output = batch_output.get("requirements")
             if not isinstance(batch_output, list):
+                if call_id is not None and active_recorder is not None:
+                    active_recorder.complete_llm_call(
+                        call_id,
+                        parsed_requirements=batch_output,
+                        elapsed_ms=_elapsed_ms(call_started_at),
+                    )
+                    active_recorder.mark_llm_schema(
+                        call_id,
+                        valid=False,
+                        error_message="批次结果不是列表",
+                    )
+                stats["llm_failed_calls"] += 1
                 raise ComplianceExtractionError(
                     "LLM Schema 校验失败：批次结果不是列表。"
                 )
+            if call_id is not None and active_recorder is not None:
+                active_recorder.complete_llm_call(
+                    call_id,
+                    parsed_requirements=batch_output,
+                    elapsed_ms=_elapsed_ms(call_started_at),
+                )
+                successful_call_ids.append(call_id)
+            stats["llm_completed_calls"] += 1
             raw_requirements.extend(batch_output)
+            stats["raw_requirements"] = len(raw_requirements)
+            persist_artifact(
+                "04_raw_requirements.json",
+                {
+                    "through_batch": batch_index,
+                    "requirements": raw_requirements,
+                },
+            )
+            record_event(
+                "compliance.batch.end",
+                index=batch_index,
+                total=len(batches),
+                attempts=attempts,
+                requirements=len(batch_output),
+                elapsed_ms=_elapsed_ms(batch_started_at),
+            )
             logger.info(
                 "compliance.batch.end index=%d total=%d attempts=%d requirements=%d elapsed_ms=%d",
                 batch_index,
@@ -1116,15 +1516,59 @@ def extract_compliance_requirements_real(
                 _elapsed_ms(batch_started_at),
             )
 
+        persist_artifact(
+            "04_raw_requirements.json",
+            {"through_batch": len(batches), "requirements": raw_requirements},
+        )
+        current_stage = "requirements_normalize"
+        record_event(
+            "requirements.normalize.start",
+            raw_requirements=len(raw_requirements),
+            source_blocks=len(blocks),
+        )
+        normalization_started_at = time.perf_counter()
         try:
             normalized = _normalize_requirements(raw_requirements, blocks)
         except Exception as exc:
+            stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
+            persist_artifact(
+                "05_normalized_requirements.json",
+                {
+                    "status": "failed",
+                    "requirements": [],
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            for call_id in successful_call_ids:
+                if active_recorder is not None:
+                    active_recorder.mark_llm_schema(
+                        call_id,
+                        valid=False,
+                        error_message=str(exc),
+                    )
             logger.error(
                 "requirements.normalize.error file=%s error_type=%s",
                 tender_file.filename,
                 type(exc).__name__,
             )
             raise
+        stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
+        stats["schema_valid_calls"] = len(successful_call_ids)
+        for call_id in successful_call_ids:
+            if active_recorder is not None:
+                active_recorder.mark_llm_schema(call_id, valid=True)
+        stats["final_requirements"] = len(normalized)
+        persist_artifact(
+            "05_normalized_requirements.json",
+            {"requirements": normalized},
+        )
+        record_event(
+            "requirements.normalize.end",
+            requirements=len(normalized),
+            elapsed_ms=stats["normalization_elapsed_ms"],
+        )
+        current_stage = "cache_write"
         if cache is not None and cache_key is not None:
             try:
                 cache.set(cache_key, normalized)
@@ -1135,6 +1579,16 @@ def extract_compliance_requirements_real(
                     type(exc).__name__,
                 )
                 raise
+        run_status = "complete"
+        record_event(
+            "compliance.extract.end",
+            status="complete",
+            candidates=len(candidates),
+            batches=len(batches),
+            raw_requirements=len(raw_requirements),
+            requirements=len(normalized),
+            elapsed_ms=_elapsed_ms(started_at),
+        )
         logger.info(
             "compliance.extract.end file=%s status=complete candidates=%d batches=%d requirements=%d elapsed_ms=%d",
             tender_file.filename,
@@ -1145,6 +1599,16 @@ def extract_compliance_requirements_real(
         )
         return normalized
     except Exception as exc:
+        failure = exc
+        failed_stage = current_stage
+        run_status = "failed"
+        record_event(
+            "compliance.extract.error",
+            stage=current_stage,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            elapsed_ms=_elapsed_ms(started_at),
+        )
         logger.error(
             "compliance.extract.error file=%s error_type=%s elapsed_ms=%d",
             tender_file.filename,
@@ -1152,6 +1616,26 @@ def extract_compliance_requirements_real(
             _elapsed_ms(started_at),
         )
         raise
+    finally:
+        stats["total_elapsed_ms"] = _elapsed_ms(started_at)
+        stats["raw_requirements"] = len(raw_requirements)
+        if run_status != "complete" and stats["final_requirements"] == 0:
+            stats["final_requirements"] = 0
+        if active_recorder is not None:
+            try:
+                active_recorder.finalize(
+                    status=run_status,
+                    stats=stats,
+                    failed_stage=failed_stage,
+                    error_type=type(failure).__name__ if failure else None,
+                    error_message=str(failure) if failure else None,
+                    elapsed_ms=stats["total_elapsed_ms"],
+                )
+            except Exception as recorder_error:
+                logger.error(
+                    "artifact.finalize.error error_type=%s",
+                    type(recorder_error).__name__,
+                )
 
 
 extract_compliance_requirements = extract_compliance_requirements_real
