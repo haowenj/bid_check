@@ -16,5 +16,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated.*:starlette.exceptions.StarletteDeprecationWarning",
+]
 pythonpath = ["."]
 testpaths = ["tests"]
