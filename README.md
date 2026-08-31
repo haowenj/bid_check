@@ -35,7 +35,7 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 可选环境变量：
 
 - `MINERU_COMMAND`：MinerU 命令模板。命令标准输出应为 JSON 数组，或包含 `blocks`/`content`/`items` 数组；可用 `{input}` 占位符接收输入路径。
-- `LLM_API_KEY`：启用 OpenAI-compatible LLM；同时可设置 `LLM_BASE_URL`、`LLM_MODEL`、`LLM_MAX_TOKENS`、`LLM_TIMEOUT_SECONDS`。
+- `LLM_API_KEY`：启用 OpenAI-compatible LLM；同时可设置 `LLM_BASE_URL`、`LLM_MODEL`、`LLM_MAX_TOKENS`（默认 8192）、`LLM_TIMEOUT_SECONDS`。
 - 项目根目录可放置本地 `.env`，配置项命名与合同审查项目一致；当前真实运行配置使用 DashScope、`LLM_MODEL=qwen3.8-27b` 和 `LLM_ENABLE_THINKING=false`。`.env` 不纳入 Git。
 - `COMPLIANCE_MAX_BATCHES`：候选批次数，范围 1–10，默认 8。
 

@@ -574,7 +574,7 @@ def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
 
     assert result == []
     assert captured["payload"]["enable_thinking"] is False
-    assert captured["payload"]["max_tokens"] <= 8192
+    assert captured["payload"]["max_tokens"] == 8192
     assert captured["timeout"] == 17
     prompt = captured["payload"]["messages"][1]["content"]
     assert "target 必须是对象" in prompt

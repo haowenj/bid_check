@@ -1260,7 +1260,7 @@ class OpenAICompatibleLLM:
         base_url: str = "https://api.openai.com/v1",
         model: str = "gpt-4o-mini",
         timeout_seconds: float = 90,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")

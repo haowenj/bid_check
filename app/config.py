@@ -19,7 +19,7 @@ class Settings:
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
     llm_enable_thinking: bool = False
-    llm_max_tokens: int = 4096
+    llm_max_tokens: int = 8192
     llm_timeout_seconds: float = 90.0
     compliance_max_batches: int = 8
 
@@ -93,7 +93,7 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         or "gpt-4o-mini",
         llm_enable_thinking=_env_bool(project_env, "LLM_ENABLE_THINKING", False),
         llm_max_tokens=int(
-            _env_value(project_env, "LLM_MAX_TOKENS", "4096") or "4096"
+            _env_value(project_env, "LLM_MAX_TOKENS", "8192") or "8192"
         ),
         llm_timeout_seconds=float(
             _env_value(project_env, "LLM_TIMEOUT_SECONDS", "90") or "90"
