@@ -495,6 +495,94 @@ class _RawRequirementModel(BaseModel):
     source_block_ids: list[str] = Field(min_length=1)
 
 
+def _legacy_check_type(requirement: str) -> tuple[str, str]:
+    if _PLACEHOLDER_RE.search(requirement):
+        return "placeholder", "text"
+    if re.search(r"签字", requirement):
+        return "signature", "text"
+    if re.search(r"签章|盖章|公章", requirement):
+        return "seal", "text"
+    if re.search(
+        r"附件|提供|身份证|营业执照|社保|证书|合同|证明材料|复印件|扫描件",
+        requirement,
+    ):
+        return "attachment_exists", "structure"
+    if re.search(r"日期|年.{0,8}月", requirement):
+        return "date", "text"
+    return "required_field", "text"
+
+
+def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    normalized = dict(raw)
+    coerced_fields: list[str] = []
+
+    target = normalized.get("target")
+    if isinstance(target, str):
+        normalized["target"] = {
+            "name": target.strip(),
+            "scope": "single_section",
+        }
+        coerced_fields.append("target")
+    elif isinstance(target, dict):
+        target_copy = dict(target)
+        if not target_copy.get("scope"):
+            target_copy["scope"] = "single_section"
+            coerced_fields.append("target.scope")
+        normalized["target"] = target_copy
+
+    checks = normalized.get("checks")
+    if isinstance(checks, list):
+        normalized_checks: list[Any] = []
+        for check in checks:
+            if isinstance(check, str):
+                requirement = check.strip()
+                check_type, evidence_type = _legacy_check_type(requirement)
+                normalized_checks.append(
+                    {
+                        "requirement": requirement,
+                        "check_type": check_type,
+                        "evidence_type": evidence_type,
+                    }
+                )
+                coerced_fields.append("checks[]")
+                continue
+            if isinstance(check, dict):
+                check_copy = dict(check)
+                requirement = check_copy.get("requirement")
+                if isinstance(requirement, str):
+                    check_type, evidence_type = _legacy_check_type(requirement)
+                    if not check_copy.get("check_type"):
+                        check_copy["check_type"] = check_type
+                        coerced_fields.append("checks[].check_type")
+                    if not check_copy.get("evidence_type"):
+                        check_copy["evidence_type"] = evidence_type
+                        coerced_fields.append("checks[].evidence_type")
+                normalized_checks.append(check_copy)
+                continue
+            normalized_checks.append(check)
+        normalized["checks"] = normalized_checks
+
+    applicability = normalized.get("applicability")
+    if isinstance(applicability, str):
+        condition = applicability.strip()
+        is_always = bool(re.search(r"所有|全部|各投标人|每个投标人", condition))
+        normalized["applicability"] = {
+            "type": "always" if is_always else "conditional",
+            "condition": None if is_always else condition,
+        }
+        coerced_fields.append("applicability")
+    elif isinstance(applicability, dict):
+        applicability_copy = dict(applicability)
+        if not applicability_copy.get("type") and applicability_copy.get(
+            "condition"
+        ):
+            applicability_copy["type"] = "conditional"
+            coerced_fields.append("applicability.type")
+        normalized["applicability"] = applicability_copy
+
+    return normalized, coerced_fields
+
+
 def _coerce_raw_requirement(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ComplianceExtractionError("LLM Schema 校验失败：要求项不是对象。")
@@ -503,6 +591,12 @@ def _coerce_raw_requirement(raw: Any) -> dict[str, Any]:
             **{key: value for key, value in raw.items() if key != "source"},
             "source_block_ids": raw["source"].get("block_ids", []),
         }
+    raw, coerced_fields = _coerce_legacy_shape(raw)
+    if coerced_fields:
+        logger.warning(
+            "requirements.normalize.coerce fields=%s",
+            ",".join(sorted(set(coerced_fields))),
+        )
     try:
         model = _RawRequirementModel.model_validate(raw)
     except ValidationError as exc:
@@ -733,7 +827,9 @@ class OpenAICompatibleLLM:
         prompt = (
             "从以下招标文件候选内容中提取投标文件编制合规要求。只返回 JSON 对象 "
             '{"requirements":[...]}。每项必须包含 name、category、target、checks、'
-            "applicability、source_block_ids；只关注填写、占位符、附件、签字盖章日期、"
+            "applicability、source_block_ids。target 必须是对象，包含 name 和 scope；"
+            "checks 每项必须是对象，包含 requirement、check_type、evidence_type；"
+            "applicability 必须是对象，包含 type 和 condition；只关注填写、占位符、附件、签字盖章日期、"
             "材料关联和文件编制要求，排除评分、得分、评标规则。\n\n" + source
         )
         payload = {

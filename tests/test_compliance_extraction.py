@@ -225,6 +225,56 @@ def test_real_extractor_rejects_invalid_llm_schema(tmp_path):
         )
 
 
+def test_real_extractor_coerces_legacy_string_schema_fields(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"docx")
+
+    class FakeParser:
+        def parse(self, path):
+            return [
+                StructuredBlock(
+                    "b0001",
+                    "paragraph",
+                    "非事业单位须提供营业执照副本扫描件。",
+                    "资格材料",
+                    1,
+                )
+            ]
+
+    class LegacyShapeLLM:
+        def extract(self, batch):
+            return [
+                {
+                    "name": "投标人主体资格证明",
+                    "category": "attachment",
+                    "target": "投标人主体资格证明",
+                    "checks": [
+                        "非事业单位须提供营业执照副本扫描件",
+                        "事业单位须提供法人证书扫描件",
+                    ],
+                    "applicability": "所有投标人",
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    result = extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=LegacyShapeLLM(),
+    )
+
+    assert result[0]["target"] == {
+        "name": "投标人主体资格证明",
+        "scope": "single_section",
+    }
+    assert [check["requirement"] for check in result[0]["checks"]] == [
+        "非事业单位须提供营业执照副本扫描件",
+        "事业单位须提供法人证书扫描件",
+    ]
+    assert result[0]["checks"][0]["check_type"] == "attachment_exists"
+    assert result[0]["applicability"] == {"type": "always", "condition": None}
+
+
 def test_real_extractor_accepts_legacy_source_shape_and_replaces_ids(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"docx")
@@ -343,6 +393,10 @@ def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
     assert captured["payload"]["enable_thinking"] is False
     assert captured["payload"]["max_tokens"] <= 8192
     assert captured["timeout"] == 17
+    prompt = captured["payload"]["messages"][1]["content"]
+    assert "target 必须是对象" in prompt
+    assert "checks 每项必须是对象" in prompt
+    assert "applicability 必须是对象" in prompt
 
 
 def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_path):
