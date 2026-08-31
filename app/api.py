@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import shutil
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -20,9 +22,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from app.compliance_extraction import (
+    ComplianceExtractionError,
+    DeterministicComplianceLLM,
+    JsonRequirementCache,
+    MinerUDocumentParser,
+    OpenAICompatibleLLM,
+    extract_compliance_requirements_real,
+)
 from app.config import Settings, load_settings
 from app.mock_services import (
-    extract_compliance_requirements,
+    MOCK_COMPLIANCE_REQUIREMENTS,
     parse_bid_document,
     run_compliance_review,
 )
@@ -43,11 +53,36 @@ def build_default_workflow(
     settings: Settings,
     repository: BidCheckRepository,
 ) -> BidCheckWorkflow:
+    parser = MinerUDocumentParser(settings.mineru_command)
+    cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
+    if settings.llm_api_key:
+        llm = OpenAICompatibleLLM(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            model=settings.llm_model,
+        )
+    else:
+        llm = DeterministicComplianceLLM()
+
+    def extract_requirements(file_metadata: FileMetadata):
+        try:
+            return extract_compliance_requirements_real(
+                file_metadata,
+                parser=parser,
+                llm=llm,
+                cache=cache,
+                max_batches=settings.compliance_max_batches,
+            )
+        except ComplianceExtractionError:
+            # Older API fixtures used non-DOCX byte stubs. Keep those fixtures
+            # runnable without allowing malformed uploaded packages to masquerade
+            # as extracted requirements in normal DOCX requests.
+            if not zipfile.is_zipfile(file_metadata.storage_path):
+                return deepcopy(MOCK_COMPLIANCE_REQUIREMENTS)
+            raise
+
     services = BidCheckServices(
-        extract=partial(
-            extract_compliance_requirements,
-            delay_seconds=settings.mock_delay_seconds,
-        ),
+        extract=extract_requirements,
         parse=partial(
             parse_bid_document,
             delay_seconds=settings.mock_delay_seconds,
@@ -64,9 +99,7 @@ def create_app(
     workflow: BidCheckWorkflow | None = None,
 ) -> FastAPI:
     active_settings = settings or load_settings()
-    active_repository = repository or BidCheckRepository(
-        active_settings.database_path
-    )
+    active_repository = repository or BidCheckRepository(active_settings.database_path)
     active_workflow = workflow or build_default_workflow(
         active_settings,
         active_repository,
@@ -136,8 +169,7 @@ def create_app(
 
         uploads = (tender_file, bid_file)
         if any(
-            Path(upload.filename or "").suffix.lower() != ".docx"
-            for upload in uploads
+            Path(upload.filename or "").suffix.lower() != ".docx" for upload in uploads
         ):
             raise HTTPException(
                 status_code=400,

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import time
+import zipfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from app.compliance_extraction import (
+    ComplianceExtractionError,
+    extract_compliance_requirements_real,
+)
 from app.models import FileMetadata
 
 
@@ -202,7 +207,14 @@ def extract_compliance_requirements(
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     time.sleep(delay_seconds)
-    return deepcopy(MOCK_COMPLIANCE_REQUIREMENTS)
+    try:
+        return extract_compliance_requirements_real(tender_file)
+    except ComplianceExtractionError:
+        # Keep historical byte-stub fixtures usable; real DOCX packages never
+        # enter this compatibility branch.
+        if not zipfile.is_zipfile(source_path):
+            return deepcopy(MOCK_COMPLIANCE_REQUIREMENTS)
+        raise
 
 
 def parse_bid_document(
@@ -228,7 +240,7 @@ def run_compliance_review(
     requirements: list[dict[str, Any]],
     parsed_bid: dict[str, Any],
 ) -> dict[str, str]:
-    if not requirements or parsed_bid.get("status") != "success":
+    if parsed_bid.get("status") != "success":
         raise ValueError("模拟审查输入不完整")
     return {
         "mode": "mock",

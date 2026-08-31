@@ -12,6 +12,11 @@ class Settings:
     database_path: Path
     tasks_dir: Path
     mock_delay_seconds: float = 0.35
+    mineru_command: str | None = None
+    llm_api_key: str | None = None
+    llm_base_url: str = "https://api.openai.com/v1"
+    llm_model: str = "gpt-4o-mini"
+    compliance_max_batches: int = 8
 
 
 def load_settings(base_dir: Path | None = None) -> Settings:
@@ -27,5 +32,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         database_path=database_path,
         tasks_dir=tasks_dir,
         mock_delay_seconds=float(os.getenv("MOCK_DELAY_SECONDS", "0.35")),
+        mineru_command=os.getenv("MINERU_COMMAND") or None,
+        llm_api_key=os.getenv("LLM_API_KEY") or None,
+        llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        compliance_max_batches=int(os.getenv("COMPLIANCE_MAX_BATCHES", "8")),
     )
-

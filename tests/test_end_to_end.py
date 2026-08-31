@@ -1,6 +1,26 @@
-DOCX_MIME = (
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-)
+from io import BytesIO
+from zipfile import ZIP_DEFLATED, ZipFile
+
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def real_tender_docx() -> bytes:
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+        "<w:r><w:t>第六章 投标文件格式</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>投标人名称：____</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>法定代表人应签字并加盖公章。</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>商务评分满分 20 分。</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output = BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+    return output.getvalue()
 
 
 def docx_files():
@@ -38,3 +58,28 @@ def test_upload_to_completed_requirements_result(client):
     assert "尚未执行真实投标文件内容校验" in page_response.text
     assert "检查通过" not in page_response.text
     assert "检查不通过" not in page_response.text
+
+
+def test_upload_valid_tender_extracts_requirements_from_document_text(client):
+    files = {
+        "tender_file": ("真实招标文件.docx", real_tender_docx(), DOCX_MIME),
+        "bid_file": ("投标文件.docx", b"PK\\x03\\x04bid", DOCX_MIME),
+    }
+    create_response = client.post(
+        "/api/bid-check/tasks",
+        files=files,
+        data={"check_mode": "compliance"},
+    )
+    assert create_response.status_code == 202
+    payload = client.get(
+        f"/api/bid-check/tasks/{create_response.json()['task_id']}"
+    ).json()
+
+    assert payload["status"] == "complete"
+    assert payload["requirements"]
+    source_text = "\n".join(
+        item["source"]["source_text"] for item in payload["requirements"]
+    )
+    assert "投标人名称：____" in source_text
+    assert "法定代表人应签字并加盖公章" in source_text
+    assert "商务评分" not in source_text

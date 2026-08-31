@@ -147,7 +147,7 @@
         <div class="parallel-stages" data-parallel-stages>
           <article class="stage-card status-surface-{{ task.requirements_status }}" data-stage="requirements">
             <span class="stage-number">2</span>
-            <div><strong>提取合规性检查要求</strong><small>从招标文件生成模拟要求</small></div>
+            <div><strong>提取合规性检查要求</strong><small>从招标文件恢复来源并整理要求</small></div>
             {{ status_badge(task.requirements_status) }}
           </article>
           <article class="stage-card status-surface-{{ task.bid_parse_status }}" data-stage="bid_parse">
@@ -183,4 +183,3 @@
     <script src="{{ url_for('static', path='task.js') }}" defer></script>
   {% endif %}
 {% endblock %}
-

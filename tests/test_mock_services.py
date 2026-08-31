@@ -54,3 +54,10 @@ def test_review_returns_disclaimer_without_fake_judgement():
     assert result["message"] == "当前版本尚未执行真实合规性检查"
     assert "passed" not in result
     assert "risk" not in result
+
+
+def test_review_accepts_zero_extracted_requirements_without_fake_judgement():
+    result = run_compliance_review([], {"status": "success"})
+
+    assert result["mode"] == "mock"
+    assert "passed" not in result
