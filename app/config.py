@@ -16,6 +16,8 @@ class Settings:
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
+    llm_max_tokens: int = 4096
+    llm_timeout_seconds: float = 90.0
     compliance_max_batches: int = 8
 
 
@@ -36,5 +38,7 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         llm_api_key=os.getenv("LLM_API_KEY") or None,
         llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
         llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "90")),
         compliance_max_batches=int(os.getenv("COMPLIANCE_MAX_BATCHES", "8")),
     )

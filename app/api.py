@@ -60,6 +60,8 @@ def build_default_workflow(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             model=settings.llm_model,
+            max_tokens=settings.llm_max_tokens,
+            timeout_seconds=settings.llm_timeout_seconds,
         )
     else:
         llm = DeterministicComplianceLLM()

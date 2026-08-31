@@ -257,6 +257,7 @@ class MinerUDocumentParser:
 _EXCLUDED_RE = re.compile(
     r"评分|得分|分值|评标|评审因素|商务评分|技术评分|价格评分|报价评分|综合评分"
 )
+_NOISE_RE = re.compile(r"PAGEREF|_Toc|HYPERLINK|目录")
 _COMPLIANCE_RE = re.compile(
     r"填写|提供|附[：:]|必须|应当|须|不得|签字|签章|盖章|公章|日期|年[　 ]?月|身份证|营业执照|社保|资格证|证书|合同证明|证明材料|复印件|扫描件|业绩|人员名单|人员信息|人员姓名|联系方式|招标编号|项目名称|投标人名称|姓名|委托代理|法定代表|文件大小|附件大小|文件容量|大附件|清晰|可读|上传|加密|CA|电子投标|文件份数|组成|附件|对应|关联|每项|逐一"
 )
@@ -266,7 +267,11 @@ _PLACEHOLDER_RE = re.compile(
 
 
 def _is_candidate_block(block: StructuredBlock) -> bool:
-    if not block.text or _EXCLUDED_RE.search(block.text):
+    if (
+        not block.text
+        or _EXCLUDED_RE.search(block.text)
+        or _NOISE_RE.search(block.text)
+    ):
         return False
     return bool(_COMPLIANCE_RE.search(block.text) or _PLACEHOLDER_RE.search(block.text))
 
@@ -460,6 +465,14 @@ def _normalize_requirements(
     return normalized
 
 
+def _is_transient_extraction_error(error: ComplianceExtractionError) -> bool:
+    cause = error.__cause__
+    return isinstance(
+        cause,
+        (TimeoutError, ConnectionError, OSError, urllib.error.URLError),
+    )
+
+
 class DeterministicComplianceLLM:
     """Local fallback that extracts structured checks directly from candidates.
 
@@ -551,11 +564,13 @@ class OpenAICompatibleLLM:
         base_url: str = "https://api.openai.com/v1",
         model: str = "gpt-4o-mini",
         timeout_seconds: float = 90,
+        max_tokens: int = 4096,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.max_tokens = max(256, min(max_tokens, 8192))
 
     def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
         source = "\n\n".join(
@@ -571,6 +586,8 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.model,
             "temperature": 0,
+            "enable_thinking": False,
+            "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": "你是招标文件合规要求抽取器。"},
@@ -583,6 +600,7 @@ class OpenAICompatibleLLM:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Connection": "close",
             },
             method="POST",
         )
@@ -599,16 +617,24 @@ class OpenAICompatibleLLM:
             if not isinstance(requirements, list):
                 raise ValueError("requirements must be a list")
             return requirements
-        except (
-            OSError,
-            urllib.error.URLError,
-            KeyError,
-            IndexError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as exc:
-            raise ComplianceExtractionError("LLM 合规要求提取失败。") from exc
+        except TimeoutError as exc:
+            raise ComplianceExtractionError("LLM 合规要求提取失败：请求超时。") from exc
+        except urllib.error.HTTPError as exc:
+            raise ComplianceExtractionError(
+                f"LLM 合规要求提取失败：HTTP {exc.code}。"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ComplianceExtractionError(
+                "LLM 合规要求提取失败：网络连接错误。"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise ComplianceExtractionError(
+                "LLM 合规要求提取失败：模型响应不是有效 JSON。"
+            ) from exc
+        except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ComplianceExtractionError(
+                "LLM 合规要求提取失败：响应结构异常。"
+            ) from exc
 
 
 def extract_compliance_requirements_real(
@@ -619,7 +645,10 @@ def extract_compliance_requirements_real(
     cache: RequirementCache | None = None,
     max_batches: int = 8,
     max_batch_chars: int = 12000,
+    max_retries: int = 2,
 ) -> list[dict[str, Any]]:
+    if max_retries < 0:
+        raise ValueError("max_retries 不能为负数。")
     path = Path(tender_file.storage_path)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -646,8 +675,17 @@ def extract_compliance_requirements_real(
     active_llm = llm or DeterministicComplianceLLM()
     llm_fn = active_llm.extract if hasattr(active_llm, "extract") else active_llm
     raw_requirements: list[Any] = []
+    retries_remaining = min(max_retries, max(0, 10 - len(batches)))
     for batch in batches:
-        batch_output = llm_fn(batch)  # type: ignore[operator]
+        while True:
+            try:
+                batch_output = llm_fn(batch)  # type: ignore[operator]
+                break
+            except ComplianceExtractionError as exc:
+                if retries_remaining and _is_transient_extraction_error(exc):
+                    retries_remaining -= 1
+                    continue
+                raise
         if isinstance(batch_output, dict):
             batch_output = batch_output.get("requirements")
         if not isinstance(batch_output, list):

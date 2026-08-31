@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+
+import app.compliance_extraction as extraction_module
 
 from app.compliance_extraction import (
     CandidateWindow,
@@ -94,6 +97,25 @@ def test_candidate_selection_keeps_compliance_and_excludes_scoring_text():
     assert len(candidates) == 1
     assert candidates[0].block_ids == ["b0004", "b0005"]
     assert "评分" not in candidates[0].text
+
+
+def test_candidate_selection_drops_table_of_contents_field_codes():
+    blocks = [
+        StructuredBlock(
+            "b0001",
+            "paragraph",
+            "3.1 投标文件的组成 PAGEREF _Toc123 \\h 26",
+            "目录",
+            1,
+        ),
+        StructuredBlock(
+            "b0002", "paragraph", "投标文件应加盖公章。", "投标文件格式", 2
+        ),
+    ]
+
+    candidates = select_compliance_candidates(blocks)
+
+    assert [candidate.block_ids for candidate in candidates] == [["b0002"]]
 
 
 def test_candidate_batches_are_bounded_to_eight_by_default():
@@ -290,3 +312,82 @@ def test_real_extractor_caches_source_grounded_result(tmp_path):
 
     assert first == second
     assert llm.calls == 1
+
+
+def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": '{"requirements": []}'}}]}
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode())
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
+    llm = extraction_module.OpenAICompatibleLLM(api_key="test-key", timeout_seconds=17)
+    result = llm.extract([CandidateWindow(["b0001"], "格式", "投标人名称应填写。", 1)])
+
+    assert result == []
+    assert captured["payload"]["enable_thinking"] is False
+    assert captured["payload"]["max_tokens"] <= 8192
+    assert captured["timeout"] == 17
+
+
+def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"tender")
+    blocks = [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    class FlakyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, batch):
+            self.calls += 1
+            if self.calls == 1:
+                try:
+                    raise TimeoutError("temporary timeout")
+                except TimeoutError as exc:
+                    raise ComplianceExtractionError("请求超时") from exc
+            return [
+                {
+                    "name": "投标人信息",
+                    "category": "required_field",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "投标人名称应填写。",
+                            "check_type": "required_field",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    llm = FlakyLLM()
+    result = extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=llm,
+        max_retries=1,
+    )
+
+    assert result[0]["name"] == "投标人信息"
+    assert llm.calls == 2
