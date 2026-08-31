@@ -1,0 +1,1 @@
+"""Bid check web application."""
