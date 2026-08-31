@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import shutil
+import uuid
+from contextlib import asynccontextmanager
+from functools import partial
+from pathlib import Path
+from typing import Literal
+
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
+
+from app.config import Settings, load_settings
+from app.mock_services import (
+    extract_compliance_requirements,
+    parse_bid_document,
+    run_compliance_review,
+)
+from app.models import FileMetadata
+from app.repository import BidCheckRepository
+from app.workflow import BidCheckServices, BidCheckWorkflow
+
+
+CheckModeInput = Literal["compliance", "evaluation", "full"]
+
+
+def build_default_workflow(
+    settings: Settings,
+    repository: BidCheckRepository,
+) -> BidCheckWorkflow:
+    services = BidCheckServices(
+        extract=partial(
+            extract_compliance_requirements,
+            delay_seconds=settings.mock_delay_seconds,
+        ),
+        parse=partial(
+            parse_bid_document,
+            delay_seconds=settings.mock_delay_seconds,
+        ),
+        review=run_compliance_review,
+    )
+    return BidCheckWorkflow(repository, services)
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    repository: BidCheckRepository | None = None,
+    workflow: BidCheckWorkflow | None = None,
+) -> FastAPI:
+    active_settings = settings or load_settings()
+    active_repository = repository or BidCheckRepository(
+        active_settings.database_path
+    )
+    active_workflow = workflow or build_default_workflow(
+        active_settings,
+        active_repository,
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        yield
+        active_workflow.shutdown()
+
+    application = FastAPI(title="标书检查", lifespan=lifespan)
+    application.state.settings = active_settings
+    application.state.repository = active_repository
+    application.state.workflow = active_workflow
+
+    @application.post("/api/bid-check/tasks", status_code=202)
+    async def create_bid_check_task(
+        background_tasks: BackgroundTasks,
+        tender_file: UploadFile = File(...),
+        bid_file: UploadFile = File(...),
+        check_mode: CheckModeInput = Form(...),
+    ):
+        if check_mode != "compliance":
+            raise HTTPException(
+                status_code=409,
+                detail="该校验方式正在开发中。",
+            )
+
+        uploads = (tender_file, bid_file)
+        if any(
+            Path(upload.filename or "").suffix.lower() != ".docx"
+            for upload in uploads
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="当前仅支持 .docx 文件。",
+            )
+
+        tender_content = await tender_file.read()
+        bid_content = await bid_file.read()
+        if not tender_content or not bid_content:
+            raise HTTPException(status_code=400, detail="上传文件不能为空。")
+
+        task_id = str(uuid.uuid4())
+        task_dir = active_settings.tasks_dir / task_id
+        tender_path = task_dir / "tender.docx"
+        bid_path = task_dir / "bid.docx"
+        try:
+            task_dir.mkdir(parents=True, exist_ok=False)
+            tender_path.write_bytes(tender_content)
+            bid_path.write_bytes(bid_content)
+            task = active_repository.create(
+                task_id=task_id,
+                tender_file=FileMetadata(
+                    filename=Path(tender_file.filename or "tender.docx").name,
+                    size=len(tender_content),
+                    storage_path=str(tender_path),
+                ),
+                bid_file=FileMetadata(
+                    filename=Path(bid_file.filename or "bid.docx").name,
+                    size=len(bid_content),
+                    storage_path=str(bid_path),
+                ),
+                check_mode=check_mode,
+            )
+        except Exception as exc:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=500,
+                detail="创建任务失败，请稍后重试。",
+            ) from exc
+
+        background_tasks.add_task(active_workflow.run, task_id)
+        return task.to_dict()
+
+    @application.get("/api/bid-check/tasks/{task_id}")
+    def get_bid_check_task(task_id: str):
+        task = active_repository.get(task_id)
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail="标书检查任务不存在。",
+            )
+        return task.to_dict()
+
+    return application
+
