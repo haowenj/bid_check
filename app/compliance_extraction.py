@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -24,6 +26,11 @@ from app.models import FileMetadata
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 ComplianceRequirement = dict[str, Any]
+logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
 
 
 @dataclass(frozen=True)
@@ -67,11 +74,27 @@ class InMemoryRequirementCache:
         self._values: dict[str, list[dict[str, Any]]] = {}
 
     def get(self, key: str) -> list[dict[str, Any]] | None:
+        logger.info("cache.read.start backend=in_memory key=%s", key[:12])
         value = self._values.get(key)
+        logger.info(
+            "cache.read.end backend=in_memory key=%s status=%s",
+            key[:12],
+            "hit" if value is not None else "miss",
+        )
         return deepcopy(value) if value is not None else None
 
     def set(self, key: str, value: list[dict[str, Any]]) -> None:
+        logger.info(
+            "cache.write.start backend=in_memory key=%s requirements=%d",
+            key[:12],
+            len(value),
+        )
         self._values[key] = deepcopy(value)
+        logger.info(
+            "cache.write.end backend=in_memory key=%s requirements=%d",
+            key[:12],
+            len(value),
+        )
 
 
 class JsonRequirementCache:
@@ -83,19 +106,46 @@ class JsonRequirementCache:
         return self.directory / f"{key}.json"
 
     def get(self, key: str) -> list[dict[str, Any]] | None:
+        started_at = time.perf_counter()
+        logger.info("cache.read.start backend=json key=%s", key[:12])
         try:
             payload = json.loads(self._path(key).read_text(encoding="utf-8"))
         except FileNotFoundError, OSError, json.JSONDecodeError:
+            logger.info(
+                "cache.read.end backend=json key=%s status=miss elapsed_ms=%d",
+                key[:12],
+                _elapsed_ms(started_at),
+            )
             return None
-        return deepcopy(payload) if isinstance(payload, list) else None
+        value = deepcopy(payload) if isinstance(payload, list) else None
+        logger.info(
+            "cache.read.end backend=json key=%s status=%s requirements=%d elapsed_ms=%d",
+            key[:12],
+            "hit" if value is not None else "miss",
+            len(value) if value is not None else 0,
+            _elapsed_ms(started_at),
+        )
+        return value
 
     def set(self, key: str, value: list[dict[str, Any]]) -> None:
+        started_at = time.perf_counter()
+        logger.info(
+            "cache.write.start backend=json key=%s requirements=%d",
+            key[:12],
+            len(value),
+        )
         target = self._path(key)
         temporary = target.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
         temporary.write_text(
             json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(temporary, target)
+        logger.info(
+            "cache.write.end backend=json key=%s requirements=%d elapsed_ms=%d",
+            key[:12],
+            len(value),
+            _elapsed_ms(started_at),
+        )
 
 
 def _element_text(element: ElementTree.Element) -> str:
@@ -126,10 +176,18 @@ def parse_docx_document(path: Path) -> list[StructuredBlock]:
     configured.  It deliberately does not infer compliance semantics.
     """
 
+    started_at = time.perf_counter()
+    logger.info("document.parse.start parser=docx file=%s", path.name)
     try:
         with zipfile.ZipFile(path) as archive:
             root = ElementTree.fromstring(archive.read("word/document.xml"))
     except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        logger.error(
+            "document.parse.error parser=docx file=%s error_type=%s elapsed_ms=%d",
+            path.name,
+            type(exc).__name__,
+            _elapsed_ms(started_at),
+        )
         raise ComplianceExtractionError(f"无法解析招标文件结构：{path.name}") from exc
 
     blocks: list[StructuredBlock] = []
@@ -137,6 +195,11 @@ def parse_docx_document(path: Path) -> list[StructuredBlock]:
     order = 0
     body = root.find(f"{W_NS}body")
     if body is None:
+        logger.info(
+            "document.parse.end parser=docx file=%s blocks=0 elapsed_ms=%d",
+            path.name,
+            _elapsed_ms(started_at),
+        )
         return blocks
 
     for child in body:
@@ -178,6 +241,12 @@ def parse_docx_document(path: Path) -> list[StructuredBlock]:
                         metadata={"rows": len(rows)},
                     )
                 )
+    logger.info(
+        "document.parse.end parser=docx file=%s blocks=%d elapsed_ms=%d",
+        path.name,
+        len(blocks),
+        _elapsed_ms(started_at),
+    )
     return blocks
 
 
@@ -236,8 +305,19 @@ class MinerUDocumentParser:
         self.command = command if command is not None else os.getenv("MINERU_COMMAND")
 
     def parse(self, path: Path) -> list[StructuredBlock]:
+        started_at = time.perf_counter()
+        parser_name = "mineru" if self.command else "docx"
+        logger.info("document.parse.dispatch.start parser=%s file=%s", parser_name, path.name)
         if not self.command:
-            return parse_docx_document(path)
+            blocks = parse_docx_document(path)
+            logger.info(
+                "document.parse.dispatch.end parser=%s file=%s blocks=%d elapsed_ms=%d",
+                parser_name,
+                path.name,
+                len(blocks),
+                _elapsed_ms(started_at),
+            )
+            return blocks
         command = [part.format(input=str(path)) for part in shlex.split(self.command)]
         if "{input}" not in self.command:
             command.append(str(path))
@@ -249,8 +329,23 @@ class MinerUDocumentParser:
                 text=True,
                 timeout=300,
             )
-            return _blocks_from_mineru_payload(json.loads(completed.stdout))
+            blocks = _blocks_from_mineru_payload(json.loads(completed.stdout))
+            logger.info(
+                "document.parse.dispatch.end parser=%s file=%s blocks=%d elapsed_ms=%d",
+                parser_name,
+                path.name,
+                len(blocks),
+                _elapsed_ms(started_at),
+            )
+            return blocks
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            logger.error(
+                "document.parse.dispatch.error parser=%s file=%s error_type=%s elapsed_ms=%d",
+                parser_name,
+                path.name,
+                type(exc).__name__,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError("MinerU 文档解析失败。") from exc
 
 
@@ -279,12 +374,18 @@ def _is_candidate_block(block: StructuredBlock) -> bool:
 def select_compliance_candidates(
     blocks: Iterable[StructuredBlock],
 ) -> list[CandidateWindow]:
+    started_at = time.perf_counter()
+    logger.info("candidate.filter.start")
     selected = [
         block
         for block in sorted(blocks, key=lambda item: item.order)
         if _is_candidate_block(block)
     ]
     if not selected:
+        logger.info(
+            "candidate.filter.end selected_blocks=0 windows=0 elapsed_ms=%d",
+            _elapsed_ms(started_at),
+        )
         return []
 
     windows: list[CandidateWindow] = []
@@ -315,6 +416,12 @@ def select_compliance_candidates(
         current.append(block)
         previous = block
     flush()
+    logger.info(
+        "candidate.filter.end selected_blocks=%d windows=%d elapsed_ms=%d",
+        len(selected),
+        len(windows),
+        _elapsed_ms(started_at),
+    )
     return windows
 
 
@@ -324,9 +431,17 @@ def build_candidate_batches(
     max_batches: int = 8,
     max_batch_chars: int = 12000,
 ) -> list[list[CandidateWindow]]:
+    started_at = time.perf_counter()
+    logger.info(
+        "batch.build.start candidates=%d max_batches=%d max_batch_chars=%d",
+        len(candidates),
+        max_batches,
+        max_batch_chars,
+    )
     if max_batches < 1 or max_batches > 10:
         raise ValueError("max_batches 必须在 1 到 10 之间。")
     if not candidates:
+        logger.info("batch.build.end batches=0 elapsed_ms=%d", _elapsed_ms(started_at))
         return []
     count = min(max_batches, len(candidates))
     batches: list[list[CandidateWindow]] = [[] for _ in range(count)]
@@ -339,7 +454,14 @@ def build_candidate_batches(
     # candidate in the bounded batch list instead of splitting into extra model
     # calls when a window is large.
     del max_batch_chars
-    return [batch for batch in batches if batch]
+    result = [batch for batch in batches if batch]
+    logger.info(
+        "batch.build.end batches=%d candidate_count=%d elapsed_ms=%d",
+        len(result),
+        sum(len(batch) for batch in result),
+        _elapsed_ms(started_at),
+    )
+    return result
 
 
 class _CheckModel(BaseModel):
@@ -392,9 +514,16 @@ def _normalize_requirements(
     raw_requirements: Iterable[Any],
     blocks: Sequence[StructuredBlock],
 ) -> list[dict[str, Any]]:
+    started_at = time.perf_counter()
+    raw_items = list(raw_requirements)
+    logger.info(
+        "requirements.normalize.start raw_requirements=%d source_blocks=%d",
+        len(raw_items),
+        len(blocks),
+    )
     block_map = {block.block_id: block for block in blocks}
     grouped: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
-    for raw in raw_requirements:
+    for raw in raw_items:
         item = _coerce_raw_requirement(raw)
         searchable_text = " ".join(
             [item["name"], *(check["requirement"] for check in item["checks"])]
@@ -462,6 +591,11 @@ def _normalize_requirements(
                 },
             }
         )
+    logger.info(
+        "requirements.normalize.end requirements=%d elapsed_ms=%d",
+        len(normalized),
+        _elapsed_ms(started_at),
+    )
     return normalized
 
 
@@ -481,6 +615,12 @@ class DeterministicComplianceLLM:
     """
 
     def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
+        started_at = time.perf_counter()
+        logger.info(
+            "llm.call.start provider=deterministic model=local batch_size=%d candidate_chars=%d",
+            len(batch),
+            sum(len(candidate.text) for candidate in batch),
+        )
         result: list[dict[str, Any]] = []
         for candidate in batch:
             text = candidate.text
@@ -553,6 +693,12 @@ class DeterministicComplianceLLM:
                     "source_block_ids": candidate.block_ids,
                 }
             )
+        logger.info(
+            "llm.call.end provider=deterministic model=local batch_size=%d requirements=%d elapsed_ms=%d",
+            len(batch),
+            len(result),
+            _elapsed_ms(started_at),
+        )
         return result
 
 
@@ -573,6 +719,13 @@ class OpenAICompatibleLLM:
         self.max_tokens = max(256, min(max_tokens, 8192))
 
     def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
+        started_at = time.perf_counter()
+        logger.info(
+            "llm.call.start provider=openai_compatible model=%s batch_size=%d candidate_chars=%d",
+            self.model,
+            len(batch),
+            sum(len(candidate.text) for candidate in batch),
+        )
         source = "\n\n".join(
             f"[{candidate.section}] block_ids={','.join(candidate.block_ids)}\n{candidate.text[:6000]}"
             for candidate in batch
@@ -616,22 +769,56 @@ class OpenAICompatibleLLM:
             )
             if not isinstance(requirements, list):
                 raise ValueError("requirements must be a list")
+            logger.info(
+                "llm.call.end provider=openai_compatible model=%s batch_size=%d requirements=%d elapsed_ms=%d",
+                self.model,
+                len(batch),
+                len(requirements),
+                _elapsed_ms(started_at),
+            )
             return requirements
         except TimeoutError as exc:
+            logger.error(
+                "llm.call.error provider=openai_compatible model=%s error_type=timeout elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError("LLM 合规要求提取失败：请求超时。") from exc
         except urllib.error.HTTPError as exc:
+            logger.error(
+                "llm.call.error provider=openai_compatible model=%s error_type=http_%s elapsed_ms=%d",
+                self.model,
+                exc.code,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError(
                 f"LLM 合规要求提取失败：HTTP {exc.code}。"
             ) from exc
         except urllib.error.URLError as exc:
+            logger.error(
+                "llm.call.error provider=openai_compatible model=%s error_type=url_error elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError(
                 "LLM 合规要求提取失败：网络连接错误。"
             ) from exc
         except json.JSONDecodeError as exc:
+            logger.error(
+                "llm.call.error provider=openai_compatible model=%s error_type=invalid_json elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError(
                 "LLM 合规要求提取失败：模型响应不是有效 JSON。"
             ) from exc
         except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+            logger.error(
+                "llm.call.error provider=openai_compatible model=%s error_type=%s elapsed_ms=%d",
+                self.model,
+                type(exc).__name__,
+                _elapsed_ms(started_at),
+            )
             raise ComplianceExtractionError(
                 "LLM 合规要求提取失败：响应结构异常。"
             ) from exc
@@ -647,54 +834,228 @@ def extract_compliance_requirements_real(
     max_batch_chars: int = 12000,
     max_retries: int = 2,
 ) -> list[dict[str, Any]]:
-    if max_retries < 0:
-        raise ValueError("max_retries 不能为负数。")
-    path = Path(tender_file.storage_path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    cache_key: str | None = None
-    if cache is not None:
-        cache_key = hashlib.sha256(path.read_bytes()).hexdigest()
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-    active_parser = parser or MinerUDocumentParser()
-    parse_fn = active_parser.parse if hasattr(active_parser, "parse") else active_parser
-    blocks = parse_fn(path)  # type: ignore[operator]
-    candidates = select_compliance_candidates(blocks)
-    batches = build_candidate_batches(
-        candidates,
-        max_batches=max_batches,
-        max_batch_chars=max_batch_chars,
+    started_at = time.perf_counter()
+    logger.info(
+        "compliance.extract.start file=%s max_batches=%d max_batch_chars=%d max_retries=%d cache_enabled=%s llm=%s",
+        tender_file.filename,
+        max_batches,
+        max_batch_chars,
+        max_retries,
+        cache is not None,
+        type(llm).__name__ if llm is not None else "default",
     )
-    if not batches:
-        empty_result: list[dict[str, Any]] = []
-        if cache is not None and cache_key is not None:
-            cache.set(cache_key, empty_result)
-        return empty_result
-    active_llm = llm or DeterministicComplianceLLM()
-    llm_fn = active_llm.extract if hasattr(active_llm, "extract") else active_llm
-    raw_requirements: list[Any] = []
-    retries_remaining = min(max_retries, max(0, 10 - len(batches)))
-    for batch in batches:
-        while True:
+    try:
+        if max_retries < 0:
+            raise ValueError("max_retries 不能为负数。")
+        path = Path(tender_file.storage_path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+        cache_key: str | None = None
+        logger.info(
+            "cache.check.start file=%s enabled=%s",
+            tender_file.filename,
+            cache is not None,
+        )
+        if cache is not None:
+            cache_key = hashlib.sha256(path.read_bytes()).hexdigest()
             try:
-                batch_output = llm_fn(batch)  # type: ignore[operator]
-                break
-            except ComplianceExtractionError as exc:
-                if retries_remaining and _is_transient_extraction_error(exc):
-                    retries_remaining -= 1
-                    continue
+                cached = cache.get(cache_key)
+            except Exception as exc:
+                logger.error(
+                    "cache.check.error file=%s error_type=%s",
+                    tender_file.filename,
+                    type(exc).__name__,
+                )
                 raise
-        if isinstance(batch_output, dict):
-            batch_output = batch_output.get("requirements")
-        if not isinstance(batch_output, list):
-            raise ComplianceExtractionError("LLM Schema 校验失败：批次结果不是列表。")
-        raw_requirements.extend(batch_output)
-    normalized = _normalize_requirements(raw_requirements, blocks)
-    if cache is not None and cache_key is not None:
-        cache.set(cache_key, normalized)
-    return normalized
+            if cached is not None:
+                logger.info(
+                    "cache.check.end file=%s status=hit requirements=%d",
+                    tender_file.filename,
+                    len(cached),
+                )
+                logger.info(
+                    "compliance.extract.end file=%s status=cache_hit requirements=%d elapsed_ms=%d",
+                    tender_file.filename,
+                    len(cached),
+                    _elapsed_ms(started_at),
+                )
+                return cached
+            logger.info(
+                "cache.check.end file=%s status=miss key=%s",
+                tender_file.filename,
+                cache_key[:12],
+            )
+        else:
+            logger.info(
+                "cache.check.end file=%s status=disabled",
+                tender_file.filename,
+            )
+
+        active_parser = parser or MinerUDocumentParser()
+        parser_name = type(active_parser).__name__
+        logger.info(
+            "document.parse.start parser=%s file=%s",
+            parser_name,
+            tender_file.filename,
+        )
+        parse_fn = (
+            active_parser.parse if hasattr(active_parser, "parse") else active_parser
+        )
+        try:
+            blocks = parse_fn(path)  # type: ignore[operator]
+        except Exception as exc:
+            logger.error(
+                "document.parse.error parser=%s file=%s error_type=%s",
+                parser_name,
+                tender_file.filename,
+                type(exc).__name__,
+            )
+            raise
+        logger.info(
+            "document.parse.end parser=%s file=%s blocks=%d",
+            parser_name,
+            tender_file.filename,
+            len(blocks),
+        )
+
+        try:
+            candidates = select_compliance_candidates(blocks)
+        except Exception as exc:
+            logger.error(
+                "candidate.filter.error file=%s error_type=%s",
+                tender_file.filename,
+                type(exc).__name__,
+            )
+            raise
+        try:
+            batches = build_candidate_batches(
+                candidates,
+                max_batches=max_batches,
+                max_batch_chars=max_batch_chars,
+            )
+        except Exception as exc:
+            logger.error(
+                "batch.build.error file=%s error_type=%s",
+                tender_file.filename,
+                type(exc).__name__,
+            )
+            raise
+        if not batches:
+            empty_result: list[dict[str, Any]] = []
+            if cache is not None and cache_key is not None:
+                try:
+                    cache.set(cache_key, empty_result)
+                except Exception as exc:
+                    logger.error(
+                        "cache.write.error file=%s error_type=%s",
+                        tender_file.filename,
+                        type(exc).__name__,
+                    )
+                    raise
+            logger.info(
+                "compliance.extract.end file=%s status=empty candidates=%d requirements=0 elapsed_ms=%d",
+                tender_file.filename,
+                len(candidates),
+                _elapsed_ms(started_at),
+            )
+            return empty_result
+
+        active_llm = llm or DeterministicComplianceLLM()
+        llm_name = type(active_llm).__name__
+        llm_fn = active_llm.extract if hasattr(active_llm, "extract") else active_llm
+        raw_requirements: list[Any] = []
+        retries_remaining = min(max_retries, max(0, 10 - len(batches)))
+        for batch_index, batch in enumerate(batches, start=1):
+            batch_started_at = time.perf_counter()
+            logger.info(
+                "compliance.batch.start index=%d total=%d llm=%s candidates=%d chars=%d retries_remaining=%d",
+                batch_index,
+                len(batches),
+                llm_name,
+                len(batch),
+                sum(len(candidate.text) for candidate in batch),
+                retries_remaining,
+            )
+            attempts = 0
+            while True:
+                attempts += 1
+                try:
+                    batch_output = llm_fn(batch)  # type: ignore[operator]
+                    break
+                except ComplianceExtractionError as exc:
+                    if retries_remaining and _is_transient_extraction_error(exc):
+                        retries_remaining -= 1
+                        logger.warning(
+                            "compliance.batch.retry index=%d total=%d attempt=%d retries_remaining=%d error_type=%s",
+                            batch_index,
+                            len(batches),
+                            attempts,
+                            retries_remaining,
+                            type(exc).__name__,
+                        )
+                        continue
+                    logger.error(
+                        "compliance.batch.error index=%d total=%d attempt=%d error_type=%s elapsed_ms=%d",
+                        batch_index,
+                        len(batches),
+                        attempts,
+                        type(exc).__name__,
+                        _elapsed_ms(batch_started_at),
+                    )
+                    raise
+            if isinstance(batch_output, dict):
+                batch_output = batch_output.get("requirements")
+            if not isinstance(batch_output, list):
+                raise ComplianceExtractionError(
+                    "LLM Schema 校验失败：批次结果不是列表。"
+                )
+            raw_requirements.extend(batch_output)
+            logger.info(
+                "compliance.batch.end index=%d total=%d attempts=%d requirements=%d elapsed_ms=%d",
+                batch_index,
+                len(batches),
+                attempts,
+                len(batch_output),
+                _elapsed_ms(batch_started_at),
+            )
+
+        try:
+            normalized = _normalize_requirements(raw_requirements, blocks)
+        except Exception as exc:
+            logger.error(
+                "requirements.normalize.error file=%s error_type=%s",
+                tender_file.filename,
+                type(exc).__name__,
+            )
+            raise
+        if cache is not None and cache_key is not None:
+            try:
+                cache.set(cache_key, normalized)
+            except Exception as exc:
+                logger.error(
+                    "cache.write.error file=%s error_type=%s",
+                    tender_file.filename,
+                    type(exc).__name__,
+                )
+                raise
+        logger.info(
+            "compliance.extract.end file=%s status=complete candidates=%d batches=%d requirements=%d elapsed_ms=%d",
+            tender_file.filename,
+            len(candidates),
+            len(batches),
+            len(normalized),
+            _elapsed_ms(started_at),
+        )
+        return normalized
+    except Exception as exc:
+        logger.error(
+            "compliance.extract.error file=%s error_type=%s elapsed_ms=%d",
+            tender_file.filename,
+            type(exc).__name__,
+            _elapsed_ms(started_at),
+        )
+        raise
 
 
 extract_compliance_requirements = extract_compliance_requirements_real

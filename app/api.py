@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import uuid
 import zipfile
@@ -42,6 +43,7 @@ from app.workflow import BidCheckServices, BidCheckWorkflow
 
 
 CheckModeInput = Literal["compliance", "evaluation", "full"]
+logger = logging.getLogger(__name__)
 STAGE_LABELS = {
     "requirements": "提取合规性检查要求",
     "bid_parse": "解析投标文件",
@@ -80,6 +82,10 @@ def build_default_workflow(
             # runnable without allowing malformed uploaded packages to masquerade
             # as extracted requirements in normal DOCX requests.
             if not zipfile.is_zipfile(file_metadata.storage_path):
+                logger.warning(
+                    "requirements.compatibility_fallback file=%s reason=non_docx_fixture",
+                    file_metadata.filename,
+                )
                 return deepcopy(MOCK_COMPLIANCE_REQUIREMENTS)
             raise
 

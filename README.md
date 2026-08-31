@@ -40,6 +40,10 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 
 未配置外部 MinerU 时，系统使用 DOCX XML 结构回退；未配置 LLM 时，系统使用确定性、来源受限的本地抽取器。对有效 DOCX 不会返回固定五条 mock 规则；历史非 DOCX 测试字节仅保留兼容回退。
 
+## 处理日志
+
+工作流和要求提取链路使用 Python `logging` 输出详细阶段日志。默认启动命令会在终端显示 `start`、`end`、`retry` 和 `error` 事件，包括文件名、批次、数量、模型名和耗时；不会记录 API Key、完整提示词或招标文件原文。重点事件前缀包括 `workflow.*`、`document.parse.*`、`candidate.filter.*`、`compliance.batch.*`、`llm.call.*` 和 `requirements.normalize.*`。
+
 ## 测试
 
 ```bash

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from threading import Barrier
 
 import pytest
@@ -160,3 +161,30 @@ def test_review_failure_is_persisted(task_repository):
     assert task.review_status == "failed"
     assert task.failed_stage == "review"
     assert task.error_message == "模拟合规性检查失败"
+
+
+def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog):
+    caplog.set_level(logging.INFO, logger="app.workflow")
+    workflow = make_workflow(
+        task_repository,
+        lambda file_metadata: [{"id": "compliance_001"}],
+        lambda file_metadata: {"status": "success"},
+        [],
+    )
+    try:
+        workflow.run("task-001")
+    finally:
+        workflow.shutdown()
+
+    messages = [record.getMessage() for record in caplog.records]
+    for event in (
+        "workflow.run.start",
+        "workflow.stage.start stage=requirements",
+        "workflow.stage.end stage=requirements",
+        "workflow.stage.start stage=bid_parse",
+        "workflow.stage.end stage=bid_parse",
+        "workflow.review.start",
+        "workflow.review.end",
+        "workflow.run.end status=complete",
+    ):
+        assert any(event in message for message in messages), event

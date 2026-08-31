@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -391,3 +392,81 @@ def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_pat
 
     assert result[0]["name"] == "投标人信息"
     assert llm.calls == 2
+
+
+def test_real_extractor_logs_each_pipeline_stage(tmp_path, caplog):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"tender")
+    blocks = [
+        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)
+    ]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    class FakeLLM:
+        def extract(self, batch):
+            return [
+                {
+                    "name": "投标人信息",
+                    "category": "required_field",
+                    "target": {"name": "投标文件", "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": "投标人名称应填写。",
+                            "check_type": "required_field",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    caplog.set_level(logging.INFO, logger="app.compliance_extraction")
+    extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=FakeLLM(),
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    for event in (
+        "compliance.extract.start",
+        "cache.check.end",
+        "document.parse.end",
+        "candidate.filter.end",
+        "batch.build.end",
+        "compliance.batch.end",
+        "requirements.normalize.end",
+        "compliance.extract.end",
+    ):
+        assert any(event in message for message in messages), event
+
+
+def test_openai_compatible_llm_logs_call_start_and_end(monkeypatch, caplog):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": '{"requirements": []}'}}]}
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        return FakeResponse()
+
+    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
+    caplog.set_level(logging.INFO, logger="app.compliance_extraction")
+    llm = extraction_module.OpenAICompatibleLLM(api_key="test-key", model="test-model")
+    llm.extract([CandidateWindow(["b0001"], "格式", "投标人名称应填写。", 1)])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("llm.call.start" in message for message in messages)
+    assert any("llm.call.end" in message for message in messages)
+    assert all("test-key" not in message for message in messages)
