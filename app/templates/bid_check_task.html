@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+
+{% macro status_badge(status) -%}
+  <span class="stage-status status-{{ status }}">
+    {% if status == "pending" %}等待中
+    {% elif status == "running" %}<span class="status-dot" aria-hidden="true"></span>运行中
+    {% elif status == "complete" %}已完成
+    {% else %}失败{% endif %}
+  </span>
+{%- endmacro %}
+
+{% block title %}{{ task.bid_file.filename }} · 标书检查{% endblock %}
+
+{% block body_attributes %}data-task-id="{{ task.task_id }}" data-task-status="{{ task.status }}"{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumb" aria-label="面包屑">
+    <a href="/bid-check">标书检查</a>
+    <span aria-hidden="true">/</span>
+    <span>任务 {{ task.task_id[:8] }}</span>
+  </nav>
+
+  {% if task.status == "complete" %}
+    <header class="page-heading result-page-heading">
+      <div>
+        <span class="eyebrow">任务已完成</span>
+        <h1>标书合规性校验结果</h1>
+        <p>本次共提取 {{ task.result.requirements|length }} 项合规性检查要求</p>
+      </div>
+      <a class="button" href="/bid-check">创建新任务</a>
+    </header>
+
+    <div class="notice notice-info" role="note">
+      <span class="notice-icon" aria-hidden="true">i</span>
+      <div>
+        <strong>当前版本仅展示提取出的合规性检查要求</strong>
+        <p>尚未执行真实投标文件内容校验，不代表任何要求已经通过或未通过。</p>
+      </div>
+    </div>
+
+    <section class="card result-summary-card" aria-label="投标文件模拟解析摘要">
+      <div>
+        <span class="summary-label">投标文件</span>
+        <strong>{{ task.bid_file.filename }}</strong>
+      </div>
+      <div class="result-metrics">
+        <div><small>章节数</small><strong>{{ task.result.bid_parse.section_count }}</strong></div>
+        <div><small>内容块数</small><strong>{{ task.result.bid_parse.block_count }}</strong></div>
+        <div><small>表格数</small><strong>{{ task.result.bid_parse.table_count }}</strong></div>
+        <div><small>图片数</small><strong>{{ task.result.bid_parse.image_count }}</strong></div>
+      </div>
+      <p>以上为工作流测试数据，不代表对投标文件的真实解析结果。</p>
+    </section>
+
+    <section class="requirements-section" aria-labelledby="requirements-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">RESULT</span>
+          <h2 id="requirements-heading">合规性检查要求</h2>
+        </div>
+        <span class="requirement-count">{{ task.result.requirements|length }} 项</span>
+      </div>
+
+      <div class="requirements-list">
+        {% for requirement in task.result.requirements %}
+          <article class="card requirement-card">
+            <div class="requirement-index">{{ "%02d"|format(loop.index) }}</div>
+            <div class="requirement-content">
+              <div class="requirement-heading">
+                <div>
+                  <span class="category-label">{{ requirement.category }}</span>
+                  <h3>{{ requirement.name }}</h3>
+                </div>
+                <span class="scope-label">{{ requirement.target.scope }}</span>
+              </div>
+              <div class="requirement-fields">
+                <div class="field-row">
+                  <strong>检查对象</strong>
+                  <span>{{ requirement.target.name }}</span>
+                </div>
+                <div class="field-row">
+                  <strong>检查要求</strong>
+                  <ul>
+                    {% for check in requirement.checks %}
+                      <li>{{ check.requirement }}</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+                <div class="field-row source-row">
+                  <strong>来源</strong>
+                  <span>{{ requirement.source.section }}</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% else %}
+    <header class="page-heading task-page-heading">
+      <div>
+        <span class="eyebrow">标书合规性校验</span>
+        <h1>正在处理检查任务</h1>
+        <p>两个前置步骤会并行执行，完成后自动进入合规性检查。</p>
+      </div>
+      <span class="task-id">任务 {{ task.task_id[:8] }}</span>
+    </header>
+
+    <section class="card task-files" aria-label="任务文件">
+      <div>
+        <span class="file-kind">招</span>
+        <span><small>招标文件</small><strong>{{ task.tender_file.filename }}</strong></span>
+      </div>
+      <div>
+        <span class="file-kind bid-kind">投</span>
+        <span><small>投标文件</small><strong>{{ task.bid_file.filename }}</strong></span>
+      </div>
+    </section>
+
+    {% if task.status == "failed" %}
+      <div class="error task-error" role="alert">
+        <strong>任务执行失败</strong>
+        <span>失败阶段：{{ failed_stage_label }}</span>
+        <p>{{ task.error_message }}</p>
+      </div>
+    {% endif %}
+
+    <section class="card workflow-card" aria-labelledby="workflow-heading">
+      <div class="section-heading">
+        <div>
+          <span class="section-number">WORKFLOW</span>
+          <h2 id="workflow-heading">任务进度</h2>
+        </div>
+        {% if task.status != "failed" %}<p>页面会自动更新任务状态</p>{% endif %}
+      </div>
+
+      <div class="workflow">
+        <article class="stage-card stage-complete" data-stage="upload">
+          <span class="stage-number">1</span>
+          <div><strong>上传文件</strong><small>招标文件与投标文件已保存</small></div>
+          {{ status_badge("complete") }}
+        </article>
+
+        <div class="connector connector-down" aria-hidden="true"></div>
+        <div class="parallel-label"><span>并行执行</span></div>
+
+        <div class="parallel-stages" data-parallel-stages>
+          <article class="stage-card status-surface-{{ task.requirements_status }}" data-stage="requirements">
+            <span class="stage-number">2</span>
+            <div><strong>提取合规性检查要求</strong><small>从招标文件生成模拟要求</small></div>
+            {{ status_badge(task.requirements_status) }}
+          </article>
+          <article class="stage-card status-surface-{{ task.bid_parse_status }}" data-stage="bid_parse">
+            <span class="stage-number">3</span>
+            <div><strong>解析投标文件</strong><small>生成模拟文档结构摘要</small></div>
+            {{ status_badge(task.bid_parse_status) }}
+          </article>
+        </div>
+
+        <div class="merge-connector" aria-hidden="true"><span></span></div>
+
+        <article class="stage-card status-surface-{{ task.review_status }}" data-stage="review">
+          <span class="stage-number">4</span>
+          <div><strong>执行合规性检查</strong><small>汇合两个前置步骤的结构化结果</small></div>
+          {{ status_badge(task.review_status) }}
+        </article>
+
+        <div class="connector connector-down" aria-hidden="true"></div>
+
+        <article class="stage-card status-surface-{{ 'failed' if task.status == 'failed' else 'pending' }}" data-stage="result">
+          <span class="stage-number">5</span>
+          <div><strong>检查结果</strong><small>展示提取出的合规性检查要求</small></div>
+          {{ status_badge("failed" if task.status == "failed" else "pending") }}
+        </article>
+      </div>
+      <div id="polling-warning" class="polling-warning" role="status" hidden></div>
+    </section>
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {% if task.status in ["pending", "running"] %}
+    <script src="{{ url_for('static', path='task.js') }}" defer></script>
+  {% endif %}
+{% endblock %}
+

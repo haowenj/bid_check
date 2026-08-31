@@ -32,6 +32,11 @@ from app.workflow import BidCheckServices, BidCheckWorkflow
 
 
 CheckModeInput = Literal["compliance", "evaluation", "full"]
+STAGE_LABELS = {
+    "requirements": "提取合规性检查要求",
+    "bid_parse": "解析投标文件",
+    "review": "执行合规性检查",
+}
 
 
 def build_default_workflow(
@@ -94,6 +99,26 @@ def create_app(
             request=request,
             name="bid_check.html",
             context={},
+        )
+
+    @application.get(
+        "/bid-check/tasks/{task_id}",
+        response_class=HTMLResponse,
+    )
+    def bid_check_task_page(request: Request, task_id: str):
+        task = active_repository.get(task_id)
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail="标书检查任务不存在。",
+            )
+        return templates.TemplateResponse(
+            request=request,
+            name="bid_check_task.html",
+            context={
+                "task": task,
+                "failed_stage_label": STAGE_LABELS.get(task.failed_stage),
+            },
         )
 
     @application.post("/api/bid-check/tasks", status_code=202)
