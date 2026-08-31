@@ -45,7 +45,9 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 
 工作流和要求提取链路使用 Python `logging` 输出详细阶段日志。默认启动命令会在终端显示 `start`、`end`、`retry` 和 `error` 事件，包括文件名、批次、数量、模型名和耗时；不会记录 API Key、完整提示词或招标文件原文。重点事件前缀包括 `workflow.*`、`document.parse.*`、`candidate.filter.*`、`compliance.batch.*`、`llm.call.*` 和 `requirements.normalize.*`。
 
-每个任务的招标文件目录下会生成 `compliance_extraction/`：`execution.jsonl` 保存结构化执行事件，`01_parsed_blocks.json`、`02_candidates.json`、`03_batches.json`、`04_raw_requirements.json`、`05_normalized_requirements.json` 保存阶段产物，`llm/call_NNN_input.json` 和 `llm/call_NNN_output.json` 保存每次调用的批次、脱敏请求、原始响应、解析结果、耗时、finish reason、usage 和错误信息，`summary.json` 保存提取统计，`workflow_summary.json` 保存并行解析、复核和整个任务耗时。阶段文件在成功后立即写入，后续失败不会清理已有文件。
+每个任务的招标文件目录下会生成 `compliance_extraction/`：`execution.jsonl` 保存结构化执行事件，`01_parsed_blocks.json`、`02_candidates.json`、`03_batches.json`、`04_raw_requirements.json`、`05_normalized_requirements.json` 保存阶段产物，`06_filter_report.json` 保存确定性边界过滤的条目和原因，`llm/call_NNN_input.json` 和 `llm/call_NNN_output.json` 保存每次调用的批次、脱敏请求、原始响应、解析结果、耗时、finish reason、usage 和错误信息，`summary.json` 保存提取统计，`workflow_summary.json` 保存并行解析、复核和整个任务耗时。阶段文件在成功后立即写入，后续失败不会清理已有文件。
+
+规范化结果中的 `applicability.type`、`target.scope`、`check_type` 和 `evidence_type` 使用固定枚举；`evidence_type` 由程序根据 `check_type` 派生，未知模型枚举会使本阶段失败并保留原始产物，避免自由文本进入最终结果。提取范围仅包括可从投标文件及其文件元数据直接检查的要求，外部系统状态、未明确要求随投标文件提交的合同履约要求，以及与项目专用条款冲突的联合体/备选方案规则会记录在过滤报告中。
 
 ## 测试
 

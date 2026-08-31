@@ -319,6 +319,189 @@ def test_real_extractor_accepts_legacy_source_shape_and_replaces_ids(tmp_path):
     assert result[0]["source"]["source_text"] == "必须提供营业执照。"
 
 
+def test_normalization_canonicalizes_enum_aliases_and_derives_evidence(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"docx")
+
+    class FakeParser:
+        def parse(self, path):
+            return [
+                StructuredBlock(
+                    "b0001",
+                    "paragraph",
+                    "须提供身份证人像面和国徽面。",
+                    "法定代表人身份证明",
+                    1,
+                )
+            ]
+
+    class AliasLLM:
+        def extract(self, batch):
+            return [
+                {
+                    "name": "法定代表人身份证明",
+                    "category": "存在性检查",
+                    "target": {
+                        "name": "投标文件商务部分",
+                        "scope": "投标文件商务部分",
+                    },
+                    "checks": [
+                        {
+                            "requirement": "须提供身份证人像面和国徽面。",
+                            "check_type": "存在性检查",
+                            "evidence_type": "自由生成值",
+                        }
+                    ],
+                    "applicability": {
+                        "type": "所有投标人",
+                        "condition": "所有投标人",
+                    },
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    result = extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=AliasLLM(),
+    )
+
+    assert result[0]["target"]["scope"] == "single_section"
+    assert result[0]["applicability"]["type"] == "always"
+    assert result[0]["checks"][0]["check_type"] == "attachment_content"
+    assert result[0]["checks"][0]["evidence_type"] == "vision"
+    assert result[0]["category"] != "存在性检查"
+
+
+def test_normalization_rejects_unknown_enum_alias(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"docx")
+
+    class FakeParser:
+        def parse(self, path):
+            return [StructuredBlock("b0001", "paragraph", "必须填写。", "格式", 1)]
+
+    class UnknownEnumLLM:
+        def extract(self, batch):
+            return [
+                {
+                    "name": "未知规则",
+                    "category": "required_field",
+                    "target": {"name": "投标文件", "scope": "未知范围"},
+                    "checks": [
+                        {
+                            "requirement": "必须填写。",
+                            "check_type": "unknown_check",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": ["b0001"],
+                }
+            ]
+
+    with pytest.raises(ComplianceExtractionError, match="Schema"):
+        extract_compliance_requirements_real(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=FakeParser(),
+            llm=UnknownEnumLLM(),
+        )
+
+
+def test_normalization_filters_non_executable_and_project_conflict_rules(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"docx")
+
+    class FakeParser:
+        def parse(self, path):
+            return [
+                StructuredBlock(
+                    "b0001",
+                    "paragraph",
+                    "本项目不接受联合体投标。",
+                    "投标人资格要求",
+                    1,
+                ),
+                StructuredBlock(
+                    "b0002",
+                    "paragraph",
+                    "投标人名称应填写，须提供身份证人像面和国徽面。",
+                    "投标文件格式",
+                    2,
+                ),
+                StructuredBlock(
+                    "b0003",
+                    "paragraph",
+                    "投标文件封面项目名称和日期应填写。",
+                    "商务投标文件封面",
+                    3,
+                ),
+            ]
+
+    class BoundaryLLM:
+        def extract(self, batch):
+            def item(name, requirement, target_name, block_id):
+                return {
+                    "name": name,
+                    "category": "required_field",
+                    "target": {"name": target_name, "scope": "single_section"},
+                    "checks": [
+                        {
+                            "requirement": requirement,
+                            "check_type": "required_field",
+                            "evidence_type": "text",
+                        }
+                    ],
+                    "applicability": {"type": "always", "condition": None},
+                    "source_block_ids": [block_id],
+                }
+
+            return [
+                item(
+                    "封面字段",
+                    "投标人名称应填写。",
+                    "商务投标文件封面",
+                    "b0002",
+                ),
+                item(
+                    "身份证附件",
+                    "须提供身份证人像面和国徽面。",
+                    "法定代表人身份证明",
+                    "b0002",
+                ),
+                item(
+                    "电子采购系统上传",
+                    "应在电子采购系统完成加密上传。",
+                    "电子投标文件",
+                    "b0002",
+                ),
+                item(
+                    "履约阶段安全告知书",
+                    "合同签订后的履约期间安全告知书需签名。",
+                    "安全告知书",
+                    "b0002",
+                ),
+                item(
+                    "联合体协议书",
+                    "联合体各方应签订联合体协议书。",
+                    "联合体协议书",
+                    "b0001",
+                ),
+            ]
+
+    result = extract_compliance_requirements_real(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        llm=BoundaryLLM(),
+    )
+
+    names = {item["name"] for item in result}
+    assert {"封面字段", "身份证附件"} <= names
+    assert "电子采购系统上传" not in names
+    assert "履约阶段安全告知书" not in names
+    assert "联合体协议书" not in names
+
+
 def test_real_extractor_caches_source_grounded_result(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"same tender")
@@ -634,6 +817,7 @@ def test_real_extractor_persists_intermediates_and_summary(tmp_path):
         "03_batches.json",
         "04_raw_requirements.json",
         "05_normalized_requirements.json",
+        "06_filter_report.json",
         "summary.json",
         "execution.jsonl",
         "llm/call_001_input.json",
@@ -666,6 +850,8 @@ def test_real_extractor_persists_intermediates_and_summary(tmp_path):
     assert output["elapsed_ms"] is not None
     assert output["parsed_requirements"] == raw["requirements"][:1]
     assert normalized["requirements"] == result
+    assert normalized["filter_count"] == 0
+    assert json.loads((artifact_dir / "06_filter_report.json").read_text()) == []
     assert summary["status"] == "complete"
     assert summary["stats"]["llm_total_calls"] == 2
     assert summary["stats"]["final_requirements"] == len(result)

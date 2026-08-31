@@ -27,6 +27,7 @@ from app.models import FileMetadata
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 ComplianceRequirement = dict[str, Any]
 logger = logging.getLogger(__name__)
+REQUIREMENT_CACHE_VERSION = "compliance-v2-enums-boundary"
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -476,23 +477,72 @@ def build_candidate_batches(
     return result
 
 
+CHECK_TYPES = (
+    "required_field",
+    "placeholder",
+    "attachment_exists",
+    "attachment_content",
+    "signature",
+    "seal",
+    "date",
+    "consistency",
+    "file_metadata",
+)
+TARGET_SCOPES = (
+    "single_section",
+    "each_section",
+    "each_person",
+    "each_contract",
+    "whole_document",
+)
+APPLICABILITY_TYPES = ("always", "conditional")
+EVIDENCE_TYPES = ("text", "structure", "vision", "metadata")
+EVIDENCE_BY_CHECK_TYPE = {
+    "required_field": "text",
+    "placeholder": "text",
+    "attachment_exists": "structure",
+    "attachment_content": "vision",
+    "signature": "vision",
+    "seal": "vision",
+    "date": "text",
+    "consistency": "structure",
+    "file_metadata": "metadata",
+}
+
+
 class _CheckModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str | None = None
     requirement: str = Field(min_length=1)
-    check_type: str = Field(min_length=1)
-    evidence_type: str = Field(min_length=1)
+    check_type: Literal[
+        "required_field",
+        "placeholder",
+        "attachment_exists",
+        "attachment_content",
+        "signature",
+        "seal",
+        "date",
+        "consistency",
+        "file_metadata",
+    ]
+    evidence_type: Literal["text", "structure", "vision", "metadata"]
 
 
 class _TargetModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1)
-    scope: str = Field(min_length=1)
+    scope: Literal[
+        "single_section",
+        "each_section",
+        "each_person",
+        "each_contract",
+        "whole_document",
+    ]
 
 
 class _ApplicabilityModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    type: str = Field(min_length=1)
+    type: Literal["always", "conditional"]
     condition: str | None = None
 
 
@@ -509,19 +559,291 @@ class _RawRequirementModel(BaseModel):
 
 def _legacy_check_type(requirement: str) -> tuple[str, str]:
     if _PLACEHOLDER_RE.search(requirement):
-        return "placeholder", "text"
+        return "placeholder", EVIDENCE_BY_CHECK_TYPE["placeholder"]
     if re.search(r"签字", requirement):
-        return "signature", "text"
+        return "signature", EVIDENCE_BY_CHECK_TYPE["signature"]
     if re.search(r"签章|盖章|公章", requirement):
-        return "seal", "text"
+        return "seal", EVIDENCE_BY_CHECK_TYPE["seal"]
+    if re.search(r"人像面|国徽面|正面|反面|关键页|内容完整|扫描件内容", requirement):
+        return "attachment_content", EVIDENCE_BY_CHECK_TYPE["attachment_content"]
     if re.search(
         r"附件|提供|身份证|营业执照|社保|证书|合同|证明材料|复印件|扫描件",
         requirement,
     ):
-        return "attachment_exists", "structure"
+        return "attachment_exists", EVIDENCE_BY_CHECK_TYPE["attachment_exists"]
     if re.search(r"日期|年.{0,8}月", requirement):
-        return "date", "text"
-    return "required_field", "text"
+        return "date", EVIDENCE_BY_CHECK_TYPE["date"]
+    return "required_field", EVIDENCE_BY_CHECK_TYPE["required_field"]
+
+
+_CHECK_TYPE_ALIASES = {
+    # Presence / completeness labels used by previous model prompts.
+    "presence": "attachment_exists",
+    "存在性检查": "attachment_exists",
+    "附件存在性检查": "attachment_exists",
+    "attachment_presence": "attachment_exists",
+    "attachment_check": "attachment_exists",
+    "document_presence": "attachment_exists",
+    "document_exists": "attachment_exists",
+    "文件存在性检查": "attachment_exists",
+    "主体资格检查": "attachment_exists",
+    "数量/主体检查": "attachment_exists",
+    "list_presence": "attachment_exists",
+    "存在": "attachment_exists",
+    # Content / image labels.
+    "content_check": "attachment_content",
+    "content_presence": "attachment_content",
+    "content_integrity": "attachment_content",
+    "内容完整性检查": "attachment_content",
+    "内容合规性检查": "attachment_content",
+    "内容检查": "attachment_content",
+    "document_content": "attachment_content",
+    "文本语义检查": "attachment_content",
+    "内容完整": "attachment_content",
+    # Placeholder and fixed-value labels.
+    "placeholder_removal": "placeholder",
+    "占位符/特定值检查": "placeholder",
+    "specific_value": "placeholder",
+    "specific_value_or_empty": "placeholder",
+    "conditional_presence": "placeholder",
+    "默认状态检查": "placeholder",
+    "空值判断": "placeholder",
+    # Signature / seal labels.
+    "signature_field": "signature",
+    "signature_check": "signature",
+    "conditional_signature": "signature",
+    "替代签署检查": "signature",
+    "签章完整性检查": "signature",
+    "签字盖章检查": "signature",
+    "seal_check": "seal",
+    "印章识别": "seal",
+    # Date labels.
+    "date_check": "date",
+    "日期检查": "date",
+    # Cross-reference / consistency labels.
+    "content_consistency": "consistency",
+    "cross_reference": "consistency",
+    "附件关联检查": "consistency",
+    "一致性检查": "consistency",
+    "内容一致性检查": "consistency",
+    "逻辑一致性检查": "consistency",
+    "顺序一致性检查": "consistency",
+    "逻辑顺序检查": "consistency",
+    "数据排序验证": "consistency",
+    "索引映射检查": "consistency",
+    "order_check": "consistency",
+    # Direct document/file metadata labels.
+    "file_upload": "file_metadata",
+    "流程合规检查": "file_metadata",
+    "文件类型检查": "file_metadata",
+    "document_format": "file_metadata",
+    "document_count": "file_metadata",
+    "electronic_file": "file_metadata",
+    "文件计数/主体识别": "file_metadata",
+    # General field / format labels.
+    "completeness": "required_field",
+    "完整性检查": "required_field",
+    "信息完整性检查": "required_field",
+    "required": "required_field",
+    "required_field_check": "required_field",
+    "format_check": "required_field",
+    "format_compliance": "required_field",
+    "format_compliance_check": "required_field",
+    "格式合规检查": "required_field",
+    "格式合规性检查": "required_field",
+    "格式标识检查": "required_field",
+    "禁止性检查": "required_field",
+    "modification_prohibition": "required_field",
+    "条件适用性检查": "required_field",
+    "有效性检查": "required_field",
+    "主体检查": "required_field",
+    "count_check": "required_field",
+    "数量合规性检查": "required_field",
+    "data_accuracy": "required_field",
+    "document_text": "required_field",
+    "text_field": "required_field",
+    "form_fields": "required_field",
+}
+
+
+def _canonicalize_check_type(value: Any, requirement: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ComplianceExtractionError("LLM Schema 校验失败：check_type 不能为空。")
+    raw = value.strip()
+    if raw in CHECK_TYPES:
+        # Even a canonical model label can be too coarse for an attachment
+        # whose sides/pages must be inspected (for example an ID card's
+        # portrait and national-emblem sides).
+        if raw == "attachment_exists" and re.search(
+            r"人像面|国徽面|正面|反面|关键页|扫描件内容|附件内容", requirement
+        ):
+            canonical = "attachment_content"
+        else:
+            canonical = raw
+    else:
+        # Generic labels such as ``presence`` and ``content_check`` need the
+        # requirement text to disambiguate fields, attachments, signatures,
+        # and dates before consulting the legacy alias table.
+        if raw in {
+            "presence",
+            "存在性检查",
+            "completeness",
+            "完整性检查",
+            "content_check",
+            "content_presence",
+            "内容完整性检查",
+        } and re.search(r"日期|年.{0,8}月", requirement):
+            canonical = "date"
+        elif raw in {
+            "presence",
+            "存在性检查",
+            "completeness",
+            "完整性检查",
+            "content_check",
+            "content_presence",
+            "内容完整性检查",
+        } and re.search(r"一一对应|对应|关联|顺序|映射|相互解释|一致", requirement):
+            canonical = "consistency"
+        elif re.search(r"人像面|国徽面|正面|反面|关键页|扫描件内容|附件内容", requirement):
+            canonical = "attachment_content"
+        elif re.search(r"签字|签名|签署", requirement) and raw in {
+            "presence",
+            "存在性检查",
+            "content_check",
+            "content_presence",
+        }:
+            canonical = "signature"
+        elif re.search(r"盖章|公章|印章", requirement) and raw in {
+            "presence",
+            "存在性检查",
+            "content_check",
+            "content_presence",
+        }:
+            canonical = "seal"
+        elif raw in {"presence", "存在性检查", "content_check", "content_presence"} and not re.search(
+            r"附件|提供|身份证|营业执照|社保|证书|合同|证明材料|复印件|扫描件|保函",
+            requirement,
+        ):
+            canonical = "required_field"
+        else:
+            canonical = _CHECK_TYPE_ALIASES.get(raw)
+            if canonical is None:
+                lowered = raw.lower()
+                canonical = _CHECK_TYPE_ALIASES.get(lowered)
+        if canonical is None:
+            # A small, deterministic vocabulary fallback handles new labels
+            # while still rejecting arbitrary model-generated enum strings.
+            if re.search(r"人像面|国徽面|正面|反面|关键页|扫描件内容|附件内容", requirement):
+                canonical = "attachment_content"
+            elif re.search(r"签字|签名|签署", requirement):
+                canonical = "signature"
+            elif re.search(r"盖章|公章|印章", requirement):
+                canonical = "seal"
+            elif re.search(r"占位|不涉及|无偏离|不得留空|留空|特定值", requirement):
+                canonical = "placeholder"
+            elif re.search(r"日期|年.{0,8}月", requirement):
+                canonical = "date"
+            elif re.search(r"一一对应|对应|关联|顺序|映射|相互解释|一致", requirement):
+                canonical = "consistency"
+            elif re.search(r"文件大小|文件容量|文件份数|电子版|上传至大附件|文件格式|可编辑", requirement):
+                canonical = "file_metadata"
+            elif re.search(r"附件|提供|身份证|营业执照|证书|合同关键页|证明材料|复印件|扫描件", requirement):
+                canonical = "attachment_exists"
+            else:
+                raise ComplianceExtractionError(
+                    f"LLM Schema 校验失败：不支持的 check_type：{raw}。"
+                )
+    return canonical
+
+
+def _canonicalize_scope(value: Any, target_name: str = "") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ComplianceExtractionError("LLM Schema 校验失败：target.scope 不能为空。")
+    raw = value.strip()
+    if raw in TARGET_SCOPES:
+        return raw
+    if raw in {"各章节", "各部分", "每个章节", "每个部分", "各标段"}:
+        return "each_section"
+    if re.search(r"每个(?:人|人员)|各(?:人员|人)", raw):
+        return "each_person"
+    if re.search(r"每份合同|各合同|每个合同|合同文件及附件", raw):
+        return "each_contract"
+    if re.search(r"所有递交|整个|整体|全文|所有版本|全部文件", raw):
+        return "whole_document"
+    if raw in {"投标文件", "投标文件整体", "投标文件及往来函电"}:
+        return "whole_document"
+    if re.search(r"投标文件|商务|技术标|技术投标|报价文件|附件|章节|封面|资格|委托|联合体|代理商|投标人|申报表|承诺函|保函|业绩|订单模板|系统|备选|项目", raw):
+        return "single_section"
+    if "合同" in raw:
+        return "each_contract"
+    if "人员" in raw:
+        return "each_person"
+    raise ComplianceExtractionError(
+        f"LLM Schema 校验失败：不支持的 target.scope：{raw}。"
+    )
+
+
+def _canonicalize_applicability(value: Any, condition: Any = None) -> tuple[str, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        if condition:
+            return "conditional", str(condition).strip()
+        raise ComplianceExtractionError(
+            "LLM Schema 校验失败：applicability.type 不能为空。"
+        )
+    raw = value.strip()
+    if raw in APPLICABILITY_TYPES:
+        canonical = raw
+    elif raw in {"mandatory", "universal", "通用适用", "所有投标人", "全部投标人"}:
+        canonical = "always"
+    elif raw in {"条件适用", "conditional", "条件适用性"}:
+        canonical = "conditional"
+    elif re.search(r"所有|全部|通用|无条件", raw):
+        canonical = "always"
+    elif re.search(r"条件|仅当|如果|若|如|涉及|适用于|代理商|联合体", raw):
+        canonical = "conditional"
+    else:
+        raise ComplianceExtractionError(
+            f"LLM Schema 校验失败：不支持的 applicability.type：{raw}。"
+        )
+    condition_text = str(condition).strip() if condition is not None else None
+    if canonical == "always" and condition_text in {
+        "所有投标人",
+        "全部投标人",
+        "通用适用",
+        "universal",
+        "mandatory",
+    }:
+        condition_text = None
+    if canonical == "conditional" and not condition_text:
+        condition_text = raw if raw not in APPLICABILITY_TYPES else "按招标文件条件"
+    return canonical, condition_text
+
+
+def _canonicalize_category(value: Any, checks: Sequence[dict[str, Any]]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ComplianceExtractionError("LLM Schema 校验失败：category 不能为空。")
+    raw = value.strip()
+    forbidden_category_aliases = {
+        "存在性检查",
+        "附件存在性检查",
+        "完整性检查",
+        "内容完整性检查",
+        "内容合规性检查",
+        "签字盖章检查",
+        "签章完整性检查",
+        "格式合规检查",
+        "格式合规性检查",
+        "一致性检查",
+        "附件关联检查",
+    }
+    if raw not in forbidden_category_aliases:
+        return raw
+    check_type = checks[0]["check_type"] if checks else "required_field"
+    if check_type in {"attachment_exists", "attachment_content"}:
+        return "attachment"
+    if check_type in {"signature", "seal"}:
+        return "signature"
+    return check_type
 
 
 def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -540,6 +862,9 @@ def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]
         if not target_copy.get("scope"):
             target_copy["scope"] = "single_section"
             coerced_fields.append("target.scope")
+        target_copy["scope"] = _canonicalize_scope(
+            target_copy["scope"], str(target_copy.get("name", ""))
+        )
         normalized["target"] = target_copy
 
     checks = normalized.get("checks")
@@ -562,13 +887,21 @@ def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]
                 check_copy = dict(check)
                 requirement = check_copy.get("requirement")
                 if isinstance(requirement, str):
-                    check_type, evidence_type = _legacy_check_type(requirement)
-                    if not check_copy.get("check_type"):
-                        check_copy["check_type"] = check_type
+                    inferred_type, _ = _legacy_check_type(requirement)
+                    supplied_type = check_copy.get("check_type") or inferred_type
+                    check_type = _canonicalize_check_type(
+                        supplied_type, requirement
+                    )
+                    if check_copy.get("check_type") != check_type:
                         coerced_fields.append("checks[].check_type")
-                    if not check_copy.get("evidence_type"):
-                        check_copy["evidence_type"] = evidence_type
+                    check_copy["check_type"] = check_type
+                    evidence_type = EVIDENCE_BY_CHECK_TYPE[check_type]
+                    if check_copy.get("evidence_type") != evidence_type:
                         coerced_fields.append("checks[].evidence_type")
+                    # Evidence is a program-owned field.  Never trust a free
+                    # model label here, even when it happens to validate as a
+                    # string.
+                    check_copy["evidence_type"] = evidence_type
                 normalized_checks.append(check_copy)
                 continue
             normalized_checks.append(check)
@@ -577,18 +910,35 @@ def _coerce_legacy_shape(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]
     applicability = normalized.get("applicability")
     if isinstance(applicability, str):
         condition = applicability.strip()
-        is_always = bool(re.search(r"所有|全部|各投标人|每个投标人", condition))
+        applicability_type, condition = _canonicalize_applicability(
+            condition, condition
+        )
         normalized["applicability"] = {
-            "type": "always" if is_always else "conditional",
-            "condition": None if is_always else condition,
+            "type": applicability_type,
+            "condition": condition,
         }
         coerced_fields.append("applicability")
     elif isinstance(applicability, dict):
         applicability_copy = dict(applicability)
-        if not applicability_copy.get("type") and applicability_copy.get("condition"):
-            applicability_copy["type"] = "conditional"
+        supplied_type = applicability_copy.get("type")
+        if not supplied_type and applicability_copy.get("condition"):
+            supplied_type = "conditional"
             coerced_fields.append("applicability.type")
+        applicability_type, condition = _canonicalize_applicability(
+            supplied_type, applicability_copy.get("condition")
+        )
+        if applicability_copy.get("type") != applicability_type:
+            coerced_fields.append("applicability.type")
+        applicability_copy["type"] = applicability_type
+        applicability_copy["condition"] = condition
         normalized["applicability"] = applicability_copy
+
+    checks_for_category = normalized.get("checks")
+    if isinstance(checks_for_category, list):
+        normalized["category"] = _canonicalize_category(
+            normalized.get("category"),
+            [check for check in checks_for_category if isinstance(check, dict)],
+        )
 
     return normalized, coerced_fields
 
@@ -614,9 +964,81 @@ def _coerce_raw_requirement(raw: Any) -> dict[str, Any]:
     return model.model_dump()
 
 
+_EXTERNAL_SYSTEM_RE = re.compile(
+    r"电子采购系统|电子招标投标系统|电子招标系统|交易平台|采购平台|系统上传|平台上传|系统提交|平台提交|"
+    r"加密电子投标文件|电子投标文件加密|上传至大附件|上传至平台|完成上传|上传投标文件|"
+    r"CA证书|CA锁|证书在使用时有效|加密提交"
+)
+_FUTURE_PERFORMANCE_RE = re.compile(
+    r"合同签订后|签订后的|履约期间|履约阶段|履约过程中|履约期|未来合同|合同订单模板|合同正文|"
+    r"正式提交的合同文件|甲乙双方信息|安全危险因素告知书|安全保密相关协议"
+)
+_CURRENT_BID_RE = re.compile(
+    r"投标文件|投标阶段|投标时|随投标|作为投标文件|当前投标|递交投标|投标人应"
+)
+_JOINT_BID_RE = re.compile(r"联合体协议|联合体各方|联合体牵头|联合体成员|联合体投标")
+_ALTERNATIVE_BID_RE = re.compile(r"备选投标方案|备选方案")
+
+
+def _project_constraints(blocks: Sequence[StructuredBlock]) -> dict[str, bool]:
+    document_text = "\n".join(block.text for block in blocks)
+    return {
+        "joint_disallowed": bool(
+            re.search(r"(?:不接受|不允许|不得采用|禁止).*联合体|联合体.*(?:不接受|不允许|不得采用|禁止)", document_text)
+        ),
+        "alternative_disallowed": bool(
+            re.search(r"(?:不接受|不允许|不得提交|禁止).*备选|备选.*(?:不接受|不允许|不得提交|禁止)", document_text)
+        ),
+    }
+
+
+def _filter_requirement_reason(
+    item: dict[str, Any],
+    *,
+    constraints: dict[str, bool],
+) -> str | None:
+    checks_text = " ".join(check["requirement"] for check in item["checks"])
+    target_text = item["target"]["name"]
+    searchable = " ".join(
+        [item["name"], target_text, checks_text, item["applicability"].get("condition") or ""]
+    )
+    if _EXTERNAL_SYSTEM_RE.search(searchable):
+        return "external_system_state"
+    if (
+        _FUTURE_PERFORMANCE_RE.search(searchable)
+        and not _CURRENT_BID_RE.search(searchable)
+    ):
+        return "future_contract_or_performance"
+    if (
+        re.search(r"订单模板|合同条款、附件一", searchable)
+        and not re.search(r"投标文件中|作为投标文件|随投标文件", searchable)
+    ):
+        return "future_contract_or_performance"
+    if (
+        re.search(r"合同条款[-—：: ]*双方信息|合同主体|甲乙双方|合同正文|安全保密相关协议", searchable)
+        and not re.search(r"投标文件中|作为投标文件|随投标文件", searchable)
+    ):
+        return "future_contract_or_performance"
+    if constraints.get("joint_disallowed") and _JOINT_BID_RE.search(searchable):
+        return "project_disallowed_joint_bid"
+    if constraints.get("alternative_disallowed") and _ALTERNATIVE_BID_RE.search(searchable):
+        return "project_disallowed_alternative_bid"
+    return None
+
+
+def _filter_reason_counts(report: Sequence[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in report:
+        reason = str(item.get("reason", "unknown"))
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def _normalize_requirements(
     raw_requirements: Iterable[Any],
     blocks: Sequence[StructuredBlock],
+    *,
+    filter_report: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     started_at = time.perf_counter()
     raw_items = list(raw_requirements)
@@ -626,6 +1048,7 @@ def _normalize_requirements(
         len(blocks),
     )
     block_map = {block.block_id: block for block in blocks}
+    constraints = _project_constraints(blocks)
     grouped: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
     for raw in raw_items:
         item = _coerce_raw_requirement(raw)
@@ -633,6 +1056,29 @@ def _normalize_requirements(
             [item["name"], *(check["requirement"] for check in item["checks"])]
         )
         if _EXCLUDED_RE.search(searchable_text):
+            continue
+        filter_reason = _filter_requirement_reason(
+            item,
+            constraints=constraints,
+        )
+        if filter_reason is not None:
+            if filter_report is not None:
+                filter_report.append(
+                    {
+                        "name": item["name"],
+                        "target_name": item["target"]["name"],
+                        "check_types": [
+                            check["check_type"] for check in item["checks"]
+                        ],
+                        "source_block_ids": list(item["source_block_ids"]),
+                        "reason": filter_reason,
+                    }
+                )
+            logger.info(
+                "requirements.normalize.filter name=%s reason=%s",
+                item["name"],
+                filter_reason,
+            )
             continue
         source_ids = list(dict.fromkeys(item["source_block_ids"]))
         if any(block_id not in block_map for block_id in source_ids):
@@ -847,12 +1293,22 @@ class OpenAICompatibleLLM:
             for candidate in batch
         )[:12000]
         prompt = (
-            "从以下招标文件候选内容中提取投标文件编制合规要求。只返回 JSON 对象 "
+            "从以下招标文件候选内容中提取投标文件本身可直接检查的合规要求。只返回 JSON 对象 "
             '{"requirements":[...]}。每项必须包含 name、category、target、checks、'
             "applicability、source_block_ids。target 必须是对象，包含 name 和 scope；"
+            "scope 只能是 single_section、each_section、each_person、each_contract、whole_document；"
             "checks 每项必须是对象，包含 requirement、check_type、evidence_type；"
-            "applicability 必须是对象，包含 type 和 condition；只关注填写、占位符、附件、签字盖章日期、"
-            "材料关联和文件编制要求，排除评分、得分、评标规则。\n\n" + source
+            "check_type 只能是 required_field、placeholder、attachment_exists、attachment_content、"
+            "signature、seal、date、consistency、file_metadata；"
+            "evidence_type 不要自由发挥，将由程序按 check_type 确定；"
+            "applicability 必须是对象，type 只能是 always 或 conditional，condition 可为 null；"
+            "source_block_ids 必须且只能复制输入候选中的真实 block_ids，不得编造 source_text。"
+            "只提取用户已生成的投标文件可检查的填写完整、材料/附件齐全、模板占位符替换、日期、签字、"
+            "盖章、合同关键页、表格与证明材料对应关系、开户证明、文件组成和文件元数据要求。"
+            "排除评分/评标规则、电子采购系统上传或加密提交、CA证书有效性等外部系统状态；"
+            "排除合同签订后或履约阶段要求，除非原文明确要求这些材料作为当前投标文件一并填写签署并提交；"
+            "结合原文项目专用条款，若项目明确不接受联合体或不允许备选方案，不要生成对应编制要求。\n\n"
+            + source
         )
         payload = {
             "model": self.model,
@@ -1012,6 +1468,7 @@ def extract_compliance_requirements_real(
     candidates: list[CandidateWindow] = []
     batches: list[list[CandidateWindow]] = []
     raw_requirements: list[Any] = []
+    filter_report: list[dict[str, Any]] = []
     successful_call_ids: list[str] = []
     stats: dict[str, Any] = {
         "filename": tender_file.filename,
@@ -1034,6 +1491,8 @@ def extract_compliance_requirements_real(
         "llm_failed_calls": 0,
         "llm_retries": 0,
         "raw_requirements": 0,
+        "filtered_requirements": 0,
+        "filtered_by_reason": {},
         "schema_valid_calls": 0,
         "normalization_elapsed_ms": None,
         "final_requirements": 0,
@@ -1107,7 +1566,9 @@ def extract_compliance_requirements_real(
             cache is not None,
         )
         if cache is not None:
-            cache_key = hashlib.sha256(path.read_bytes()).hexdigest()
+            cache_key = hashlib.sha256(
+                REQUIREMENT_CACHE_VERSION.encode("utf-8") + b"\0" + path.read_bytes()
+            ).hexdigest()
             try:
                 cached = cache.get(cache_key)
             except Exception as exc:
@@ -1145,8 +1606,15 @@ def extract_compliance_requirements_real(
                 )
                 persist_artifact(
                     "05_normalized_requirements.json",
-                    {"source": "requirements_cache", "requirements": cached},
+                    {
+                        "source": "requirements_cache",
+                        "requirements": cached,
+                        "filtered_requirements": [],
+                        "filter_count": 0,
+                        "filter_by_reason": {},
+                    },
                 )
+                persist_artifact("06_filter_report.json", [])
                 stats["final_requirements"] = len(cached)
                 run_status = "complete"
                 record_event(
@@ -1327,7 +1795,12 @@ def extract_compliance_requirements_real(
             persist_artifact("04_raw_requirements.json", {"requirements": []})
             persist_artifact(
                 "05_normalized_requirements.json",
-                {"requirements": empty_result},
+                {
+                    "requirements": empty_result,
+                    "filtered_requirements": [],
+                    "filter_count": 0,
+                    "filter_by_reason": {},
+                },
             )
             current_stage = "cache_write"
             if cache is not None and cache_key is not None:
@@ -1341,6 +1814,7 @@ def extract_compliance_requirements_real(
                     )
                     raise
             stats["raw_requirements"] = 0
+            stats["filtered_requirements"] = 0
             stats["final_requirements"] = 0
             run_status = "complete"
             record_event(
@@ -1528,14 +2002,24 @@ def extract_compliance_requirements_real(
         )
         normalization_started_at = time.perf_counter()
         try:
-            normalized = _normalize_requirements(raw_requirements, blocks)
+            normalized = _normalize_requirements(
+                raw_requirements,
+                blocks,
+                filter_report=filter_report,
+            )
         except Exception as exc:
             stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
+            stats["filtered_requirements"] = len(filter_report)
+            stats["filtered_by_reason"] = _filter_reason_counts(filter_report)
+            persist_artifact("06_filter_report.json", filter_report)
             persist_artifact(
                 "05_normalized_requirements.json",
                 {
                     "status": "failed",
                     "requirements": [],
+                    "filtered_requirements": filter_report,
+                    "filter_count": len(filter_report),
+                    "filter_by_reason": _filter_reason_counts(filter_report),
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                 },
@@ -1554,6 +2038,8 @@ def extract_compliance_requirements_real(
             )
             raise
         stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
+        stats["filtered_requirements"] = len(filter_report)
+        stats["filtered_by_reason"] = _filter_reason_counts(filter_report)
         stats["schema_valid_calls"] = len(successful_call_ids)
         for call_id in successful_call_ids:
             if active_recorder is not None:
@@ -1561,11 +2047,19 @@ def extract_compliance_requirements_real(
         stats["final_requirements"] = len(normalized)
         persist_artifact(
             "05_normalized_requirements.json",
-            {"requirements": normalized},
+            {
+                "requirements": normalized,
+                "filtered_requirements": filter_report,
+                "filter_count": len(filter_report),
+                "filter_by_reason": _filter_reason_counts(filter_report),
+            },
         )
+        persist_artifact("06_filter_report.json", filter_report)
         record_event(
             "requirements.normalize.end",
             requirements=len(normalized),
+            filtered_requirements=len(filter_report),
+            filtered_by_reason=_filter_reason_counts(filter_report),
             elapsed_ms=stats["normalization_elapsed_ms"],
         )
         current_stage = "cache_write"
