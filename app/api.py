@@ -13,8 +13,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
 )
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from app.config import Settings, load_settings
 from app.mock_services import (
@@ -72,6 +76,25 @@ def create_app(
     application.state.settings = active_settings
     application.state.repository = active_repository
     application.state.workflow = active_workflow
+    app_dir = Path(__file__).resolve().parent
+    application.mount(
+        "/static",
+        StaticFiles(directory=str(app_dir / "static")),
+        name="static",
+    )
+    templates = Jinja2Templates(directory=str(app_dir / "templates"))
+
+    @application.get("/")
+    def root():
+        return RedirectResponse("/bid-check")
+
+    @application.get("/bid-check", response_class=HTMLResponse)
+    def bid_check_page(request: Request):
+        return templates.TemplateResponse(
+            request=request,
+            name="bid_check.html",
+            context={},
+        )
 
     @application.post("/api/bid-check/tasks", status_code=202)
     async def create_bid_check_task(
@@ -144,4 +167,3 @@ def create_app(
         return task.to_dict()
 
     return application
-

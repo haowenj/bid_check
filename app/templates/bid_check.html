@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+
+{% block title %}标书检查 · 创建任务{% endblock %}
+
+{% block content %}
+  <header class="page-heading hero-heading">
+    <div>
+      <span class="eyebrow">新版工作流 · 第一版</span>
+      <h1>创建标书检查任务</h1>
+      <p>上传招标文件与投标文件，选择校验方式后开始任务。</p>
+    </div>
+    <div class="version-badge">DOCX</div>
+  </header>
+
+  <form id="bid-check-form" novalidate>
+    <section class="card section-card" aria-labelledby="upload-heading">
+      <div class="section-heading">
+        <div>
+          <span class="section-number">01</span>
+          <h2 id="upload-heading">上传文件</h2>
+        </div>
+        <p>当前第一版仅支持 .docx 文件</p>
+      </div>
+
+      <div class="upload-grid">
+        <article class="upload-card" data-upload-card="tender_file">
+          <div class="upload-card-heading">
+            <span class="file-kind">招</span>
+            <div>
+              <h3>招标文件</h3>
+              <p>用于提取合规性检查要求</p>
+            </div>
+          </div>
+          <label class="upload-zone">
+            <span class="upload-icon" aria-hidden="true">↑</span>
+            <strong>上传招标文件</strong>
+            <span>点击选择本地 DOCX 文件</span>
+            <input
+              name="tender_file"
+              type="file"
+              accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              required
+            >
+          </label>
+          <div class="file-summary" aria-live="polite" hidden>
+            <span class="file-success" aria-hidden="true">✓</span>
+            <span class="file-copy">
+              <strong data-file-name></strong>
+              <small><span data-file-size></span> · 已选择</small>
+            </span>
+            <button class="text-button" type="button" data-clear-file>删除</button>
+          </div>
+        </article>
+
+        <article class="upload-card" data-upload-card="bid_file">
+          <div class="upload-card-heading">
+            <span class="file-kind bid-kind">投</span>
+            <div>
+              <h3>投标文件</h3>
+              <p>用于模拟解析投标文件结构</p>
+            </div>
+          </div>
+          <label class="upload-zone">
+            <span class="upload-icon" aria-hidden="true">↑</span>
+            <strong>上传投标文件</strong>
+            <span>点击选择本地 DOCX 文件</span>
+            <input
+              name="bid_file"
+              type="file"
+              accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              required
+            >
+          </label>
+          <div class="file-summary" aria-live="polite" hidden>
+            <span class="file-success" aria-hidden="true">✓</span>
+            <span class="file-copy">
+              <strong data-file-name></strong>
+              <small><span data-file-size></span> · 已选择</small>
+            </span>
+            <button class="text-button" type="button" data-clear-file>删除</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="card section-card" aria-labelledby="mode-heading">
+      <div class="section-heading">
+        <div>
+          <span class="section-number">02</span>
+          <h2 id="mode-heading">选择校验方式</h2>
+        </div>
+        <p>第一版仅开放标书合规性校验</p>
+      </div>
+
+      <div class="mode-grid">
+        <label class="mode-card mode-available">
+          <input name="check_mode" type="radio" value="compliance" required>
+          <span class="mode-radio" aria-hidden="true"></span>
+          <span class="mode-status available">本轮可执行</span>
+          <strong>标书合规性校验</strong>
+          <span class="mode-description">
+            检查模板填写、必填字段、附件完整性、<br>
+            签字盖章、日期及材料完整性等问题。
+          </span>
+        </label>
+
+        <label class="mode-card mode-disabled" aria-disabled="true">
+          <input name="check_mode" type="radio" value="evaluation" disabled>
+          <span class="mode-radio" aria-hidden="true"></span>
+          <span class="mode-status">开发中</span>
+          <strong>评标规则校验</strong>
+          <span class="mode-subtitle">评分项与否决投标风险</span>
+          <span class="mode-description">
+            根据招标文件中的评分办法、初步评审标准、
+            否决投标条款等，检查预计得分及废标风险。
+          </span>
+        </label>
+
+        <label class="mode-card mode-disabled" aria-disabled="true">
+          <input name="check_mode" type="radio" value="full" disabled>
+          <span class="mode-radio" aria-hidden="true"></span>
+          <span class="mode-status">开发中</span>
+          <strong>全面校验</strong>
+          <span class="mode-description">
+            同时执行标书合规性校验和评标规则校验。
+          </span>
+        </label>
+      </div>
+    </section>
+
+    <div id="form-error" class="error" role="alert" hidden></div>
+    <div class="form-actions">
+      <p>文件仅用于当前任务，第一版不会调用任何模型或真实解析器。</p>
+      <button id="start-check" class="button primary" type="submit" disabled>
+        开始校验
+        <span aria-hidden="true">→</span>
+      </button>
+    </div>
+  </form>
+{% endblock %}
+
+{% block scripts %}
+  <script src="{{ url_for('static', path='upload.js') }}" defer></script>
+{% endblock %}
+
