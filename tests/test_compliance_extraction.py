@@ -139,6 +139,534 @@ def test_template_attachment_extraction_ignores_attachment_word_and附加_clause
     assert template["attachments"] == ["法定代表人身份证复印件"]
 
 
+def test_template_attachment_extraction_uses_submission_semantics_for_materials():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应提交营业执照、开户证明及软件合法使用权证明。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "营业执照",
+        "开户证明",
+        "软件合法使用权证明",
+    ]
+
+
+def test_template_attachment_extraction_filters_non_material_items_from_explicit_list():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "附件：投标文件及营业执照复印件。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["营业执照复印件"]
+
+
+def test_template_attachment_extraction_accepts_material_quantity_suffixes():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应提交营业执照原件1份及开户证明复印件各一份。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["营业执照原件1份", "开户证明复印件各一份"]
+
+
+def test_template_attachment_extraction_preserves_conditional_material_requirements():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "如为代理商，须提供制造商授权证明；"
+                "联合体投标时，需分别提交各成员单位的主体资格证明文件；"
+                "非事业单位时，应提供营业执照扫描件。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "如为代理商，须提供制造商授权证明",
+        "联合体投标时，需分别提交各成员单位的主体资格证明文件",
+        "非事业单位时，应提供营业执照扫描件",
+    ]
+
+
+def test_template_attachment_extraction_preserves_long_supplier_condition():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标产品制造商注册地在境外，使用代理商投标且制造商无法盖章的，"
+                "应提供委托签署权的相关证明材料。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "投标产品制造商注册地在境外，使用代理商投标且制造商无法盖章的，应提供委托签署权的相关证明材料"
+    ]
+
+
+def test_template_attachment_extraction_reads_materials_from_table_cells():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "table",
+                "<table><tr><th>材料</th><th>要求</th></tr>"
+                "<tr><td>资格证明</td><td>需提交开户证明及软件授权文件</td></tr></table>",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["开户证明", "软件授权文件"]
+
+
+def test_template_attachment_extraction_carries_standalone_attachment_marker_to_next_block():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2", "b3"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block("b2", "paragraph", "附：", "投标文件格式", 2),
+            block(
+                "b3",
+                "paragraph",
+                "1.委托代理人的合法有效身份证明复印件或扫描件(如提供居民身份证，需同时提供正反面)",
+                "投标文件格式",
+                3,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "1.委托代理人的合法有效身份证明复印件或扫描件(如提供居民身份证，需同时提供正反面)"
+    ]
+
+
+def test_template_attachment_extraction_keeps_multiple_blocks_after_attachment_marker():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2", "b3", "b4"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block("b2", "paragraph", "附：", "投标文件格式", 2),
+            block("b3", "paragraph", "1.营业执照复印件。", "投标文件格式", 3),
+            block("b4", "paragraph", "2.开户证明文件。", "投标文件格式", 4),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["1.营业执照复印件", "2.开户证明文件"]
+
+
+def test_template_attachment_extraction_does_not_emit_table_layout_separators():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "table",
+                "<table><tr><td>附：</td><td>营业执照复印件</td></tr></table>",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["营业执照复印件"]
+
+
+def test_template_attachment_extraction_does_not_treat_capability_as_material():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应提供服务能力和售后支持，不附加任何条件。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_requires_a_material_entity_beyond_evidence_words():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应提供扫描件，并提交相关证明材料。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_ignores_unrelated_document_prose():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "本单位承诺与贵公司的合同/协议约定一致，不得向其他方提供、披露；"
+                "投标文件编制、签署并递交相关资料；"
+                "还应报送审查工作需要的材料。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_accepts_material_before_submission_action():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "营业执照复印件应随投标文件一并提交；软件合法使用权证明须附。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "营业执照复印件",
+        "软件合法使用权证明",
+    ]
+
+
+def test_template_attachment_extraction_ignores_descriptive_document_prose():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "本保函作为（投标人）对（项目）的投标邀请而提供的投标保函。"
+                "本保函有效期应不短于投标有效期。"
+                "要求提供原件的，需提供文件原件。"
+                "投标文件编制、签署并递交相关资料。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_does_not_treat_bare_附_as_submission_action():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "前附表3.3.6投标报价具体要求，未按照招标文件要求进行报价。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_ignores_process_and_contract_prose():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "我方在评标过程中根据评标委员会要求提供的符合相关规定的澄清文件，"
+                "联合体递交投标文件，履行合同并处理相关事务。"
+                "其他途径开具的电子投标保函，投标人须提供可在评标现场核验保函真实性的有效途径。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_extraction_ignores_post_award_and_review_process_materials():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "合同签订后应提交验收报告；评标过程中应提供澄清材料。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == []
+
+
+def test_template_attachment_condition_detection_requires_condition_grammar():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应当提交营业执照；如为代理商，须提交制造商授权证明。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == [
+        "营业执照",
+        "如为代理商，须提交制造商授权证明",
+    ]
+
+
+def test_template_attachment_extraction_keeps_qualification_evidence_names():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人须提交项目经验报告及商业信誉证明。",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["项目经验报告", "商业信誉证明"]
+
+
+def test_template_condition_is_retained_in_raw_template_source():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block(
+                "b2",
+                "heading",
+                "法定代表人身份证明（如有）",
+                "投标文件格式",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["name"] == "法定代表人身份证明"
+    assert "（如有）" in template["body"]
+    assert template["source"]["source_text"] == template["body"]
+
+
 def test_template_fields_prefer_mineru_underline_runs_over_bare_colons():
     payload = [
         {"type": "text", "content": "投标人名称："},

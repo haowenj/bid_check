@@ -39,7 +39,7 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v21:{REQUIREMENT_PROMPT_VERSION}"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v24:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v5"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
@@ -1299,7 +1299,49 @@ _PLACEHOLDER_FIELD_LABEL_RE = re.compile(r"\[([^\[\]]{1,60})\]")
 _EXTERNAL_PLACEHOLDER_LABEL_RE = re.compile(r"招标人|招标项目|标包")
 _TABLE_INDEX_LABEL_RE = re.compile(r"^(?:序号|编号|行号)$")
 _ATTACHMENT_RE = re.compile(
-    r"(?:附件|须附|应附|附)(?!加|带|近)[：:\s]+(.+?)(?=[。；;\n]|$)"
+    r"附件(?!加|带|近)[：:\s]+(?P<attachment>.+?)(?=[。；;\n]|$)|"
+    r"(?:须附|应附)(?!加|带|近)[：:\s]*(?P<direct_attachment>.+?)(?=[。；;\n]|$)|"
+    r"(?<!附)附(?!加|带|近)[：:\s]+(?P<legacy_attachment>.+?)(?=[。；;\n]|$)"
+)
+_ATTACHMENT_SUBMISSION_RE = re.compile(
+    r"附上|附带|附送|(?:应当|必须|须|需|应)附|提供|提交|递交|上传|出具|报送"
+)
+_ATTACHMENT_MATERIAL_RE = re.compile(
+    r"证明|材料|文件|证书|证照|执照|证件|报告|合同|协议|授权|凭证|发票|订单|"
+    r"清单|复印件|扫描件|影印件|截图|照片|回执|许可证|批件|申请表|登记表|表单|函"
+)
+_ATTACHMENT_GENERIC_MATERIAL_RE = re.compile(
+    r"^(?:相关|相应|有关|上述|必要的)?(?:证明材料|证明文件|证明|材料|文件|资料|"
+    r"扫描件|复印件|影印件|证件|文件原件|原件|数据文件)$|"
+    r"^的?(?:其他|相关|有关)相关?文件$|"
+    r"^[^。；;，,]{1,20}(?:需要的|所需的)(?:证明材料|证明文件|材料|文件|资料)$"
+)
+_ATTACHMENT_NOT_INDEPENDENT_RE = re.compile(
+    r"投标文件|响应文件|报价文件|履约保证金|履约保函|履行合同|合同签订后|"
+    r"终验|承诺如下|承诺内容|招标文件|"
+    r"本(?:文件|承诺函|清单|表|函)|"
+    r"虚假|伪造|变造|弄虚作假|骗取中标"
+)
+_ATTACHMENT_NEGATIVE_CONTEXT_RE = re.compile(
+    r"无需|无须|不得|不应|不向|不提供|不提交|不递交|不上传|不出具"
+)
+_ATTACHMENT_PROCESS_CONTEXT_RE = re.compile(
+    r"合同签订后|合同履行过程中|履约阶段|评标过程中|评审过程中|评标委员会要求"
+)
+_ATTACHMENT_MATERIAL_END_RE = re.compile(
+    r"(?:证明|材料|文件|证书|证照|执照|证件|报告|合同|协议|授权|凭证|发票|订单|"
+    r"清单|复印件|扫描件|影印件|截图|照片|回执|许可证|批件|申请表|登记表|表单|函)"
+    r"(?:\s*(?:原件|正本|副本|电子版|纸质版|各?[0-9一二三四五六七八九十百]+份|"
+    r"[0-9一二三四五六七八九十百]+套|[0-9一二三四五六七八九十百]+页|"
+    r"[（(][^（）()]*[）)]))*\s*$")
+_ATTACHMENT_CONDITION_RE = re.compile(
+    r"(?:^|[，,；;。．.：:（(\[【])\s*(?:如|若|如果|当|仅在|仅限于?|非)"
+    r"[^。；;\n]{0,60}(?:时|情况下|情形|条件|才|则|，|,)|"
+    r"(?:^|[，,；;。．.：:（(\[【])\s*(?:联合体|代理商|经销商|制造商|分支机构)"
+    r"[^。；;\n]{0,40}(?:投标|时|情况下|情形|分别|各成员)|"
+    r"(?:^|[，,；;。．.：:（(\[【])[^。；;\n]{0,20}"
+    r"(?:联合体|代理商|经销商|制造商|分支机构)"
+    r"[^。；;\n]{0,80}(?:投标的?|投标时|使用代理商投标|需要(?:单独|分别)?提供)"
 )
 
 
@@ -1863,11 +1905,194 @@ def _template_fields(blocks: Sequence[StructuredBlock]) -> list[str]:
 
 def _template_attachments(blocks: Sequence[StructuredBlock]) -> list[str]:
     attachments: list[str] = []
+
+    def append(value: str, *, clause: str) -> None:
+        normalized = re.sub(r"\s+", " ", value).strip(" \t。；;")
+        if not normalized:
+            return
+        display = (
+            re.sub(r"\s+", " ", clause).strip(" \t。；;")
+            if _ATTACHMENT_CONDITION_RE.search(clause)
+            else normalized
+        )
+        if display and display not in attachments:
+            attachments.append(display)
+
+    def split_materials(value: str) -> list[str]:
+        parts: list[str] = []
+        start = 0
+        stack: list[str] = []
+        closing_to_opening = {
+            closing: opening for opening, closing in _PARENTHETICAL_PAIRS.items()
+        }
+        for index, character in enumerate(value):
+            if character in _PARENTHETICAL_PAIRS:
+                stack.append(character)
+                continue
+            opening = closing_to_opening.get(character)
+            if opening is not None and stack and stack[-1] == opening:
+                stack.pop()
+                continue
+            if not stack and character in "、及":
+                part = value[start:index].strip(" \t，,")
+                if part:
+                    parts.append(part)
+                start = index + 1
+        tail = value[start:].strip(" \t，,")
+        if tail:
+            parts.append(tail)
+        return parts or [value]
+
+    def clauses(value: str) -> list[str]:
+        result: list[str] = []
+        start = 0
+        stack: list[str] = []
+        closing_to_opening = {
+            closing: opening for opening, closing in _PARENTHETICAL_PAIRS.items()
+        }
+        for index, character in enumerate(value):
+            if character in _PARENTHETICAL_PAIRS:
+                stack.append(character)
+                continue
+            opening = closing_to_opening.get(character)
+            if opening is not None and stack and stack[-1] == opening:
+                stack.pop()
+                continue
+            if not stack and character in "。；;\n":
+                clause = value[start:index].strip()
+                if clause:
+                    result.append(clause)
+                start = index + 1
+        tail = value[start:].strip()
+        if tail:
+            result.append(tail)
+        return result
+
+    def material_candidates(value: str) -> list[str]:
+        value = re.sub(r"\s+", " ", _strip_markup(value)).strip(" \t|：:")
+        value = re.sub(r"[，,]\s*(?:并|且|同时)?\s*$", "", value)
+        value = re.sub(r"^(?:以下|相关|相应)?(?:材料|文件)\s*[：:]\s*", "", value)
+        if (
+            not value
+            or not _ATTACHMENT_MATERIAL_RE.search(value)
+            or _ATTACHMENT_GENERIC_MATERIAL_RE.fullmatch(value)
+        ):
+            return []
+        candidates: list[str] = []
+        for candidate in split_materials(value):
+            candidate = candidate.strip(" \t|，,。；;")
+            if (
+                candidate
+                and _ATTACHMENT_MATERIAL_RE.search(candidate)
+                and not _ATTACHMENT_GENERIC_MATERIAL_RE.fullmatch(candidate)
+                and not _ATTACHMENT_NOT_INDEPENDENT_RE.search(candidate)
+            ):
+                candidates.append(candidate)
+        return candidates
+
+    def submission_material_candidates(value: str) -> list[str]:
+        """Extract noun-like material phrases immediately after a submission verb."""
+        candidates: list[str] = []
+        for segment in clauses(re.sub(r"([，,])", r"\1\n", value)):
+            segment = re.sub(r"^(?:以及|并且|并|同时|或者|或)\s*", "", segment)
+            for candidate in split_materials(segment):
+                candidate = candidate.strip(" \t|，,。；;")
+                if (
+                    candidate
+                    and _ATTACHMENT_MATERIAL_END_RE.search(candidate)
+                    and material_candidates(candidate)
+                ):
+                    candidates.append(candidate)
+        return candidates
+
+    def submission_is_requirement(match: re.Match[str], clause: str) -> bool:
+        action = match.group(0)
+        if action in {"附上", "附带", "附送"} or action.endswith("附"):
+            return True
+        context = clause[max(0, match.start() - 36) : match.start()]
+        if (
+            _ATTACHMENT_NEGATIVE_CONTEXT_RE.search(context)
+            or _ATTACHMENT_PROCESS_CONTEXT_RE.search(context)
+        ):
+            return False
+        if action in {"提交", "递交", "上传", "出具", "报送"}:
+            return True
+        return bool(re.search(r"应当|必须|须|需|应|要求|承诺", context))
+
+    def preceding_material(match: re.Match[str], clause: str) -> list[str]:
+        prefix = clause[: match.start()].strip(" \t，,：:")
+        if not prefix:
+            return []
+        action = match.group(0)
+        if action.endswith("附"):
+            before_modal = prefix
+        else:
+            modal_match = list(re.finditer(r"应当|必须|须|需|应", prefix))
+            if not modal_match:
+                return []
+            modal = modal_match[-1]
+            context = prefix[max(0, modal.start() - 4) : modal.end() + 4]
+            if _ATTACHMENT_NEGATIVE_CONTEXT_RE.search(context):
+                return []
+            before_modal = prefix[: modal.start()]
+        before_modal = re.split(r"[。；;，,：:\n]", before_modal)[-1]
+        return submission_material_candidates(before_modal)
+
+    pending_attachment_marker = False
     for block in blocks:
-        for match in _ATTACHMENT_RE.finditer(block.text):
-            attachment = match.group(1).strip(" \t。；;")
-            if attachment and attachment not in attachments:
-                attachments.append(attachment)
+        if pending_attachment_marker and block.type == "heading":
+            pending_attachment_marker = False
+        texts = [block.text]
+        if block.type == "table":
+            rows = _template_table_rows(block)
+            texts.extend(" | ".join(row) for row in rows)
+            texts.extend(cell for row in rows for cell in row)
+        for raw_text in texts:
+            text = _strip_markup(raw_text)
+            for clause in clauses(text):
+                if pending_attachment_marker:
+                    pending_candidates = material_candidates(clause)
+                    if not pending_candidates:
+                        pending_attachment_marker = False
+                    for candidate in pending_candidates:
+                        append(candidate, clause=clause)
+
+                explicit_matches = list(_ATTACHMENT_RE.finditer(clause))
+                for match in explicit_matches:
+                    attachment = next(
+                        (
+                            match.group(group)
+                            for group in (
+                                "attachment",
+                                "direct_attachment",
+                                "legacy_attachment",
+                            )
+                            if match.group(group)
+                        ),
+                        "",
+                    )
+                    for candidate in material_candidates(attachment):
+                        append(candidate, clause=clause)
+                if re.fullmatch(r"附\s*[：:]", clause.strip()):
+                    pending_attachment_marker = True
+
+                submission_matches = list(_ATTACHMENT_SUBMISSION_RE.finditer(clause))
+                for index, match in enumerate(submission_matches):
+                    if not submission_is_requirement(match, clause):
+                        continue
+                    end = (
+                        submission_matches[index + 1].start()
+                        if index + 1 < len(submission_matches)
+                        else len(clause)
+                    )
+                    after_candidates = submission_material_candidates(
+                        clause[match.end() : end]
+                    )
+                    for candidate in after_candidates:
+                        append(candidate, clause=clause)
+                    if not after_candidates:
+                        for candidate in preceding_material(match, clause):
+                            append(candidate, clause=clause)
     return attachments
 
 
