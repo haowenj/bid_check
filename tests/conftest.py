@@ -49,6 +49,7 @@ def settings(tmp_path):
         database_path=data_dir / "bid_check.db",
         tasks_dir=data_dir / "tasks",
         mock_delay_seconds=0,
+        mineru_url="",
         allow_docx_fallback=True,
     )
 

@@ -42,8 +42,9 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # its own stable version and remains reusable.
 REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v14:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v2"
-MINERU_TASKS_PROTOCOL_VERSION = "pdf-trans-tasks-v1"
-MINERU_TASKS_PROTOCOL_LABEL = "pdf_trans_tasks"
+MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
+MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
+DEFAULT_MINERU_URL = "http://127.0.0.1:7100"
 DEFAULT_MINERU_BACKEND = "hybrid-engine"
 SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
 DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
@@ -479,24 +480,18 @@ class MinerUDocumentParser:
         self.mineru_url = (
             mineru_url
             if mineru_url is not None
-            else os.getenv("PDF_TRANS_MINERU_URL")
-            or os.getenv("MINERU_API_URL")
+            else DEFAULT_MINERU_URL
         )
         self.mineru_api_key = (
             mineru_api_key
             if mineru_api_key is not None
-            else os.getenv("MINERU_API_KEY")
-            or os.getenv("PDF_TRANS_MINERU_API_KEY")
+            else None
         )
-        self.mineru_backend = mineru_backend or os.getenv(
-            "PDF_TRANS_MINERU_BACKEND",
-            os.getenv("MINERU_BACKEND", DEFAULT_MINERU_BACKEND),
-        )
+        self.mineru_backend = mineru_backend or DEFAULT_MINERU_BACKEND
         self.mineru_server_url = (
             mineru_server_url
             if mineru_server_url is not None
-            else os.getenv("PDF_TRANS_MINERU_SERVER_URL")
-            or os.getenv("MINERU_SERVER_URL")
+            else None
         )
         self.timeout_seconds = float(timeout_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
@@ -517,16 +512,16 @@ class MinerUDocumentParser:
 
     @property
     def cache_descriptor(self) -> dict[str, Any]:
-        if (self.mineru_url or "").strip():
-            transport = "pdf_trans_tasks"
-        elif (self.command or "").strip():
+        if (self.command or "").strip():
             transport = "command"
+        elif (self.mineru_url or "").strip():
+            transport = "mineru_tasks"
         else:
             transport = "docx_fallback"
         return {
             "parser": self.parser_name,
             "transport": transport,
-            "protocol": MINERU_TASKS_PROTOCOL_VERSION if transport == "pdf_trans_tasks" else None,
+            "protocol": MINERU_TASKS_PROTOCOL_VERSION if transport == "mineru_tasks" else None,
             "url": (self.mineru_url or "").strip(),
             "backend": self.mineru_backend,
             "server_url": (self.mineru_server_url or "").strip(),
@@ -541,10 +536,10 @@ class MinerUDocumentParser:
             path.name,
         )
         try:
-            if (self.mineru_url or "").strip():
-                blocks = self._parse_with_mineru_service(path)
-            elif (self.command or "").strip():
+            if (self.command or "").strip():
                 blocks = self._parse_with_mineru_command(path)
+            elif (self.mineru_url or "").strip():
+                blocks = self._parse_with_mineru_service(path)
             elif self.allow_docx_fallback:
                 blocks = parse_docx_document(path)
                 self.parse_diagnostics = {
@@ -555,17 +550,18 @@ class MinerUDocumentParser:
                 }
             else:
                 raise ComplianceExtractionError(
-                    "MinerU 未配置：请配置 PDF_TRANS_MINERU_URL（或 MINERU_API_URL）"
-                    "，正常业务不允许自动使用 DOCX XML fallback。"
+                    "MinerU 服务未配置，正常业务不允许自动使用 DOCX XML fallback。"
                 )
         except ComplianceExtractionError:
             self.parse_diagnostics = {
                 "parser": self.parser_name,
                 "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
                 "service_protocol": (
-                    MINERU_TASKS_PROTOCOL_LABEL
+                    "command"
+                    if (self.command or "").strip()
+                    else MINERU_TASKS_PROTOCOL_LABEL
                     if (self.mineru_url or "").strip()
-                    else "command" if (self.command or "").strip() else None
+                    else None
                 ),
                 "elapsed_ms": _elapsed_ms(started_at),
             }
@@ -575,9 +571,11 @@ class MinerUDocumentParser:
                 "parser": self.parser_name,
                 "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
                 "service_protocol": (
-                    MINERU_TASKS_PROTOCOL_LABEL
+                    "command"
+                    if (self.command or "").strip()
+                    else MINERU_TASKS_PROTOCOL_LABEL
                     if (self.mineru_url or "").strip()
-                    else "command" if (self.command or "").strip() else None
+                    else None
                 ),
                 "elapsed_ms": _elapsed_ms(started_at),
             }
@@ -636,7 +634,7 @@ class MinerUDocumentParser:
             self.mineru_server_url or ""
         ).strip():
             raise ComplianceExtractionError(
-                "hybrid-http-client 模式下必须配置 PDF_TRANS_MINERU_SERVER_URL。"
+                "hybrid-http-client 模式下必须配置 MinerU server_url。"
             )
         if self.timeout_seconds <= 0 or self.poll_interval_seconds < 0:
             raise ComplianceExtractionError("MinerU 超时或轮询间隔配置无效。")

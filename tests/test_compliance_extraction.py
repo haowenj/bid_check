@@ -777,7 +777,7 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
     assert blocks[4].metadata["img_path"] == "images/001.jpg"
     assert parser.parser_name == "mineru"
     assert parser.parse_diagnostics["mineru_called"] is True
-    assert parser.parse_diagnostics["service_protocol"] == "pdf_trans_tasks"
+    assert parser.parse_diagnostics["service_protocol"] == "mineru_tasks"
     client.close()
 
 

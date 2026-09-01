@@ -33,19 +33,16 @@ def test_load_settings_reads_project_env_before_process_environment(
     assert load_settings(tmp_path).llm_model == "qwen3.8-27b"
 
 
-def test_load_settings_reads_existing_pdf_trans_mineru_configuration(tmp_path):
+def test_load_settings_keeps_mineru_on_existing_default_service(tmp_path):
     (tmp_path / ".env").write_text(
-        "PDF_TRANS_MINERU_URL=http://mineru.example:7100\n"
-        "PDF_TRANS_MINERU_BACKEND=hybrid-http-client\n"
-        "PDF_TRANS_MINERU_SERVER_URL=http://model.example:8000\n"
-        "MINERU_API_KEY=service-key\n",
+        "LLM_BASE_URL=https://llm.example/v1\n",
         encoding="utf-8",
     )
 
     settings = load_settings(tmp_path)
 
-    assert settings.mineru_url == "http://mineru.example:7100"
-    assert settings.mineru_backend == "hybrid-http-client"
-    assert settings.mineru_server_url == "http://model.example:8000"
-    assert settings.mineru_api_key == "service-key"
+    assert settings.mineru_url == "http://127.0.0.1:7100"
+    assert settings.mineru_backend == "hybrid-engine"
+    assert settings.mineru_server_url is None
+    assert settings.mineru_api_key is None
     assert settings.allow_docx_fallback is False
