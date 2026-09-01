@@ -138,7 +138,7 @@ def test_normalization_repairs_source_id_using_candidate_window_support():
     assert "知识产权" in result[0]["source"]["source_text"]
 
 
-def test_deterministic_fallback_keeps_candidate_rule_without_invented_checks():
+def test_deterministic_fallback_returns_object_without_invented_checks():
     llm = extraction_module.DeterministicComplianceLLM()
     result = llm.extract(
         [
@@ -151,17 +151,19 @@ def test_deterministic_fallback_keeps_candidate_rule_without_invented_checks():
         ]
     )
 
-    assert result == [
-        {
-            "name": "商务投标文件封面",
-            "rule": "投标人名称：____\n日期：____",
-            "condition": None,
-            "source_block_ids": ["b0001"],
-        }
-    ]
+    assert result == {
+        "templates": [
+            {
+                "name": "商务投标文件封面",
+                "source_block_ids": ["b0001"],
+            }
+        ],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
 
 
-def test_openai_prompt_only_requests_tender_requirements(monkeypatch):
+def test_openai_prompt_only_requests_tender_objects(monkeypatch):
     captured = {}
 
     class FakeResponse:
@@ -172,7 +174,17 @@ def test_openai_prompt_only_requests_tender_requirements(monkeypatch):
             return False
 
         def read(self):
-            return json.dumps({"choices": [{"message": {"content": '{"requirements": []}'}}]}).encode()
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
+                            }
+                        }
+                    ]
+                }
+            ).encode()
 
     def fake_urlopen(request, timeout):
         captured["payload"] = json.loads(request.data.decode())
@@ -184,12 +196,15 @@ def test_openai_prompt_only_requests_tender_requirements(monkeypatch):
     )
 
     prompt = captured["payload"]["messages"][1]["content"]
-    assert "name、rule、condition、source_block_ids" in prompt
+    assert "templates" in prompt
+    assert "project_requirements" in prompt
+    assert "supplemental_materials" in prompt
     assert "不得生成 check_type" in prompt
-    assert "不得生成 scope" in prompt
-    assert "不得生成 evidence_type" in prompt
-    assert "保留" in prompt and "或者" in prompt
-    assert "每项只能包含" in prompt
+    assert "scope" in prompt
+    assert "evidence_type" in prompt
+    assert "source_text" in prompt
+    assert "自然语言规则" in prompt
+    assert "name、rule、condition" not in prompt
 
 
 def test_requirement_cache_version_is_new_and_parse_cache_key_is_stable():
@@ -297,7 +312,15 @@ def test_openai_prompt_does_not_drop_long_candidate_text(monkeypatch):
 
         def read(self):
             return json.dumps(
-                {"choices": [{"message": {"content": '{"requirements": []}'}}]}
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
+                            }
+                        }
+                    ]
+                }
             ).encode()
 
     def fake_urlopen(request, timeout):

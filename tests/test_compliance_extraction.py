@@ -557,6 +557,106 @@ def test_source_normalization_rejects_unknown_ids_and_restores_original_text():
         normalize_tender_extraction_sources(invalid, blocks)
 
 
+def test_openai_prompt_requests_only_narrow_tender_objects(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "templates": [],
+                                        "project_requirements": [],
+                                        "supplemental_materials": [],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
+    result = extraction_module.OpenAICompatibleLLM(api_key="test-key").extract(
+        [
+            CandidateWindow(
+                ["b0600"],
+                "商务投标文件格式",
+                "投标函\n投标人名称：____",
+                600,
+                kind="templates",
+            )
+        ]
+    )
+
+    prompt = captured["payload"]["messages"][1]["content"]
+    assert result == {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
+    assert "templates" in prompt
+    assert "project_requirements" in prompt
+    assert "supplemental_materials" in prompt
+    assert "check_type" in prompt
+    assert "scope" in prompt
+    assert "evidence_type" in prompt
+    assert "source_text" in prompt
+    assert "TenderRequirement" in prompt or "自然语言规则" in prompt
+    assert "name、rule、condition" not in prompt
+
+
+def test_deterministic_llm_returns_narrow_object_candidates():
+    result = extraction_module.DeterministicComplianceLLM().extract(
+        [
+            CandidateWindow(
+                ["b0601"],
+                "商务投标文件格式",
+                "投标函\n投标人名称：____",
+                601,
+                kind="templates",
+            ),
+            CandidateWindow(
+                ["b0602"],
+                "投标人须知前附表",
+                "投标有效期 | 90 天",
+                602,
+                kind="project_requirements",
+            ),
+        ]
+    )
+
+    assert result["templates"] == [
+        {
+            "name": "投标函",
+            "source_block_ids": ["b0601"],
+        }
+    ]
+    assert result["project_requirements"] == [
+        {
+            "requirement": "投标有效期 | 90 天",
+            "value": "90 天",
+            "source_block_ids": ["b0602"],
+        }
+    ]
+    assert result["supplemental_materials"] == []
+
+
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:
     body = []
     for text, style in paragraphs:
@@ -1030,7 +1130,15 @@ def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
 
         def read(self):
             return json.dumps(
-                {"choices": [{"message": {"content": '{"requirements": []}'}}]}
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
+                            }
+                        }
+                    ]
+                }
             ).encode()
 
     def fake_urlopen(request, timeout):
@@ -1042,12 +1150,18 @@ def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
     llm = extraction_module.OpenAICompatibleLLM(api_key="test-key", timeout_seconds=17)
     result = llm.extract([CandidateWindow(["b0001"], "格式", "投标人名称应填写。", 1)])
 
-    assert result == []
+    assert result == {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
     assert captured["payload"]["enable_thinking"] is False
     assert captured["payload"]["max_tokens"] == 8192
     assert captured["timeout"] == 17
     prompt = captured["payload"]["messages"][1]["content"]
-    assert "name、rule、condition、source_block_ids" in prompt
+    assert "templates" in prompt
+    assert "project_requirements" in prompt
+    assert "supplemental_materials" in prompt
     assert "不得生成 check_type" in prompt
 
 
@@ -1143,7 +1257,15 @@ def test_openai_compatible_llm_logs_call_start_and_end(monkeypatch, caplog):
 
         def read(self):
             return json.dumps(
-                {"choices": [{"message": {"content": '{"requirements": []}'}}]}
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
+                            }
+                        }
+                    ]
+                }
             ).encode()
 
     def fake_urlopen(request, timeout):
@@ -1175,7 +1297,9 @@ def test_openai_compatible_llm_persists_raw_http_exchange(monkeypatch, tmp_path)
                     "choices": [
                         {
                             "finish_reason": "stop",
-                            "message": {"content": '{"requirements": []}'},
+                            "message": {
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
+                            },
                         }
                     ],
                     "usage": {
@@ -1204,7 +1328,11 @@ def test_openai_compatible_llm_persists_raw_http_exchange(monkeypatch, tmp_path)
     )
     llm.set_call_context(recorder=recorder, call_id=call_id)
     result = llm.extract([CandidateWindow(["b0001"], "资格", "须提供证明材料", 1)])
-    assert result == []
+    assert result == {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
     recorder.complete_llm_call(call_id, parsed_requirements=result, elapsed_ms=2)
 
     input_payload = json.loads(

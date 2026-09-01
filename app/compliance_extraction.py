@@ -71,6 +71,7 @@ class CandidateWindow:
     section: str
     text: str
     order: int
+    kind: Literal["templates", "project_requirements", "supplemental_materials"] = "templates"
 
 
 FunctionalRegionKind = Literal[
@@ -98,7 +99,7 @@ class DocumentParser(Protocol):
 
 
 class RequirementLLM(Protocol):
-    def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]: ...
+    def extract(self, batch: Sequence[CandidateWindow]) -> dict[str, list[dict[str, Any]]]: ...
 
 
 class RequirementCache(Protocol):
@@ -1350,34 +1351,58 @@ def _is_transient_extraction_error(error: ComplianceExtractionError) -> bool:
 
 
 class DeterministicComplianceLLM:
-    """Local fallback that keeps candidate text as a source-grounded rule.
+    """Local fallback that keeps candidate text as source-grounded objects.
 
     It is source-grounded and deterministic, so development can run without a
     model credential; production can select ``OpenAICompatibleLLM`` instead.
     """
 
-    def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
+    def extract(self, batch: Sequence[CandidateWindow]) -> dict[str, list[dict[str, Any]]]:
         started_at = time.perf_counter()
         logger.info(
             "llm.call.start provider=deterministic model=local batch_size=%d candidate_chars=%d",
             len(batch),
             sum(len(candidate.text) for candidate in batch),
         )
-        result: list[dict[str, Any]] = []
+        result: dict[str, list[dict[str, Any]]] = {
+            "templates": [],
+            "project_requirements": [],
+            "supplemental_materials": [],
+        }
         for candidate in batch:
             text = candidate.text.strip()
-            result.append(
-                {
-                    "name": candidate.section or "投标文件",
-                    "rule": text,
-                    "condition": None,
-                    "source_block_ids": candidate.block_ids,
-                }
-            )
+            if candidate.kind == "templates":
+                first_line = text.splitlines()[0] if text else ""
+                name = _template_name(first_line)
+                if not _TEMPLATE_ITEM_NAME_RE.search(name):
+                    name = _template_name(candidate.section)
+                result["templates"].append(
+                    {
+                        "name": name,
+                        "source_block_ids": list(candidate.block_ids),
+                    }
+                )
+            elif candidate.kind == "project_requirements":
+                result["project_requirements"].append(
+                    {
+                        "requirement": text,
+                        "value": _project_value(text),
+                        "source_block_ids": list(candidate.block_ids),
+                    }
+                )
+            else:
+                for name in _supplemental_material_names(text):
+                    result["supplemental_materials"].append(
+                        {
+                            "name": name,
+                            "material": text,
+                            "source_block_ids": list(candidate.block_ids),
+                        }
+                    )
         logger.info(
-            "llm.call.end provider=deterministic model=local batch_size=%d requirements=%d elapsed_ms=%d",
+            "llm.call.end provider=deterministic model=local batch_size=%d objects=%d elapsed_ms=%d",
             len(batch),
-            len(result),
+            sum(len(items) for items in result.values()),
             _elapsed_ms(started_at),
         )
         return result
@@ -1420,23 +1445,21 @@ class OpenAICompatibleLLM:
             sum(len(candidate.text) for candidate in batch),
         )
         source = "\n\n".join(
-            f"[{candidate.section}] block_ids={','.join(candidate.block_ids)}\n{candidate.text}"
+            f"[{candidate.kind}] [{candidate.section}] block_ids={','.join(candidate.block_ids)}\n{candidate.text}"
             for candidate in batch
         )
         prompt = (
-            "从以下已经筛选的招标文件候选内容中，忠实提取明确要求投标文件做到的事项。"
-            "只返回 JSON 对象 {\"requirements\":[...]}。每项只能包含 "
-            "name、rule、condition、source_block_ids；name 是简短展示名称，rule 是原文要求的忠实表达，"
-            "condition 仅在原文明确存在条件时填写，否则为 null。source_block_ids 必须且只能复制输入候选中的真实 block_ids，"
-            "不得生成 source_text。\n"
-            "保留原文中的且、或、或者、同时、分别、如有、如适用、若、除非、不得、可以、无需等逻辑关系；"
-            "不要把一句包含 OR/或者 的要求拆成多个 AND 要求，不要过度原子化。原文简短明确时尽量原样保留，"
-            "原文很长时只压缩与投标文件当前编制和提交有关的规则，不得增加原文不存在的要求。\n"
-            "LLM 只负责发现要求、忠实压缩、保留明确条件并返回来源 block_id；不得生成 check_type；"
-            "不得生成 scope；不得生成 evidence_type；不得生成 category；不得生成 checks；"
-            "不得判断文本/图片/结构/metadata 执行方式，不得设计执行器或投标文件定位方式。\n"
-            "继续排除评分/评标规则、CA证书当前有效性、电子采购系统上传/加密提交等外部系统状态，"
-            "排除合同签订后或履约阶段动作；若项目明确不接受联合体或不允许备选方案，不生成对应编制要求。\n\n"
+            "从以下有限的、已经按功能区域筛选的招标文件候选内容中识别投标模板和材料对象。"
+            "只返回 JSON 对象 {\"templates\":[],\"project_requirements\":[],\"supplemental_materials\":[]}。"
+            "templates 每项只能包含 name、source_block_ids；project_requirements 每项只能包含 requirement、value、source_block_ids；"
+            "supplemental_materials 每项只能包含 name、material、source_block_ids。"
+            "source_block_ids 必须且只能复制输入候选中的真实 block_ids，不得生成 source_text。\n"
+            "模板必须按连续 block 分组，一个完整模板只返回一个对象；name 是稳定简短名称，不要把模板正文拆成规则。"
+            "项目要求只保留直接影响投标文件组成、编制、填写、容量、形式、有效期、保证金、备选方案和报价格式的行，并保留项目具体值。"
+            "补充材料只保留明确要求随投标文件提供的具体证明材料。原文不明确时不要猜测。\n"
+            "LLM 只负责有限候选的分组和命名；不得生成 check_type、scope、evidence_type、checks、required_field 或其他执行字段；"
+            "不得把模板编译成自然语言规则，不得扫描候选之外的招标文件。排除评分/评标、外部采购系统状态、合同签订后、履约、终验、"
+            "人员管理、知识产权归属和违约责任。\n\n"
             + source
         )
         payload = {
@@ -1510,19 +1533,26 @@ class OpenAICompatibleLLM:
                     )
             content = response_payload["choices"][0]["message"]["content"]
             decoded = json.loads(content) if isinstance(content, str) else content
-            requirements = (
-                decoded.get("requirements") if isinstance(decoded, dict) else decoded
-            )
-            if not isinstance(requirements, list):
-                raise ValueError("requirements must be a list")
+            if not isinstance(decoded, dict):
+                raise ValueError("object result must be a JSON object")
+            result = {
+                key: decoded.get(key, [])
+                for key in (
+                    "templates",
+                    "project_requirements",
+                    "supplemental_materials",
+                )
+            }
+            if any(not isinstance(items, list) for items in result.values()):
+                raise ValueError("object result collections must be lists")
             logger.info(
-                "llm.call.end provider=openai_compatible model=%s batch_size=%d requirements=%d elapsed_ms=%d",
+                "llm.call.end provider=openai_compatible model=%s batch_size=%d objects=%d elapsed_ms=%d",
                 self.model,
                 len(batch),
-                len(requirements),
+                sum(len(items) for items in result.values()),
                 _elapsed_ms(started_at),
             )
-            return requirements
+            return result
         except TimeoutError as exc:
             logger.error(
                 "llm.call.error provider=openai_compatible model=%s error_type=timeout elapsed_ms=%d",
