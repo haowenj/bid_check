@@ -139,6 +139,292 @@ def test_template_attachment_extraction_ignores_attachment_word_and附加_clause
     assert template["attachments"] == ["法定代表人身份证复印件"]
 
 
+def test_template_fields_prefer_mineru_underline_runs_over_bare_colons():
+    payload = [
+        {"type": "text", "content": "投标人名称："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "单位性质："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "成立时间："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "经营期限："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "姓名："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "性别："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "年龄："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "职务："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "日期："},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "年"},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "月"},
+        {"type": "text", "content": "                       ", "style": ["underline"]},
+        {"type": "text", "content": "日"},
+        {"type": "text", "content": "我方承诺如下内容："},
+        {"type": "text", "content": "如我方中标："},
+        {"type": "text", "content": "现承诺如下："},
+        {"type": "text", "content": "附："},
+        {"type": "text", "content": "即："},
+        {"type": "text", "content": "包括但不限于："},
+        {"type": "text", "content": "编制要求："},
+        {"type": "text", "content": "复制、查阅和传播含有以下内容的信息："},
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == [
+        "投标人名称",
+        "单位性质",
+        "成立时间",
+        "经营期限",
+        "姓名",
+        "性别",
+        "年龄",
+        "职务",
+        "日期",
+    ]
+
+
+def test_template_fields_read_underline_styles_inside_nested_paragraph_content():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "法定代表人："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "签发机关："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                ]
+            },
+        }
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["法定代表人", "签发机关"]
+
+
+def test_template_fields_read_underline_styles_from_flat_content_runs():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": [
+                {"type": "text", "content": "法定代表人："},
+                {"type": "text", "content": "       ", "style": ["underline"]},
+            ],
+        }
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["法定代表人"]
+
+
+def test_template_fields_keep_literal_placeholders_and_noun_phrase_fallbacks():
+    block_value = (
+        "成立时间：____年____月____日；"
+        "委托期限：。；"
+        "本单位名称：____；应答内容：____；"
+        "我方承诺如下内容：；如我方中标：；现承诺如下："
+    )
+
+    blocks = [block("b1", "paragraph", block_value, "模板", 1)]
+
+    assert extraction_module._template_fields(blocks) == [
+        "成立时间",
+        "委托期限",
+        "本单位名称",
+        "应答内容",
+    ]
+
+
+def test_template_fields_keep_parenthesized_input_slots():
+    blocks = [
+        block(
+            "b1",
+            "paragraph",
+            "投标人名称：（盖章）；联系人：（请填写）",
+            "模板",
+            1,
+        )
+    ]
+
+    assert extraction_module._template_fields(blocks) == ["投标人名称", "联系人"]
+
+
+def test_template_fields_associate_literal_placeholder_blocks_with_labels():
+    blocks = [
+        block("b1", "paragraph", "法定代表人：", "模板", 1),
+        block("b2", "paragraph", "________", "模板", 2),
+    ]
+
+    assert extraction_module._template_fields(blocks) == ["法定代表人"]
+
+
+def test_template_fields_preserve_source_order_when_style_and_text_markers_mix():
+    blocks = [
+        block("b1", "paragraph", "项目名称：____", "模板", 1),
+        block("b2", "paragraph", "法定代表人：", "模板", 2),
+        StructuredBlock(
+            "b3",
+            "paragraph",
+            "       ",
+            "模板",
+            3,
+            metadata={"style": ["underline"]},
+        ),
+    ]
+
+    assert extraction_module._template_fields(blocks) == ["项目名称", "法定代表人"]
+
+
+def test_template_fields_read_html_table_placeholder_cells_without_using_style():
+    table = (
+        "<table><tbody>"
+        "<tr><th>字段</th><th>填写内容</th></tr>"
+        "<tr><td>申报人名称</td><td>【XX公司[投标人名称]】</td></tr>"
+        "<tr><td>地址</td><td></td></tr>"
+        "<tr><td>电话</td><td>________</td></tr>"
+        "<tr><td>固定信息</td><td>北京市</td></tr>"
+        "</tbody></table>"
+    )
+    blocks = [block("b1", "table", table, "模板", 1)]
+    blocks.append(
+        block("b2", "table", "身份证正面 | ______\n身份证反面 | ______", "模板", 2)
+    )
+
+    assert extraction_module._template_fields(blocks) == [
+        "申报人名称",
+        "地址",
+        "电话",
+        "身份证正面",
+        "身份证反面",
+    ]
+
+
+def test_template_fields_do_not_attach_prose_parentheses_to_previous_label():
+    blocks = [
+        block("b1", "paragraph", "附：", "模板", 1),
+        block(
+            "b2",
+            "paragraph",
+            "1.委托代理人的合法有效身份证明复印件或扫描件(如提供中华人民共和国居民身份证的，需同时提供国徽面及人像面)",
+            "模板",
+            2,
+        ),
+        block("b3", "paragraph", "编制要求：", "模板", 3),
+        block(
+            "b4",
+            "paragraph",
+            "除本文件允许投标人进行填写的内容以外，投标人不得对本文件进行修改（含单位或者个人）。",
+            "模板",
+            4,
+        ),
+        block("b5", "paragraph", "投标人名称：", "模板", 5),
+        StructuredBlock(
+            "b6",
+            "paragraph",
+            "       ",
+            "模板",
+            6,
+            metadata={"style": ["underline"]},
+        ),
+    ]
+
+    assert extraction_module._template_fields(blocks) == ["投标人名称"]
+
+
+def test_template_fields_reject_recipient_label_before_bracket_placeholder():
+    blocks = [
+        block("b1", "paragraph", "致：【XX公司[招标人名称]】：", "模板", 1),
+        block("b2", "paragraph", "联系人：（请填写）", "模板", 2),
+    ]
+
+    assert extraction_module._template_fields(blocks) == ["联系人"]
+
+
+def test_template_fields_extract_semantic_label_from_underlined_bracket_run():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "本人"},
+                    {
+                        "type": "text",
+                        "content": "【XX [法定代表人姓名]】",
+                        "style": ["underline"],
+                    },
+                    {"type": "text", "content": "签字："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                ]
+            },
+        }
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["法定代表人姓名", "签字"]
+
+
+def test_template_fields_use_matrix_headers_for_blank_table_cells():
+    table = (
+        "<table><tr><th>序号</th><th>关键元器件名称</th><th>关键元器件型号</th>"
+        "<th>生产厂商</th><th>备注</th></tr>"
+        "<tr><td>1</td><td>CPU</td><td></td><td></td><td></td></tr>"
+        "<tr><td>2</td><td>GPU</td><td></td><td></td><td></td></tr></table>"
+    )
+
+    blocks = [block("b1", "table", table, "模板", 1)]
+
+    assert extraction_module._template_fields(blocks) == [
+        "关键元器件型号",
+        "生产厂商",
+        "备注",
+    ]
+
+
+def test_template_fields_extract_inline_labels_from_html_table_cells():
+    table = (
+        "<table><tr><td>开户银行</td><td>名称：【XX[基本账户开户银行名称]】</td></tr>"
+        "<tr><td>地址：【XX[基本账户开户银行地址]】</td></tr>"
+        "<tr><td>电话：【XX[基本账户开户银行电话]】</td>"
+        "<td>联系人及职务：【XX[姓名]，XX[职务]】</td></tr></table>"
+    )
+
+    blocks = [block("b1", "table", table, "模板", 1)]
+
+    assert extraction_module._template_fields(blocks) == [
+        "名称",
+        "地址",
+        "电话",
+        "联系人及职务",
+    ]
+
+
+def test_template_fields_choose_detailed_header_over_group_header_and_total_row():
+    table = (
+        "<table><tr><th>序号</th><th colspan='2'>人员情况</th></tr>"
+        "<tr><th>姓名</th><th>职务</th><th>联系方式</th></tr>"
+        "<tr><td>示例</td><td>张三</td><td>法定代表人</td><td>13800000000</td></tr>"
+        "<tr><td>1</td><td></td><td></td><td></td></tr>"
+        "<tr><td>总计</td><td></td></tr></table>"
+    )
+
+    blocks = [block("b1", "table", table, "模板", 1)]
+
+    assert extraction_module._template_fields(blocks) == [
+        "姓名",
+        "职务",
+        "联系方式",
+    ]
+
+
 def test_template_does_not_become_one_requirement_per_block():
     region = FunctionalRegion(
         kind="templates",

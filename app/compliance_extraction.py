@@ -39,8 +39,8 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v16:{REQUIREMENT_PROMPT_VERSION}"
-PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v4"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v19:{REQUIREMENT_PROMPT_VERSION}"
+PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v5"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
 DEFAULT_MINERU_BACKEND = "hybrid-engine"
@@ -265,6 +265,22 @@ def _mineru_inline_text(value: Any) -> str:
     return ""
 
 
+def _mineru_has_style(value: Any, style_name: str) -> bool:
+    target = style_name.casefold()
+    if isinstance(value, dict):
+        styles = value.get("style", [])
+        if isinstance(styles, str):
+            styles = [styles]
+        if isinstance(styles, (list, tuple, set)) and any(
+            str(style).casefold() == target for style in styles
+        ):
+            return True
+        return any(_mineru_has_style(item, style_name) for item in value.values())
+    if isinstance(value, list):
+        return any(_mineru_has_style(item, style_name) for item in value)
+    return False
+
+
 def _flatten_mineru_content_list(payload: Any) -> list[dict[str, Any]]:
     """Normalize MinerU v1 and nested v2 content items to one ordered stream."""
     if isinstance(payload, dict):
@@ -321,7 +337,7 @@ def _flatten_mineru_content_list(payload: Any) -> list[dict[str, Any]]:
                     }
                 )
             continue
-        if isinstance(content, dict):
+        if isinstance(content, (dict, list)):
             normalized = {
                 key: value for key, value in raw.items() if key != "content"
             }
@@ -332,27 +348,36 @@ def _flatten_mineru_content_list(payload: Any) -> list[dict[str, Any]]:
                 normalized["type"] = "title"
                 normalized["text"] = _mineru_inline_text(
                     content.get("title_content", [])
+                    if isinstance(content, dict)
+                    else content
                 ).strip()
-                normalized["text_level"] = content.get(
-                    "level", raw.get("text_level", raw.get("heading_level"))
+                normalized["text_level"] = (
+                    content.get(
+                        "level", raw.get("text_level", raw.get("heading_level"))
+                    )
+                    if isinstance(content, dict)
+                    else raw.get("text_level", raw.get("heading_level"))
                 )
             elif raw_type == "paragraph":
                 normalized["type"] = "paragraph"
                 normalized["text"] = _mineru_inline_text(
                     content.get("paragraph_content", [])
+                    if isinstance(content, dict)
+                    else content
                 ).strip()
             elif raw_type == "table":
                 normalized["type"] = "table"
-                normalized["table_body"] = content.get(
-                    "html", content.get("table_body", "")
-                )
-                normalized.update(
-                    {
-                        key: value
-                        for key, value in content.items()
-                        if key not in {"html", "table_body"}
-                    }
-                )
+                if isinstance(content, dict):
+                    normalized["table_body"] = content.get(
+                        "html", content.get("table_body", "")
+                    )
+                    normalized.update(
+                        {
+                            key: value
+                            for key, value in content.items()
+                            if key not in {"html", "table_body"}
+                        }
+                    )
             elif raw_type in {"image", "figure"}:
                 normalized["type"] = raw_type
                 normalized["text"] = _mineru_inline_text(
@@ -402,14 +427,26 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
         )
         for text_key in text_keys:
             value = raw.get(text_key)
-            if isinstance(value, str) and value.strip():
+            if not isinstance(value, str):
+                continue
+            if value.strip():
                 text = value.strip()
                 break
+            if not text and _mineru_has_style(raw, "underline"):
+                # An underline-only run is an input marker even though its
+                # visible text consists only of whitespace.  Preserve that
+                # source block so field extraction can associate it with the
+                # preceding label.
+                text = value
         if not text:
             # Keep an image as a real source block even when MinerU has no
             # caption; the raw image reference remains in metadata.
             if kind == "image":
                 text = "[MinerU image]"
+            elif kind == "paragraph" and _mineru_has_style(raw, "underline"):
+                # Nested paragraph content may have been stripped while
+                # flattening, but its underline style remains in metadata.
+                text = " "
             else:
                 continue
 
@@ -1226,11 +1263,41 @@ _TEMPLATE_NUMBER_PREFIX_RE = re.compile(
 )
 _TEMPLATE_FORMAT_SUFFIX_RE = re.compile(r"\s*[（(](?:格式|范本|样式)[）)]\s*$")
 _TEMPLATE_FIELD_RE = re.compile(
-    r"(?<![\w])([^\s：:|,，。；;]{1,20})\s*[：:]\s*(?=_{2,}|[…·.]{2,}|（|\(|\[|$)"
+    r"(?<![\w])([^\s：:|,，。；;、.!！?？]{1,20})\s*[：:]"
 )
 _TABLE_FIELD_RE = re.compile(
     r"(?:^|\n|\|)\s*([^|\n：:]{1,20})\s*\|\s*(?=_{2,}|[…·.]{2,}|$)"
 )
+_FIELD_LABEL_SUFFIX_RE = re.compile(
+    r"(?:名称|姓名|性别|年龄|职务|地址|电话|手机|邮箱|邮编|日期|时间|期限|"
+    r"性质|单位|联系人|负责人|法人|账号|账户|开户行|编号|证号|代码|金额|"
+    r"数量|比例|方式|类别|类型|内容|事项|专业|学历|等级|资质|网址|传真|"
+    r"税号|注册资本|经营范围|全称|简称|签字|盖章|印章|证明文件|证明材料|"
+    r"页码|型号|厂商|软件|银行)$"
+)
+_FIELD_NARRATIVE_RE = re.compile(
+    r"^(?:我方|我司)(?:承诺|声明|保证|确认|同意|提供|将|在)"
+    r"|^(?:如|若).{0,16}(?:中标|提供|填写|提交)"
+    r"|^现(?:承诺|声明|说明|如下)"
+    r"|^(?:附|即)$"
+    r"|(?:承诺如下|包括但不限于|以下内容|含有以下)"
+    r"|^(?:复制|查阅|传播)"
+)
+_FIELD_INSTRUCTION_LABEL_RE = re.compile(
+    r"^(?:附|即|注|说明|提示|注意|注意事项|编制(?:说明|要求)?|"
+    r"填写说明|填报说明|使用说明)$"
+)
+_FIELD_PLACEHOLDER_RE = re.compile(
+    r"_{2,}|[…·.]{2,}|"
+    r"(?:由|供)[^。；;，,]{0,8}(?:填写|录入|补充|提供|选择)"
+)
+_FIELD_DATE_SLOT_RE = re.compile(r"(?=.*年)(?=.*月)(?=.*日)(?!.*\d)")
+_FIELD_PLAIN_X_PLACEHOLDER_RE = re.compile(
+    r"[Xx]{2,}(?:\s*[、/.-]\s*[Xx]{2,})*"
+)
+_PLACEHOLDER_FIELD_LABEL_RE = re.compile(r"\[([^\[\]]{1,60})\]")
+_EXTERNAL_PLACEHOLDER_LABEL_RE = re.compile(r"招标人|招标项目|标包")
+_TABLE_INDEX_LABEL_RE = re.compile(r"^(?:序号|编号|行号)$")
 _ATTACHMENT_RE = re.compile(
     r"(?:附件|须附|应附|附)(?!加|带|近)[：:\s]+(.+?)(?=[。；;\n]|$)"
 )
@@ -1322,14 +1389,383 @@ def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) ->
     return bool(_TEMPLATE_ITEM_NAME_RE.search(name))
 
 
+def _normalize_field_label(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip(" \t\r\n：:|")
+
+
+def _is_field_label_candidate(
+    value: str,
+    *,
+    require_field_suffix: bool = False,
+    reject_narrative: bool = True,
+) -> bool:
+    label = _normalize_field_label(value)
+    compact = re.sub(r"\s+", "", label)
+    if not compact or len(compact) > 20:
+        return False
+    if re.fullmatch(r"[0-9０-９]+(?:[.．、)）])?", compact):
+        return False
+    if re.fullmatch(r"[…·.]+", compact):
+        return False
+    if re.search(r"[\[\]【】]", label):
+        return False
+    if re.search(r"[，,。；;、.!！?？\n|]", label):
+        return False
+    if reject_narrative and _FIELD_NARRATIVE_RE.search(compact):
+        return False
+    if _FIELD_INSTRUCTION_LABEL_RE.fullmatch(compact):
+        return False
+    return not require_field_suffix or bool(_FIELD_LABEL_SUFFIX_RE.search(compact))
+
+
+def _bracket_group_end(text: str) -> int | None:
+    if not text or text[0] not in _PARENTHETICAL_PAIRS:
+        return None
+    closing_to_opening = {
+        closing: opening
+        for opening, closing in _PARENTHETICAL_PAIRS.items()
+    }
+    stack: list[str] = []
+    for index, character in enumerate(text):
+        if character in _PARENTHETICAL_PAIRS:
+            stack.append(character)
+            continue
+        opening = closing_to_opening.get(character)
+        if opening is None or not stack or stack[-1] != opening:
+            continue
+        stack.pop()
+        if not stack:
+            return index
+    return None
+
+
+def _is_standalone_bracket_placeholder(value: str) -> bool:
+    text = value.strip().strip("：:，,；;。")
+    found_group = False
+    while text:
+        text = text.lstrip()
+        end = _bracket_group_end(text)
+        if end is None:
+            return False
+        inner = text[1:end]
+        if (
+            re.search(r"[，,。；;]", inner)
+            and not re.search(
+                r"请填写|请录入|请补充|请提供|请选择|待填|待定|\[[^\]]+\]",
+                inner,
+            )
+        ):
+            return False
+        found_group = True
+        text = text[end + 1 :].strip(" \t：:，,；;。")
+    return found_group
+
+
+def _is_text_placeholder(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    return bool(
+        _FIELD_PLACEHOLDER_RE.search(value)
+        or _FIELD_DATE_SLOT_RE.search(value)
+        or _FIELD_PLAIN_X_PLACEHOLDER_RE.fullmatch(text)
+        or _is_standalone_bracket_placeholder(text)
+    )
+
+
+def _is_table_placeholder(value: str) -> bool:
+    return not value.strip() or _is_text_placeholder(value)
+
+
+def _field_value_segment(value: str) -> str:
+    closing_to_opening = {
+        closing: opening
+        for opening, closing in _PARENTHETICAL_PAIRS.items()
+    }
+    stack: list[str] = []
+    for index, character in enumerate(value):
+        if character in _PARENTHETICAL_PAIRS:
+            stack.append(character)
+            continue
+        opening = closing_to_opening.get(character)
+        if opening is not None and stack and stack[-1] == opening:
+            stack.pop()
+            continue
+        if not stack and character in "\n。；;，,":
+            return value[:index]
+    return value
+
+
+def _trailing_field_label(
+    value: str,
+    *,
+    reject_narrative: bool = True,
+) -> str | None:
+    text = value.rstrip()
+    matches = list(_TEMPLATE_FIELD_RE.finditer(text))
+    if not matches or matches[-1].end() != len(text):
+        return None
+    raw_label = matches[-1].group(1)
+    closing_positions = [
+        raw_label.rfind(closing) for closing in _PARENTHETICAL_PAIRS.values()
+    ]
+    last_closing = max(closing_positions, default=-1)
+    if last_closing >= 0 and last_closing < len(raw_label) - 1:
+        raw_label = raw_label[last_closing + 1 :]
+    label = _normalize_field_label(raw_label)
+    return (
+        label
+        if _is_field_label_candidate(label, reject_narrative=reject_narrative)
+        else None
+    )
+
+
+def _placeholder_field_labels(text: str) -> list[str]:
+    labels: list[str] = []
+    for match in _PLACEHOLDER_FIELD_LABEL_RE.finditer(text):
+        label = _normalize_field_label(match.group(1))
+        compact = re.sub(r"\s+", "", label)
+        if _EXTERNAL_PLACEHOLDER_LABEL_RE.search(compact):
+            continue
+        if not _is_field_label_candidate(
+            label,
+            require_field_suffix=True,
+            reject_narrative=True,
+        ):
+            continue
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _template_text_fields(text: str) -> list[str]:
+    fields: list[str] = []
+    for match in _TEMPLATE_FIELD_RE.finditer(text):
+        label = _normalize_field_label(match.group(1))
+        remainder = text[match.end() :]
+        value = _field_value_segment(remainder)
+        has_placeholder = _is_text_placeholder(value)
+        if not _is_field_label_candidate(label, reject_narrative=not has_placeholder):
+            continue
+        if has_placeholder and not _is_field_label_candidate(
+            label,
+            require_field_suffix=True,
+            reject_narrative=True,
+        ):
+            continue
+        if has_placeholder or (
+            not value.strip(" \t\r\n。；;，,")
+            and _is_field_label_candidate(label, require_field_suffix=True)
+        ):
+            if label not in fields:
+                fields.append(label)
+    return fields
+
+
+def _mineru_content_runs(
+    value: Any,
+    inherited_styles: frozenset[str] = frozenset(),
+) -> Iterable[tuple[str, frozenset[str]]]:
+    if isinstance(value, str):
+        yield value, inherited_styles
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _mineru_content_runs(item, inherited_styles)
+        return
+    if not isinstance(value, dict):
+        return
+
+    styles = set(inherited_styles)
+    raw_styles = value.get("style", [])
+    if isinstance(raw_styles, str):
+        raw_styles = [raw_styles]
+    if isinstance(raw_styles, (list, tuple, set)):
+        styles.update(str(style).casefold() for style in raw_styles)
+    styles_frozen = frozenset(styles)
+
+    for key in ("paragraph_content", "title_content", "item_content"):
+        if key in value:
+            yield from _mineru_content_runs(value[key], styles_frozen)
+            return
+    if "content" in value:
+        yield from _mineru_content_runs(value["content"], styles_frozen)
+
+
+def _block_mineru_content_runs(
+    block: StructuredBlock,
+) -> list[tuple[str, frozenset[str]]]:
+    nested = block.metadata.get("mineru_nested_content")
+    if nested is not None:
+        runs = list(_mineru_content_runs(nested))
+        if runs:
+            return runs
+    styles = block.metadata.get("style", [])
+    if isinstance(styles, str):
+        styles = [styles]
+    if not isinstance(styles, (list, tuple, set)):
+        styles = []
+    return [(block.text, frozenset(str(style).casefold() for style in styles))]
+
+
+def _is_underline_input_run(text: str, styles: frozenset[str]) -> bool:
+    return "underline" in styles and not text.strip()
+
+
+def _template_styled_fields(
+    blocks: Sequence[StructuredBlock],
+) -> list[tuple[int, str]]:
+    fields: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    previous_text = ""
+    for block_index, block in enumerate(blocks):
+        runs = _block_mineru_content_runs(block)
+        prefix = ""
+        for text, styles in runs:
+            is_underlined = "underline" in styles
+            if is_underlined and text.strip():
+                for label in _placeholder_field_labels(text):
+                    if label not in seen:
+                        fields.append((block_index, label))
+                        seen.add(label)
+            if is_underlined or _is_text_placeholder(text):
+                label = _trailing_field_label(
+                    prefix,
+                    reject_narrative=True,
+                ) or _trailing_field_label(
+                    previous_text,
+                    reject_narrative=True,
+                )
+                if label and label not in seen:
+                    fields.append((block_index, label))
+                    seen.add(label)
+            prefix += text
+        meaningful_text = "".join(text for text, styles in runs if text.strip())
+        if meaningful_text:
+            previous_text = meaningful_text
+    return fields
+
+
+def _template_table_rows(block: StructuredBlock) -> list[list[str]]:
+    table_text = block.metadata.get("table_body")
+    if not isinstance(table_text, str) or not table_text.strip():
+        table_text = block.text
+    html_rows = _mineru_html_table_rows(table_text)
+    if html_rows:
+        return html_rows
+    rows: list[list[str]] = []
+    for line in _strip_markup(table_text).splitlines():
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) >= 2:
+            rows.append(cells)
+    return rows
+
+
+def _template_table_fields(block: StructuredBlock) -> list[str]:
+    rows = _template_table_rows(block)
+    fields: list[str] = []
+
+    def append(label: str) -> None:
+        if label and label not in fields:
+            fields.append(label)
+
+    def is_data_marker(row: Sequence[str]) -> bool:
+        if not row:
+            return False
+        first = row[0].strip()
+        return bool(
+            first == "示例"
+            or re.fullmatch(r"[0-9０-９]+(?:[.．、)）])?", first)
+            or re.fullmatch(r"[…·.]+", first)
+        )
+
+    data_start = next(
+        (
+            index
+            for index, row in enumerate(rows[1:], start=1)
+            if is_data_marker(row) or (row and all(not cell.strip() for cell in row))
+        ),
+        None,
+    )
+    data_rows = rows[data_start:] if data_start is not None else []
+    has_data_marker = any(is_data_marker(row) for row in data_rows)
+    has_key_value_row = not has_data_marker and any(
+        len(row) >= 2
+        and _is_field_label_candidate(row[0])
+        and _is_table_placeholder(row[1])
+        for row in rows[1:]
+    )
+    header_index = None
+    if data_start is not None and not has_key_value_row:
+        header_index = max(
+            range(data_start),
+            key=lambda index: len(rows[index]),
+        )
+    looks_like_matrix = header_index is not None and len(rows[header_index]) >= 2
+
+    for row_index, row in enumerate(rows):
+        for cell in row:
+            for label in _template_text_fields(cell):
+                append(label)
+        if looks_like_matrix and row_index > header_index:
+            continue
+        for index in range(len(row) - 1):
+            label = _normalize_field_label(row[index])
+            compact = re.sub(r"\s+", "", label)
+            if (
+                not _is_field_label_candidate(label)
+                or _TABLE_INDEX_LABEL_RE.fullmatch(compact)
+            ):
+                continue
+            if _is_table_placeholder(row[index + 1]):
+                append(label)
+
+    if looks_like_matrix:
+        headers = list(rows[header_index])
+        if (
+            header_index > 0
+            and rows[0]
+            and _TABLE_INDEX_LABEL_RE.fullmatch(
+                re.sub(r"\s+", "", rows[0][0])
+            )
+            and len(headers) < max(len(row) for row in rows[header_index + 1 :])
+        ):
+            headers.insert(0, rows[0][0])
+        data_rows = rows[header_index + 1 :]
+        for index, header in enumerate(headers):
+            label = _normalize_field_label(header)
+            compact = re.sub(r"\s+", "", label)
+            if (
+                not _is_field_label_candidate(label)
+                or _TABLE_INDEX_LABEL_RE.fullmatch(compact)
+            ):
+                continue
+            if any(
+                len(row) > index
+                and (not row[index].strip() or _is_text_placeholder(row[index]))
+                for row in data_rows
+            ):
+                append(label)
+    return fields
+
+
 def _template_fields(blocks: Sequence[StructuredBlock]) -> list[str]:
     fields: list[str] = []
-    for block in blocks:
-        for pattern in (_TEMPLATE_FIELD_RE, _TABLE_FIELD_RE):
-            for match in pattern.finditer(block.text):
-                field = match.group(1).strip(" \t：:|")
-                if field and field not in fields:
-                    fields.append(field)
+    styled_by_block: dict[int, list[str]] = {}
+    for block_index, field in _template_styled_fields(blocks):
+        styled_by_block.setdefault(block_index, []).append(field)
+
+    def append(candidates: Iterable[str]) -> None:
+        for field in candidates:
+            if field and field not in fields:
+                fields.append(field)
+
+    for block_index, block in enumerate(blocks):
+        append(styled_by_block.get(block_index, []))
+        if block.type == "table":
+            append(_template_table_fields(block))
+        else:
+            append(_template_text_fields(block.text))
     return fields
 
 
