@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 
 def _content_payload() -> list[object]:
     return [
@@ -131,3 +133,188 @@ def test_clean_items_retains_non_dict_values_for_raw_traceability():
 
     assert cleaned == [value]
     assert log == []
+
+
+def _source_item(
+    item_type: str,
+    text: str,
+    *,
+    raw_index: int,
+    page_idx: int,
+    bbox: list[int],
+    **extra: object,
+) -> dict[str, object]:
+    return {
+        "type": item_type,
+        "text": text,
+        "page_idx": page_idx,
+        "bbox": bbox,
+        "_bid_source": {
+            "raw_item_index": raw_index,
+            "source_path": [raw_index],
+        },
+        **extra,
+    }
+
+
+def test_merge_items_combines_unfinished_cross_page_body_and_keeps_full_provenance():
+    from app.bid_document import merge_items
+
+    items = [
+        _source_item(
+            "paragraph",
+            "上一页未完",
+            raw_index=10,
+            page_idx=0,
+            bbox=[10, 800, 300, 950],
+        ),
+        _source_item(
+            "paragraph",
+            "下一页继续完成。",
+            raw_index=11,
+            page_idx=1,
+            bbox=[10, 10, 300, 150],
+        ),
+        _source_item(
+            "image",
+            "",
+            raw_index=12,
+            page_idx=0,
+            bbox=[10, 10, 300, 150],
+        ),
+        _source_item(
+            "image",
+            "",
+            raw_index=13,
+            page_idx=1,
+            bbox=[10, 800, 300, 950],
+        ),
+    ]
+    original = deepcopy(items)
+
+    merged, logs = merge_items(items)
+
+    assert items == original
+    assert merged[0]["text"] == "上一页未完下一页继续完成。"
+    assert merged[0]["start_page_idx"] == 0
+    assert merged[0]["end_page_idx"] == 1
+    assert merged[0]["source_item_indices"] == [10, 11]
+    assert merged[0]["source_page_indices"] == [0, 1]
+    assert merged[0]["source_bboxes"] == [
+        [10, 800, 300, 950],
+        [10, 10, 300, 150],
+    ]
+    assert merged[0]["merged_cross_page"] is True
+    assert logs[0]["a"] == items[0]
+    assert logs[0]["b"] == items[1]
+    assert logs[0]["merged"] == merged[0]
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+            [
+                _source_item(
+                    "paragraph",
+                    "前一段",
+                    raw_index=1,
+                page_idx=0,
+                bbox=[10, 800, 300, 950],
+            ),
+            _source_item(
+                "heading",
+                "下一章节",
+                raw_index=2,
+                page_idx=1,
+                bbox=[10, 10, 300, 150],
+                text_level=1,
+            ),
+        ],
+        [
+            _source_item(
+                "paragraph",
+                "前一段",
+                raw_index=1,
+                page_idx=0,
+                bbox=[10, 800, 300, 950],
+            ),
+            _source_item(
+                "table",
+                "<table></table>",
+                raw_index=2,
+                page_idx=1,
+                bbox=[10, 10, 300, 150],
+            ),
+            _source_item(
+                "paragraph",
+                "后续内容。",
+                raw_index=3,
+                page_idx=1,
+                bbox=[10, 200, 300, 300],
+            ),
+        ],
+        [
+            _source_item(
+                "paragraph",
+                "已经完成。",
+                raw_index=1,
+                page_idx=0,
+                bbox=[10, 800, 300, 950],
+            ),
+            _source_item(
+                "paragraph",
+                "下一段",
+                raw_index=2,
+                page_idx=1,
+                bbox=[10, 10, 300, 150],
+            ),
+        ],
+        [
+            _source_item(
+                "paragraph",
+                "标题提示：",
+                raw_index=1,
+                page_idx=0,
+                bbox=[10, 800, 300, 950],
+            ),
+            _source_item(
+                "paragraph",
+                "下一页说明",
+                raw_index=2,
+                page_idx=1,
+                bbox=[10, 10, 300, 150],
+            ),
+        ],
+        [
+            _source_item(
+                "paragraph",
+                "前一段",
+                raw_index=1,
+                page_idx=0,
+                bbox=[10, 100, 300, 200],
+            ),
+            _source_item(
+                "paragraph",
+                "下一段",
+                raw_index=2,
+                    page_idx=1,
+                    bbox=[10, 10, 300, 150],
+                ),
+                _source_item(
+                    "image",
+                    "",
+                    raw_index=3,
+                    page_idx=0,
+                    bbox=[10, 10, 300, 950],
+                ),
+            ],
+        ],
+    ids=["heading", "table_boundary", "complete_sentence", "colon", "not_bottom"],
+)
+def test_merge_items_does_not_cross_document_boundaries(items):
+    from app.bid_document import merge_items
+
+    merged, logs = merge_items(items)
+
+    assert merged == items
+    assert logs == []
