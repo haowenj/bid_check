@@ -21,6 +21,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from app.bid_document import (
+    MinerUBidDocumentParser,
+    parse_bid_document as clean_bid_document,
+)
 from app.compliance_extraction import (
     DeterministicComplianceLLM,
     DocumentParser,
@@ -32,7 +36,6 @@ from app.compliance_extraction import (
 )
 from app.config import Settings, load_settings
 from app.mock_services import (
-    parse_bid_document,
     run_compliance_review,
 )
 from app.models import FileMetadata
@@ -53,6 +56,7 @@ def build_default_workflow(
     repository: BidCheckRepository,
     *,
     document_parser: DocumentParser | None = None,
+    bid_document_parser: MinerUBidDocumentParser | None = None,
 ) -> BidCheckWorkflow:
     parser = document_parser or MinerUDocumentParser(
         settings.mineru_url,
@@ -64,6 +68,14 @@ def build_default_workflow(
     )
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
     parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
+    bid_parser = bid_document_parser or MinerUBidDocumentParser(
+        settings.mineru_url,
+        mineru_api_key=settings.mineru_api_key,
+        mineru_backend=settings.mineru_backend,
+        mineru_server_url=settings.mineru_server_url,
+        timeout_seconds=settings.mineru_timeout_seconds,
+        poll_interval_seconds=settings.mineru_poll_interval_seconds,
+    )
     if settings.llm_api_key:
         llm = OpenAICompatibleLLM(
             api_key=settings.llm_api_key,
@@ -88,8 +100,8 @@ def build_default_workflow(
     services = BidCheckServices(
         extract=extract_requirements,
         parse=partial(
-            parse_bid_document,
-            delay_seconds=settings.mock_delay_seconds,
+            clean_bid_document,
+            parser=bid_parser,
         ),
         review=run_compliance_review,
     )

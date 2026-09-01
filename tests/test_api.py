@@ -145,7 +145,9 @@ def test_create_task_stores_files_and_runs_workflow(
     task_dir = settings.tasks_dir / payload["task_id"]
     assert (task_dir / "tender.docx").read_bytes() == b"PK\x03\x04tender"
     assert (task_dir / "bid.docx").read_bytes() == b"PK\x03\x04bid"
-    assert repository.get(payload["task_id"]).status == "complete"
+    task = repository.get(payload["task_id"])
+    assert task.status == "complete"
+    assert task.result["bid_parse"]["stats"]["structured_block_count"] == 1
 
 
 def test_get_task_returns_stable_payload(client, stored_task):

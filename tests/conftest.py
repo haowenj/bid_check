@@ -78,6 +78,22 @@ class FixtureMineruParser:
         ]
 
 
+class FixtureBidDocumentParser:
+    def parse(self, path, *, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "status": "success",
+            "document_name": path.name,
+            "artifact_dir": str(output_dir),
+            "stats": {
+                "structured_block_count": 1,
+                "section_count": 1,
+                "table_count": 0,
+                "image_count": 0,
+            },
+        }
+
+
 @pytest.fixture
 def task_repository(tmp_path):
     repository = BidCheckRepository(tmp_path / "bid_check.db")
@@ -127,6 +143,7 @@ def workflow(settings, repository):
         settings,
         repository,
         document_parser=FixtureMineruParser(),
+        bid_document_parser=FixtureBidDocumentParser(),
     )
 
 
