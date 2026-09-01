@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from io import BytesIO
+from typing import get_type_hints
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -19,7 +20,44 @@ from app.compliance_extraction import (
     parse_docx_document,
     select_compliance_candidates,
 )
-from app.models import FileMetadata
+from app.models import (
+    FileMetadata,
+    ProjectRequirement,
+    SupplementalMaterial,
+    TenderExtractionResult,
+    TenderTemplate,
+)
+
+
+def test_tender_extraction_object_types_define_three_result_collections():
+    assert set(get_type_hints(TenderExtractionResult)) == {
+        "templates",
+        "project_requirements",
+        "supplemental_materials",
+    }
+    assert set(get_type_hints(TenderTemplate)) >= {
+        "id",
+        "name",
+        "section",
+        "block_ids",
+        "body",
+        "tables",
+        "fields",
+        "attachments",
+        "source",
+    }
+    assert set(get_type_hints(ProjectRequirement)) >= {
+        "id",
+        "requirement",
+        "value",
+        "source",
+    }
+    assert set(get_type_hints(SupplementalMaterial)) >= {
+        "id",
+        "name",
+        "material",
+        "source",
+    }
 
 
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:

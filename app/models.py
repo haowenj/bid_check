@@ -22,6 +22,47 @@ class TenderRequirement(TypedDict):
     source: TenderRequirementSource
 
 
+TenderSource = TenderRequirementSource
+
+
+class TenderTemplateTable(TypedDict):
+    block_id: str
+    text: str
+    metadata: dict[str, Any]
+
+
+class TenderTemplate(TypedDict):
+    id: str
+    name: str
+    section: str
+    block_ids: list[str]
+    body: str
+    tables: list[TenderTemplateTable]
+    fields: list[str]
+    attachments: list[str]
+    source: TenderSource
+
+
+class ProjectRequirement(TypedDict):
+    id: str
+    requirement: str
+    value: str | None
+    source: TenderSource
+
+
+class SupplementalMaterial(TypedDict):
+    id: str
+    name: str
+    material: str
+    source: TenderSource
+
+
+class TenderExtractionResult(TypedDict):
+    templates: list[TenderTemplate]
+    project_requirements: list[ProjectRequirement]
+    supplemental_materials: list[SupplementalMaterial]
+
+
 @dataclass(frozen=True)
 class FileMetadata:
     filename: str
