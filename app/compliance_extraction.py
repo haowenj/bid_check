@@ -22,7 +22,12 @@ from xml.etree import ElementTree
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
-from app.models import FileMetadata, TenderRequirement, TenderTemplate
+from app.models import (
+    FileMetadata,
+    ProjectRequirement,
+    TenderRequirement,
+    TenderTemplate,
+)
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 # Keep the old import name as a data-only compatibility alias.  The former
@@ -664,6 +669,75 @@ def extract_templates_from_regions(
                 )
             )
     return templates
+
+
+_PROJECT_COMPILATION_RE = re.compile(
+    r"组成|分别编制|编制|文件大小|文件容量|容量|大小|清晰|可读|签字盖章|扫描件|"
+    r"投标有效期|有效期|保证金|备选|加密电子|电子投标文件|纸质|正本|副本|"
+    r"报价.*(?:小数|位数|格式)|保留.*小数"
+)
+_PROJECT_NON_COMPILATION_RE = re.compile(
+    r"评分|评标|评审因素|评标委员会|招标代理|中标候选人|履约|合同签订后|"
+    r"终验|人员(?:请假|调班|更换|替换|报备)|知识产权归属|违约责任|"
+    r"商业信誉|项目经验|服务能力|7\s*[×xX*]\s*24|售后服务"
+)
+_PROJECT_VALUE_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:MB|GB|天|日)|(?:一|两|二|三|四|五|六|七|八|九|十)位小数"
+)
+
+
+def _project_rows(region: FunctionalRegion) -> Iterable[tuple[StructuredBlock, str]]:
+    for block in region.blocks[1:]:
+        lines = block.text.splitlines() if block.type == "table" else [block.text]
+        for line in lines:
+            text = line.strip()
+            if text:
+                yield block, text
+
+
+def _project_value(row: str) -> str | None:
+    value_part = re.split(r"\||[：:]", row, maxsplit=1)
+    candidate = value_part[1].strip() if len(value_part) == 2 else row
+    match = _PROJECT_VALUE_RE.search(candidate)
+    if match:
+        return match.group(0)
+    if re.search(r"无需|不允许|允许|只需|仅需|不得|不超过|应当|必须", candidate):
+        return candidate
+    return candidate if len(value_part) == 2 and candidate else None
+
+
+def extract_project_requirements_from_regions(
+    regions: Sequence[FunctionalRegion],
+) -> list[ProjectRequirement]:
+    """Extract only project-specific rules that shape the bid file itself."""
+
+    requirements: list[ProjectRequirement] = []
+    seen: set[str] = set()
+    for region in regions:
+        if region.kind != "project_requirements":
+            continue
+        for block, row in _project_rows(region):
+            if not _PROJECT_COMPILATION_RE.search(row):
+                continue
+            if _PROJECT_NON_COMPILATION_RE.search(row):
+                continue
+            normalized_row = re.sub(r"\s+", " ", row).strip()
+            if normalized_row in seen:
+                continue
+            seen.add(normalized_row)
+            requirements.append(
+                {
+                    "id": f"project_requirement_{len(requirements) + 1:03d}",
+                    "requirement": normalized_row,
+                    "value": _project_value(normalized_row),
+                    "source": {
+                        "section": region.section,
+                        "block_ids": [block.block_id],
+                        "source_text": block.text,
+                    },
+                }
+            )
+    return requirements
 
 
 _EXCLUDED_RE = re.compile(

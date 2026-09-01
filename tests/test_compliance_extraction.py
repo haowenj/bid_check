@@ -18,6 +18,7 @@ from app.compliance_extraction import (
     StructuredBlock,
     build_candidate_batches,
     extract_compliance_requirements_real,
+    extract_project_requirements_from_regions,
     extract_templates_from_regions,
     identify_functional_regions,
     parse_docx_document,
@@ -252,6 +253,96 @@ def test_template_extraction_does_not_create_rule_per_block():
     assert templates[0]["block_ids"] == ["b0201", "b0202", "b0203"]
     assert "项目名称：____" in templates[0]["body"]
     assert "投标人名称：____" in templates[0]["body"]
+
+
+def test_project_requirement_extraction_keeps_only_bid_compilation_rows():
+    blocks = [
+        StructuredBlock(
+            "b0300",
+            "heading",
+            "投标须知前附表",
+            "投标须知前附表",
+            300,
+        ),
+        StructuredBlock(
+            "b0301",
+            "table",
+            "投标文件组成 | 商务文件、技术文件、报价文件\n"
+            "单个组成部分大小 | 不得超过 50MB\n"
+            "投标文件总容量 | 不得超过 500MB\n"
+            "文件要求 | 清晰可读，第三方签字盖章的上传扫描件\n"
+            "投标有效期 | 90 天\n"
+            "投标保证金 | 无需递交投标保证金\n"
+            "备选方案 | 不允许\n"
+            "报价 | 保留两位小数",
+            "投标须知前附表",
+            301,
+        ),
+        StructuredBlock(
+            "b0302",
+            "paragraph",
+            "评标委员会按照评分标准评审，中标候选人规则另行规定。",
+            "投标须知前附表",
+            302,
+        ),
+        StructuredBlock(
+            "b0303",
+            "paragraph",
+            "合同签订后的履约期间应提供 7×24 小时服务。",
+            "投标须知前附表",
+            303,
+        ),
+    ]
+
+    requirements = extract_project_requirements_from_regions(
+        identify_functional_regions(blocks)
+    )
+
+    requirement_text = "\n".join(item["requirement"] for item in requirements)
+    values = {item["value"] for item in requirements if item["value"] is not None}
+    assert len(requirements) == 8
+    assert "投标文件组成" in requirement_text
+    assert "清晰可读" in requirement_text
+    assert "无需递交投标保证金" in requirement_text
+    assert {"50MB", "500MB", "90 天", "两位小数"} <= values
+    assert all(item["source"]["block_ids"] == ["b0301"] for item in requirements)
+    assert "评分标准" not in requirement_text
+    assert "履约" not in requirement_text
+
+
+def test_project_requirement_extraction_does_not_turn_qualifications_into_rules():
+    blocks = [
+        StructuredBlock(
+            "b0310",
+            "heading",
+            "项目专用表",
+            "项目专用表",
+            310,
+        ),
+        StructuredBlock(
+            "b0311",
+            "paragraph",
+            "具有良好的商业信誉，具备丰富的软件项目经验，能够提供 7×24 小时服务。",
+            "项目专用表",
+            311,
+        ),
+        StructuredBlock(
+            "b0312",
+            "paragraph",
+            "各组成部分分别编制，单个文件不得超过 50MB。",
+            "项目专用表",
+            312,
+        ),
+    ]
+
+    requirements = extract_project_requirements_from_regions(
+        identify_functional_regions(blocks)
+    )
+
+    assert len(requirements) == 1
+    assert all("商业信誉" not in item["requirement"] for item in requirements)
+    assert all("软件项目经验" not in item["requirement"] for item in requirements)
+    assert any("分别编制" in item["requirement"] for item in requirements)
 
 
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:
