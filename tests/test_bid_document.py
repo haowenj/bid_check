@@ -98,6 +98,40 @@ def test_flatten_mineru_content_list_preserves_nested_order_and_source_paths():
     assert flattened[4]["img_path"] == "images/id-card.jpg"
 
 
+def test_flatten_supports_mineru_grouped_v2_content_and_image_source_path():
+    from app.bid_document import flatten_mineru_content_list
+
+    payload = [
+        [
+            {
+                "type": "image",
+                "content": {
+                    "image_source": {"path": "images/license.png"},
+                    "image_caption": [],
+                },
+            }
+        ],
+        [
+            {
+                "type": "paragraph",
+                "content": {
+                    "paragraph_content": [
+                        {"type": "text", "content": "分组正文"}
+                    ]
+                },
+            }
+        ],
+    ]
+
+    flattened = flatten_mineru_content_list(payload)
+
+    assert [item["type"] for item in flattened] == ["image", "paragraph"]
+    assert flattened[0]["img_path"] == "images/license.png"
+    assert flattened[0]["_bid_source"]["source_path"] == [0, 0]
+    assert flattened[1]["_bid_source"]["source_path"] == [1, 0]
+    assert [item["_bid_source"]["raw_item_index"] for item in flattened] == [0, 1]
+
+
 def test_clean_items_removes_only_deterministic_noise_and_keeps_material_objects():
     from app.bid_document import clean_items, flatten_mineru_content_list
 
@@ -472,7 +506,7 @@ def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
                 "bbox": [10, 180, 500, 500],
                 "content": {
                     "image_caption": [{"type": "text", "content": "证照"}],
-                    "img_path": "images/license.jpg",
+                    "image_source": {"path": "images/license.jpg"},
                 },
             },
             {"type": "paragraph", "text": "附件说明。", "page_idx": 0},
@@ -528,4 +562,5 @@ def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
     structured = json.loads((output_dir / "structured_document.json").read_text())
     assert structured["tables"][0]["rows"] == [["材料"]]
     assert structured["images"][0]["asset_status"] == "ready"
+    assert result["diagnostics"]["asset_reference_count"] == 1
     assert json.loads((output_dir / "cleaning_log.json").read_text()) == []

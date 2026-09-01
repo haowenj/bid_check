@@ -63,11 +63,33 @@ def _payload_items(payload: Any) -> tuple[list[Any], list[int]]:
         raise ValueError("MinerU 返回结果不是结构化内容列表。")
     if (
         len(payload) == 2
+        and isinstance(payload[0], dict)
         and isinstance(payload[1], list)
         and all(isinstance(item, dict) for item in payload[1])
     ):
         return payload[1], [1]
     return payload, []
+
+
+def _expanded_payload_items(payload: Any) -> list[tuple[int, Any, list[Any]]]:
+    """Expand MinerU's optional grouped top-level list without losing paths."""
+
+    items, prefix = _payload_items(payload)
+    expanded: list[tuple[int, Any, list[Any]]] = []
+    raw_item_index = 0
+
+    def visit(value: Any, source_path: list[Any]) -> None:
+        nonlocal raw_item_index
+        if isinstance(value, list):
+            for child_index, child in enumerate(value):
+                visit(child, [*source_path, child_index])
+            return
+        expanded.append((raw_item_index, value, source_path))
+        raw_item_index += 1
+
+    for top_index, raw in enumerate(items):
+        visit(raw, [*prefix, top_index])
+    return expanded
 
 
 def _source_metadata(
@@ -109,10 +131,8 @@ def _with_source(
 def flatten_mineru_content_list(payload: Any) -> list[Any]:
     """Flatten supported MinerU envelopes while retaining raw source paths."""
 
-    items, prefix = _payload_items(payload)
     flattened: list[Any] = []
-    for raw_item_index, raw in enumerate(items):
-        source_path = [*prefix, raw_item_index]
+    for raw_item_index, raw, source_path in _expanded_payload_items(payload):
         if not isinstance(raw, dict):
             flattened.append(raw)
             continue
@@ -196,6 +216,13 @@ def flatten_mineru_content_list(payload: Any) -> list[Any]:
                     ).strip()
                     if content.get("img_path"):
                         normalized["img_path"] = content["img_path"]
+                    image_source = content.get("image_source")
+                    if (
+                        not normalized.get("img_path")
+                        and isinstance(image_source, dict)
+                        and isinstance(image_source.get("path"), str)
+                    ):
+                        normalized["img_path"] = image_source["path"]
             else:
                 normalized["text"] = _inline_text(content).strip()
             flattened.append(
@@ -811,7 +838,7 @@ class MinerUBidDocumentParser:
         payload, raw_content_bytes, content_member, zip_diagnostics = (
             self._content_list_from_zip(result_zip)
         )
-        raw_items, _ = _payload_items(payload)
+        raw_item_count = len(_expanded_payload_items(payload))
         flattened = flatten_mineru_content_list(payload)
         cleaned, cleaning_log = clean_items(flattened)
         merged, merge_log = merge_items(cleaned)
@@ -860,7 +887,7 @@ class MinerUBidDocumentParser:
         _write_json_atomic(artifacts["merge_log"], merge_log)
 
         stats = {
-            "raw_item_count": len(raw_items),
+            "raw_item_count": raw_item_count,
             "flattened_item_count": len(flattened),
             "cleaned_item_count": len(cleaned),
             "merged_item_count": len(merged),
@@ -1138,6 +1165,12 @@ class MinerUBidDocumentParser:
                         child, str
                     ):
                         references.append(child)
+                    elif (
+                        key == "image_source"
+                        and isinstance(child, dict)
+                        and isinstance(child.get("path"), str)
+                    ):
+                        references.append(child["path"])
                     else:
                         collect(child)
             elif isinstance(value, list):
