@@ -1,30 +1,27 @@
 from app.mock_services import (
-    extract_compliance_requirements,
+    extract_tender_objects,
     parse_bid_document,
     run_compliance_review,
 )
 from app.models import FileMetadata
 
 
-def test_extract_returns_five_structured_requirements(tmp_path):
+def test_extract_returns_three_tender_object_collections(tmp_path):
     tender_path = tmp_path / "tender.docx"
     tender_path.write_bytes(b"docx")
     tender_file = FileMetadata("招标文件.docx", 4, str(tender_path))
 
-    requirements = extract_compliance_requirements(
+    result = extract_tender_objects(
         tender_file,
         delay_seconds=0,
     )
 
-    assert [item["id"] for item in requirements] == [
-        "tender_requirement_001",
-        "tender_requirement_002",
-        "tender_requirement_003",
-        "tender_requirement_004",
-        "tender_requirement_005",
-    ]
-    assert all(set(item) == {"id", "name", "rule", "condition", "source"} for item in requirements)
-    assert all(item["source"]["section"] for item in requirements)
+    assert set(result) == {
+        "templates",
+        "project_requirements",
+        "supplemental_materials",
+    }
+    assert result == {"templates": [], "project_requirements": [], "supplemental_materials": []}
 
 
 def test_parse_returns_original_document_name_and_mock_counts(tmp_path):
@@ -46,7 +43,7 @@ def test_parse_returns_original_document_name_and_mock_counts(tmp_path):
 
 def test_review_returns_disclaimer_without_fake_judgement():
     result = run_compliance_review(
-        [{"id": "compliance_001"}],
+        {"templates": [], "project_requirements": [], "supplemental_materials": []},
         {"status": "success"},
     )
 
@@ -57,7 +54,10 @@ def test_review_returns_disclaimer_without_fake_judgement():
 
 
 def test_review_accepts_zero_extracted_requirements_without_fake_judgement():
-    result = run_compliance_review([], {"status": "success"})
+    result = run_compliance_review(
+        {"templates": [], "project_requirements": [], "supplemental_materials": []},
+        {"status": "success"},
+    )
 
     assert result["mode"] == "mock"
     assert "passed" not in result

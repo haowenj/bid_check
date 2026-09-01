@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
-from io import BytesIO
-from typing import get_type_hints
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -16,548 +13,411 @@ from app.compliance_extraction import (
     FunctionalRegion,
     InMemoryRequirementCache,
     StructuredBlock,
-    build_candidate_batches,
-    extract_compliance_requirements_real,
+    apply_project_applicability,
     extract_project_requirements_from_regions,
     extract_supplemental_materials_from_regions,
     extract_templates_from_regions,
-    apply_project_applicability,
+    extract_tender_compliance_objects,
     identify_functional_regions,
     normalize_tender_extraction_sources,
     parse_docx_document,
-    select_compliance_candidates,
 )
-from app.models import (
-    FileMetadata,
-    ProjectRequirement,
-    SupplementalMaterial,
-    TenderExtractionResult,
-    TenderTemplate,
-)
+from app.models import FileMetadata
 
 
-def test_tender_extraction_object_types_define_three_result_collections():
-    assert set(get_type_hints(TenderExtractionResult)) == {
-        "templates",
-        "project_requirements",
-        "supplemental_materials",
-    }
-    assert set(get_type_hints(TenderTemplate)) >= {
-        "id",
-        "name",
-        "section",
-        "block_ids",
-        "body",
-        "tables",
-        "fields",
-        "attachments",
-        "source",
-    }
-    assert set(get_type_hints(ProjectRequirement)) >= {
-        "id",
-        "requirement",
-        "value",
-        "source",
-    }
-    assert set(get_type_hints(SupplementalMaterial)) >= {
-        "id",
-        "name",
-        "material",
-        "source",
-    }
+def block(
+    block_id: str,
+    block_type: str,
+    text: str,
+    section: str,
+    order: int,
+) -> StructuredBlock:
+    return StructuredBlock(block_id, block_type, text, section, order)
 
 
-def test_functional_regions_use_semantic_titles_without_fixed_chapter_numbers():
+def test_functional_regions_are_semantic_and_stop_at_excluded_sections():
     blocks = [
-        StructuredBlock(
-            "b0001",
-            "heading",
-            "第一部分 投标人须知前附表",
-            "第一部分 投标人须知前附表",
-            1,
-        ),
-        StructuredBlock(
-            "b0002",
-            "table",
-            "投标文件组成 | 商务文件、技术文件、报价文件",
-            "第一部分 投标人须知前附表",
-            2,
-        ),
-        StructuredBlock(
-            "b0003",
-            "heading",
-            "第三章 评标办法",
-            "第三章 评标办法",
-            3,
-        ),
-        StructuredBlock(
-            "b0004",
-            "paragraph",
-            "商务评分满分 20 分。",
-            "第三章 评标办法",
-            4,
-        ),
-        StructuredBlock(
-            "b0005",
-            "heading",
-            "附件 响应文件格式",
-            "附件 响应文件格式",
-            5,
-        ),
-        StructuredBlock(
-            "b0006",
-            "paragraph",
-            "商务投标文件封面",
-            "附件 响应文件格式",
-            6,
-        ),
-        StructuredBlock(
-            "b0007",
-            "heading",
-            "投标产品资格要求",
-            "投标产品资格要求",
-            7,
-        ),
-        StructuredBlock(
-            "b0008",
-            "paragraph",
-            "须随投标文件提供制造商登记证明。",
-            "投标产品资格要求",
-            8,
-        ),
+        block("b1", "heading", "附件 响应文件格式", "附件 响应文件格式", 1),
+        block("b2", "heading", "投标函", "附件 响应文件格式", 2),
+        block("b3", "paragraph", "投标人名称：____", "附件 响应文件格式", 3),
+        block("b4", "heading", "投标人须知前附表", "投标人须知前附表", 4),
+        block("b5", "table", "投标有效期 | 90 天", "投标人须知前附表", 5),
+        block("b6", "heading", "第三部分 评标办法", "第三部分 评标办法", 6),
+        block("b7", "paragraph", "商务评分满分 20 分。", "第三部分 评标办法", 7),
+        block("b8", "heading", "投标产品资格要求", "投标产品资格要求", 8),
+        block("b9", "paragraph", "须随投标文件提供制造商登记证明。", "投标产品资格要求", 9),
     ]
 
     regions = identify_functional_regions(blocks)
 
     assert [(region.kind, region.title) for region in regions] == [
-        ("project_requirements", "第一部分 投标人须知前附表"),
         ("templates", "附件 响应文件格式"),
+        ("project_requirements", "投标人须知前附表"),
         ("supplemental_materials", "投标产品资格要求"),
     ]
-    assert regions[0].block_ids == ["b0001", "b0002"]
-    assert regions[1].block_ids == ["b0005", "b0006"]
-    assert regions[2].block_ids == ["b0007", "b0008"]
-    assert all(region.kind != "templates" or "评分" not in region.text for region in regions)
+    assert regions[0].block_ids == ["b1", "b2", "b3"]
+    assert "商务评分" not in "\n".join(region.text for region in regions)
 
 
-def test_functional_region_type_keeps_source_order_and_blocks():
-    assert set(get_type_hints(FunctionalRegion)) >= {
-        "kind",
-        "title",
-        "section",
-        "block_ids",
-        "blocks",
-        "text",
-        "order",
-    }
-
-
-def test_template_extraction_keeps_one_complete_object_across_contiguous_blocks():
+def test_plain_paragraph_front_table_title_is_recognized_but_toc_entry_is_not():
     blocks = [
-        StructuredBlock(
-            "b0100",
-            "heading",
-            "附件 商务投标文件格式",
-            "附件 商务投标文件格式",
-            100,
-        ),
-        StructuredBlock(
-            "b0101",
-            "heading",
-            "一、法定代表人身份证明（格式）",
-            "附件 商务投标文件格式",
-            101,
-        ),
-        StructuredBlock(
-            "b0102",
-            "paragraph",
-            "姓名：____ 性别：____ 年龄：____ 职务：____",
-            "附件 商务投标文件格式",
-            102,
-        ),
-        StructuredBlock(
-            "b0103",
-            "table",
-            "投标人名称 | ____\n身份证附件 | 国徽面、人像面",
-            "附件 商务投标文件格式",
-            103,
-            metadata={"rows": 2},
-        ),
-        StructuredBlock(
-            "b0104",
-            "paragraph",
-            "附：身份证正反面扫描件。",
-            "附件 商务投标文件格式",
-            104,
-        ),
-        StructuredBlock(
-            "b0105",
-            "heading",
-            "二、授权委托书",
-            "附件 商务投标文件格式",
-            105,
-        ),
-        StructuredBlock(
-            "b0106",
-            "paragraph",
-            "委托代理人姓名：____，附授权委托书。",
-            "附件 商务投标文件格式",
-            106,
-        ),
+        block("b1", "heading", "第二章 投标人须知", "第二章 投标人须知", 1),
+        block("b2", "paragraph", "投标人须知前附表", "第二章 投标人须知", 2),
+        block("b3", "table", "投标有效期 | 90 天", "第二章 投标人须知", 3),
+        block("b4", "heading", "第六章 投标文件格式", "第六章 投标文件格式", 4),
+        block("b5", "paragraph", "投标函 PAGEREF _Toc123 \\h 10", "第六章 投标文件格式", 5),
     ]
 
     regions = identify_functional_regions(blocks)
-    templates = extract_templates_from_regions(regions)
 
-    assert [template["name"] for template in templates] == [
-        "法定代表人身份证明",
-        "授权委托书",
-    ]
-    first = templates[0]
-    assert first["block_ids"] == ["b0101", "b0102", "b0103", "b0104"]
-    assert first["section"] == "附件 商务投标文件格式"
-    assert "姓名：____" in first["body"]
-    assert first["tables"] == [
-        {
-            "block_id": "b0103",
-            "text": "投标人名称 | ____\n身份证附件 | 国徽面、人像面",
-            "metadata": {"rows": 2},
-        }
-    ]
-    assert {"姓名", "性别", "年龄", "职务", "投标人名称"} <= set(first["fields"])
-    assert "身份证正反面扫描件" in first["attachments"]
-    assert first["source"] == {
-        "section": "附件 商务投标文件格式",
-        "block_ids": ["b0101", "b0102", "b0103", "b0104"],
-        "source_text": "\n".join(block.text for block in blocks[1:5]),
-    }
-
-
-def test_template_extraction_does_not_create_rule_per_block():
-    blocks = [
-        StructuredBlock(
-            "b0200", "heading", "第九章 投标文件模板", "第九章 投标文件模板", 200
-        ),
-        StructuredBlock(
-            "b0201", "heading", "投标函", "第九章 投标文件模板", 201
-        ),
-        StructuredBlock(
-            "b0202", "paragraph", "项目名称：____", "第九章 投标文件模板", 202
-        ),
-        StructuredBlock(
-            "b0203", "paragraph", "投标人名称：____", "第九章 投标文件模板", 203
-        ),
+    assert [(region.kind, region.title) for region in regions] == [
+        ("project_requirements", "投标人须知前附表")
     ]
 
-    templates = extract_templates_from_regions(identify_functional_regions(blocks))
+
+def test_template_is_one_complete_contiguous_check_object():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="附件 投标文件格式",
+        block_ids=["b1", "b2", "b3", "b4", "b5"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "附件 投标文件格式", 1),
+            block("b2", "heading", "法定代表人身份证明", "附件 投标文件格式", 2),
+            block("b3", "paragraph", "姓名：____；职务：____。", "附件 投标文件格式", 3),
+            block("b4", "table", "身份证正面 | ______\n身份证反面 | ______", "附件 投标文件格式", 4),
+            block("b5", "paragraph", "附：法定代表人身份证复印件。", "附件 投标文件格式", 5),
+        ],
+        text="",
+        order=1,
+    )
+
+    templates = extract_templates_from_regions([region])
 
     assert len(templates) == 1
-    assert templates[0]["name"] == "投标函"
-    assert templates[0]["block_ids"] == ["b0201", "b0202", "b0203"]
-    assert "项目名称：____" in templates[0]["body"]
-    assert "投标人名称：____" in templates[0]["body"]
-
-
-def test_project_requirement_extraction_keeps_only_bid_compilation_rows():
-    blocks = [
-        StructuredBlock(
-            "b0300",
-            "heading",
-            "投标须知前附表",
-            "投标须知前附表",
-            300,
-        ),
-        StructuredBlock(
-            "b0301",
-            "table",
-            "投标文件组成 | 商务文件、技术文件、报价文件\n"
-            "单个组成部分大小 | 不得超过 50MB\n"
-            "投标文件总容量 | 不得超过 500MB\n"
-            "文件要求 | 清晰可读，第三方签字盖章的上传扫描件\n"
-            "投标有效期 | 90 天\n"
-            "投标保证金 | 无需递交投标保证金\n"
-            "备选方案 | 不允许\n"
-            "报价 | 保留两位小数",
-            "投标须知前附表",
-            301,
-        ),
-        StructuredBlock(
-            "b0302",
-            "paragraph",
-            "评标委员会按照评分标准评审，中标候选人规则另行规定。",
-            "投标须知前附表",
-            302,
-        ),
-        StructuredBlock(
-            "b0303",
-            "paragraph",
-            "合同签订后的履约期间应提供 7×24 小时服务。",
-            "投标须知前附表",
-            303,
-        ),
+    template = templates[0]
+    assert template["name"] == "法定代表人身份证明"
+    assert template["block_ids"] == ["b2", "b3", "b4", "b5"]
+    assert "姓名：____" in template["body"]
+    assert template["tables"] == [
+        {
+            "block_id": "b4",
+            "text": "身份证正面 | ______\n身份证反面 | ______",
+            "metadata": {},
+        }
     ]
+    assert "姓名" in template["fields"]
+    assert "职务" in template["fields"]
+    assert template["attachments"] == ["法定代表人身份证复印件"]
+    assert template["source"]["source_text"] == template["body"]
 
-    requirements = extract_project_requirements_from_regions(
-        identify_functional_regions(blocks)
+
+def test_template_attachment_extraction_ignores_attachment_word_and附加_clause():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="附件 投标文件格式",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "附件 投标文件格式", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标函\n有关附件，我方不提出任何附加条件。\n附：法定代表人身份证复印件。",
+                "附件 投标文件格式",
+                2,
+            ),
+        ],
+        text="投标文件格式\n投标函\n有关附件，我方不提出任何附加条件。\n附：法定代表人身份证复印件。",
+        order=1,
     )
 
-    requirement_text = "\n".join(item["requirement"] for item in requirements)
-    values = {item["value"] for item in requirements if item["value"] is not None}
+    template = extract_templates_from_regions([region])[0]
+
+    assert template["attachments"] == ["法定代表人身份证复印件"]
+
+
+def test_template_does_not_become_one_requirement_per_block():
+    region = FunctionalRegion(
+        kind="templates",
+        title="响应文件格式",
+        section="响应文件格式",
+        block_ids=["b1", "b2", "b3"],
+        blocks=[
+            block("b1", "heading", "响应文件格式", "响应文件格式", 1),
+            block("b2", "heading", "投标函", "响应文件格式", 2),
+            block("b3", "paragraph", "项目名称：____；投标人名称：____", "响应文件格式", 3),
+        ],
+        text="",
+        order=1,
+    )
+
+    templates = extract_templates_from_regions([region])
+
+    assert len(templates) == 1
+    assert templates[0]["block_ids"] == ["b2", "b3"]
+
+
+def test_flattened_paragraph_titles_segment_complete_templates():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2", "b3", "b4", "b5"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block("b2", "paragraph", "投标函", "投标文件格式", 2),
+            block("b3", "paragraph", "投标人名称：____", "投标文件格式", 3),
+            block("b4", "paragraph", "法定代表人身份证明", "投标文件格式", 4),
+            block("b5", "paragraph", "姓名：____", "投标文件格式", 5),
+        ],
+        text="",
+        order=1,
+    )
+
+    templates = extract_templates_from_regions([region])
+
+    assert [(item["name"], item["block_ids"]) for item in templates] == [
+        ("投标函", ["b2", "b3"]),
+        ("法定代表人身份证明", ["b4", "b5"]),
+    ]
+
+
+def test_project_requirements_keep_only_file_compilation_rows():
+    region = FunctionalRegion(
+        kind="project_requirements",
+        title="项目专用表",
+        section="项目专用表",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "项目专用表", "项目专用表", 1),
+            block(
+                "b2",
+                "table",
+                "投标文件组成 | 商务、技术、报价文件\n"
+                "各组成部分 | 分别编制\n"
+                "单个组成部分大小 | 不超过 50MB\n"
+                "总容量 | 不超过 500MB\n"
+                "投标有效期 | 90 天\n"
+                "投标保证金 | 无需递交投标保证金\n"
+                "备选方案 | 不允许\n"
+                "报价 | 保留两位小数\n"
+                "人员经验 | 具有丰富项目经验\n"
+                "履约支持 | 提供 7×24 小时服务",
+                "项目专用表",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    requirements = extract_project_requirements_from_regions([region])
+    text = "\n".join(item["requirement"] for item in requirements)
+
     assert len(requirements) == 8
-    assert "投标文件组成" in requirement_text
-    assert "清晰可读" in requirement_text
-    assert "无需递交投标保证金" in requirement_text
-    assert {"50MB", "500MB", "90 天", "两位小数"} <= values
-    assert all(item["source"]["block_ids"] == ["b0301"] for item in requirements)
-    assert "评分标准" not in requirement_text
-    assert "履约" not in requirement_text
+    assert "不超过 50MB" in text
+    assert "500MB" in text
+    assert "无需递交投标保证金" in text
+    assert "丰富项目经验" not in text
+    assert "7×24" not in text
+    assert all(item["source"]["block_ids"] == ["b2"] for item in requirements)
 
 
-def test_project_requirement_extraction_does_not_turn_qualifications_into_rules():
-    blocks = [
-        StructuredBlock(
-            "b0310",
-            "heading",
-            "项目专用表",
-            "项目专用表",
-            310,
-        ),
-        StructuredBlock(
-            "b0311",
-            "paragraph",
-            "具有良好的商业信誉，具备丰富的软件项目经验，能够提供 7×24 小时服务。",
-            "项目专用表",
-            311,
-        ),
-        StructuredBlock(
-            "b0312",
-            "paragraph",
-            "各组成部分分别编制，单个文件不得超过 50MB。",
-            "项目专用表",
-            312,
-        ),
+def test_supplemental_materials_only_include_explicit_submission_evidence():
+    regions = [
+        FunctionalRegion(
+            kind="supplemental_materials",
+            title="投标人资格要求",
+            section="投标人资格要求",
+            block_ids=["b1", "b2", "b3", "b4"],
+            blocks=[
+                block("b1", "heading", "投标人资格要求", "投标人资格要求", 1),
+                block("b2", "paragraph", "须随投标文件提供营业执照或事业单位法人证书。", "投标人资格要求", 2),
+                block("b3", "paragraph", "提供指定时间范围内的业绩证明及合同关键页。", "投标人资格要求", 3),
+                block("b4", "paragraph", "具有良好的商业信誉并能够提供 7×24 小时服务。", "投标人资格要求", 4),
+            ],
+            text="",
+            order=1,
+        )
     ]
 
-    requirements = extract_project_requirements_from_regions(
-        identify_functional_regions(blocks)
-    )
+    materials = extract_supplemental_materials_from_regions(regions)
 
-    assert len(requirements) == 1
-    assert all("商业信誉" not in item["requirement"] for item in requirements)
-    assert all("软件项目经验" not in item["requirement"] for item in requirements)
-    assert any("分别编制" in item["requirement"] for item in requirements)
-
-
-def test_supplemental_material_extraction_keeps_explicit_submission_evidence():
-    blocks = [
-        StructuredBlock(
-            "b0400",
-            "heading",
-            "投标人资格要求",
-            "投标人资格要求",
-            400,
-        ),
-        StructuredBlock(
-            "b0401",
-            "paragraph",
-            "须随投标文件提供营业执照或事业单位法人证书复印件。",
-            "投标人资格要求",
-            401,
-        ),
-        StructuredBlock(
-            "b0402",
-            "paragraph",
-            "分支机构投标的，应附总公司出具的授权书。",
-            "投标人资格要求",
-            402,
-        ),
-        StructuredBlock(
-            "b0403",
-            "paragraph",
-            "应提供近三年同类业绩证明及合同关键页。",
-            "投标人资格要求",
-            403,
-        ),
-        StructuredBlock(
-            "b0404",
-            "heading",
-            "制造商资格要求",
-            "制造商资格要求",
-            404,
-        ),
-        StructuredBlock(
-            "b0405",
-            "paragraph",
-            "投标产品须提交制造商登记证明。",
-            "制造商资格要求",
-            405,
-        ),
+    assert [item["name"] for item in materials] == [
+        "营业执照",
+        "业绩证明",
+        "合同关键页",
     ]
+    assert all("商业信誉" not in item["material"] for item in materials)
+    assert all(item["source"]["section"] == "投标人资格要求" for item in materials)
 
-    materials = extract_supplemental_materials_from_regions(
-        identify_functional_regions(blocks)
+
+def test_supplemental_materials_can_extract_evidence_from_mixed_qualification_block():
+    region = FunctionalRegion(
+        kind="supplemental_materials",
+        title="招标公告",
+        section="招标公告",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "招标公告", "招标公告", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应具有良好的银行资信和商业信誉，如非事业单位，须提供有效的营业执照正本或副本扫描件；"
+                "能够提供 7×24 小时服务。",
+                "招标公告",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
     )
 
-    names = "\n".join(item["name"] for item in materials)
-    assert {"营业执照", "授权书", "业绩证明", "合同关键页", "制造商登记证明"} <= set(
-        names.splitlines()
-    )
-    assert len(materials) == 5
-    assert all(item["source"]["block_ids"] for item in materials)
-    assert all(item["source"]["source_text"] for item in materials)
-    assert all("须" in item["material"] or "应" in item["material"] for item in materials)
+    materials = extract_supplemental_materials_from_regions([region])
+
+    assert [item["name"] for item in materials] == ["营业执照"]
+    assert "须提供" in materials[0]["material"]
+    assert "商业信誉" not in materials[0]["material"]
 
 
-def test_supplemental_material_extraction_excludes_qualifications_and_future_duties():
-    blocks = [
-        StructuredBlock(
-            "b0410",
-            "heading",
-            "资格条件",
-            "资格条件",
-            410,
-        ),
-        StructuredBlock(
-            "b0411",
-            "paragraph",
-            "具有良好的商业信誉，具备丰富的软件项目经验，能够提供 7×24 小时服务。",
-            "资格条件",
-            411,
-        ),
-        StructuredBlock(
-            "b0412",
-            "paragraph",
-            "中标后人员更换需要报备，终验后的质保义务由中标人承担。",
-            "资格条件",
-            412,
-        ),
+def _template(name: str, block_id: str) -> dict:
+    return {
+        "id": f"t-{block_id}",
+        "name": name,
+        "section": "投标文件格式",
+        "block_ids": [block_id],
+        "body": name,
+        "tables": [],
+        "fields": [],
+        "attachments": [],
+        "source": {
+            "section": "投标文件格式",
+            "block_ids": [block_id],
+            "source_text": name,
+        },
+    }
+
+
+def test_project_specific_applicability_filters_bond_and_paper_templates():
+    templates = [
+        _template("投标保证金缴纳凭证", "b1"),
+        _template("纸质投标文件正本密封", "b2"),
+        {**_template("投标函", "b3"), "body": "投标函及通用投标保证金说明"},
     ]
-
-    materials = extract_supplemental_materials_from_regions(
-        identify_functional_regions(blocks)
-    )
-
-    assert materials == []
-
-
-def test_project_applicability_filters_generic_bid_bond_template():
-    blocks = [
-        StructuredBlock(
-            "b0500", "heading", "投标文件格式", "投标文件格式", 500
-        ),
-        StructuredBlock(
-            "b0501", "heading", "投标保证金缴纳证明", "投标文件格式", 501
-        ),
-        StructuredBlock(
-            "b0502", "paragraph", "附投标保证金缴纳凭证。", "投标文件格式", 502
-        ),
-        StructuredBlock(
-            "b0503", "heading", "投标函", "投标文件格式", 503
-        ),
-        StructuredBlock(
-            "b0504", "paragraph", "投标人名称：____", "投标文件格式", 504
-        ),
-        StructuredBlock(
-            "b0505", "heading", "投标人须知前附表", "投标人须知前附表", 505
-        ),
-        StructuredBlock(
-            "b0506", "paragraph", "投标保证金：无需递交投标保证金。", "投标人须知前附表", 506
-        ),
+    project_requirements = [
+        {
+            "id": "p1",
+            "requirement": "投标保证金 | 无需递交投标保证金",
+            "value": "无需递交投标保证金",
+            "source": {"section": "前附表", "block_ids": ["p1"], "source_text": ""},
+        },
+        {
+            "id": "p2",
+            "requirement": "递交方式 | 只需上传一份加密电子投标文件",
+            "value": "只需上传一份加密电子投标文件",
+            "source": {"section": "前附表", "block_ids": ["p2"], "source_text": ""},
+        },
     ]
-    regions = identify_functional_regions(blocks)
-    templates = extract_templates_from_regions(regions)
-    project_requirements = extract_project_requirements_from_regions(regions)
 
     filtered, report = apply_project_applicability(templates, project_requirements)
 
-    assert [template["name"] for template in filtered] == ["投标函"]
-    assert len(report) == 1
-    assert report[0]["name"] == "投标保证金缴纳证明"
-    assert report[0]["reason"] == "project_no_bid_bond"
-    assert report[0]["block_ids"] == ["b0501", "b0502"]
-    assert "投标保证金" in report[0]["source_text"]
+    assert [item["name"] for item in filtered] == ["投标函"]
+    assert {item["reason"] for item in report} == {
+        "project_no_bid_bond",
+        "project_electronic_only",
+    }
 
 
-def test_project_applicability_filters_paper_templates_for_electronic_only_bid():
+def test_source_normalization_rebuilds_text_from_real_blocks():
     blocks = [
-        StructuredBlock(
-            "b0510", "heading", "响应文件格式", "响应文件格式", 510
-        ),
-        StructuredBlock("b0511", "heading", "纸质正本", "响应文件格式", 511),
-        StructuredBlock("b0512", "paragraph", "纸质正本一份。", "响应文件格式", 512),
-        StructuredBlock("b0513", "heading", "密封包装", "响应文件格式", 513),
-        StructuredBlock("b0514", "paragraph", "外层包封并加盖公章。", "响应文件格式", 514),
-        StructuredBlock("b0515", "heading", "响应函", "响应文件格式", 515),
-        StructuredBlock("b0516", "paragraph", "响应人名称：____", "响应文件格式", 516),
-        StructuredBlock(
-            "b0517", "heading", "项目专用表", "项目专用表", 517
-        ),
-        StructuredBlock(
-            "b0518",
-            "paragraph",
-            "只需上传一份加密电子投标文件。",
-            "项目专用表",
-            518,
-        ),
-    ]
-    regions = identify_functional_regions(blocks)
-    templates = extract_templates_from_regions(regions)
-    project_requirements = extract_project_requirements_from_regions(regions)
-
-    filtered, report = apply_project_applicability(templates, project_requirements)
-
-    assert [template["name"] for template in filtered] == ["响应函"]
-    assert {item["reason"] for item in report} == {"project_electronic_only"}
-    assert {item["name"] for item in report} == {"纸质正本", "密封包装"}
-
-
-def test_source_normalization_rejects_unknown_ids_and_restores_original_text():
-    blocks = [
-        StructuredBlock("b0520", "paragraph", "营业执照复印件。", "资格条件", 520),
-        StructuredBlock("b0521", "paragraph", "投标人名称：____", "格式", 521),
+        block("b1", "paragraph", "招标文件原始正文。", "真实章节", 1),
+        block("b2", "paragraph", "第二个连续块。", "真实章节", 2),
     ]
     result = {
-        "templates": [],
-        "project_requirements": [
+        "templates": [
             {
-                "id": "project_requirement_001",
-                "requirement": "投标人名称应填写。",
-                "value": None,
+                **_template("模板", "b1"),
+                "block_ids": ["b1", "b2"],
                 "source": {
                     "section": "模型伪造章节",
-                    "block_ids": ["b0521"],
-                    "source_text": "模型伪造来源",
+                    "block_ids": ["b2", "b1"],
+                    "source_text": "模型伪造文本",
                 },
             }
         ],
+        "project_requirements": [],
         "supplemental_materials": [],
     }
 
     normalized = normalize_tender_extraction_sources(result, blocks)
 
-    assert normalized["project_requirements"][0]["source"] == {
-        "section": "格式",
-        "block_ids": ["b0521"],
-        "source_text": "投标人名称：____",
+    assert normalized["templates"][0]["block_ids"] == ["b1", "b2"]
+    assert normalized["templates"][0]["source"] == {
+        "section": "真实章节",
+        "block_ids": ["b1", "b2"],
+        "source_text": "招标文件原始正文。\n第二个连续块。",
     }
-    invalid = {
-        **result,
+    with pytest.raises(ComplianceExtractionError, match="block_id"):
+        normalize_tender_extraction_sources(
+            {
+                "templates": [
+                    {
+                        **_template("模板", "b1"),
+                        "source": {"block_ids": ["missing"]},
+                    }
+                ],
+                "project_requirements": [],
+                "supplemental_materials": [],
+            },
+            blocks,
+        )
+
+
+def test_llm_schema_accepts_only_narrow_object_protocol():
+    valid = {
+        "templates": [{"name": "投标函", "source_block_ids": ["b1"]}],
         "project_requirements": [
             {
-                **result["project_requirements"][0],
-                "source": {
-                    "section": "格式",
-                    "block_ids": ["missing"],
-                    "source_text": "模型伪造来源",
-                },
+                "requirement": "投标有效期 | 90 天",
+                "value": "90 天",
+                "source_block_ids": ["b2"],
+            }
+        ],
+        "supplemental_materials": [
+            {
+                "name": "营业执照",
+                "material": "须随投标文件提供营业执照。",
+                "source_block_ids": ["b3"],
             }
         ],
     }
-    with pytest.raises(ComplianceExtractionError, match="block_id"):
-        normalize_tender_extraction_sources(invalid, blocks)
+    assert extraction_module._coerce_object_output(valid) == valid
+
+    with pytest.raises(ComplianceExtractionError, match="未允许字段"):
+        extraction_module._coerce_object_output(
+            {
+                "templates": [
+                    {
+                        "name": "投标函",
+                        "source_block_ids": ["b1"],
+                        "checks": ["不得出现规则编译字段"],
+                    }
+                ],
+                "project_requirements": [],
+                "supplemental_materials": [],
+            }
+        )
+    with pytest.raises(ComplianceExtractionError, match="顶层字段"):
+        extraction_module._coerce_object_output(
+            {
+                **valid,
+                "requirements": [],
+            }
+        )
 
 
-def test_openai_prompt_requests_only_narrow_tender_objects(monkeypatch):
+def test_openai_prompt_limits_llm_to_three_object_collections(monkeypatch):
     captured = {}
 
     class FakeResponse:
@@ -573,14 +433,7 @@ def test_openai_prompt_requests_only_narrow_tender_objects(monkeypatch):
                     "choices": [
                         {
                             "message": {
-                                "content": json.dumps(
-                                    {
-                                        "templates": [],
-                                        "project_requirements": [],
-                                        "supplemental_materials": [],
-                                    },
-                                    ensure_ascii=False,
-                                )
+                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
                             }
                         }
                     ]
@@ -592,1024 +445,230 @@ def test_openai_prompt_requests_only_narrow_tender_objects(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
-    result = extraction_module.OpenAICompatibleLLM(api_key="test-key").extract(
-        [
-            CandidateWindow(
-                ["b0600"],
-                "商务投标文件格式",
-                "投标函\n投标人名称：____",
-                600,
-                kind="templates",
-            )
-        ]
+    extraction_module.OpenAICompatibleLLM(api_key="test-key").extract(
+        [CandidateWindow(["b1"], "响应文件格式", "投标函\n投标人名称：____", 1)]
     )
 
     prompt = captured["payload"]["messages"][1]["content"]
-    assert result == {
-        "templates": [],
-        "project_requirements": [],
-        "supplemental_materials": [],
-    }
-    assert "templates" in prompt
-    assert "project_requirements" in prompt
-    assert "supplemental_materials" in prompt
-    assert "check_type" in prompt
+    assert '"templates":[]' in prompt
+    assert "不得生成 check_type" in prompt
     assert "scope" in prompt
-    assert "evidence_type" in prompt
-    assert "source_text" in prompt
-    assert "TenderRequirement" in prompt or "自然语言规则" in prompt
+    assert "不得把模板编译成自然语言规则" in prompt
     assert "name、rule、condition" not in prompt
 
 
-def test_deterministic_llm_returns_narrow_object_candidates():
-    result = extraction_module.DeterministicComplianceLLM().extract(
-        [
-            CandidateWindow(
-                ["b0601"],
-                "商务投标文件格式",
-                "投标函\n投标人名称：____",
-                601,
-                kind="templates",
-            ),
-            CandidateWindow(
-                ["b0602"],
-                "投标人须知前附表",
-                "投标有效期 | 90 天",
-                602,
-                kind="project_requirements",
-            ),
-        ]
+def test_main_extractor_returns_complete_three_collection_result_and_artifacts(tmp_path):
+    task_dir = tmp_path / "task-001"
+    task_dir.mkdir()
+    tender = task_dir / "tender.docx"
+    tender.write_bytes(b"tender")
+    blocks = [
+        block("b1", "heading", "响应文件格式", "响应文件格式", 1),
+        block("b2", "heading", "投标函", "响应文件格式", 2),
+        block("b3", "paragraph", "投标人名称：____", "响应文件格式", 3),
+        block("b4", "heading", "投标人须知前附表", "投标人须知前附表", 4),
+        block("b5", "table", "投标有效期 | 90 天\n递交方式 | 只需上传电子投标文件", "投标人须知前附表", 5),
+        block("b6", "heading", "投标人资格要求", "投标人资格要求", 6),
+        block("b7", "paragraph", "须随投标文件提供营业执照。", "投标人资格要求", 7),
+    ]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    recorder = ComplianceExtractionRecorder(task_dir)
+    result = extract_tender_compliance_objects(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+        recorder=recorder,
     )
 
-    assert result["templates"] == [
-        {
-            "name": "投标函",
-            "source_block_ids": ["b0601"],
-        }
+    assert set(result) == {"templates", "project_requirements", "supplemental_materials"}
+    assert "requirements" not in result
+    assert [item["name"] for item in result["templates"]] == ["投标函"]
+    assert result["templates"][0]["body"] == "投标函\n投标人名称：____"
+    assert result["project_requirements"][0]["value"] == "90 天"
+    assert result["supplemental_materials"][0]["name"] == "营业执照"
+    assert result["templates"][0]["source"]["source_text"]
+    artifact_dir = task_dir / "compliance_extraction"
+    assert all(
+        (artifact_dir / name).is_file()
+        for name in (
+            "01_parsed_blocks.json",
+            "02_functional_regions.json",
+            "03_templates.json",
+            "04_project_requirements.json",
+            "05_supplemental_materials.json",
+            "06_filter_report.json",
+            "07_result.json",
+            "summary.json",
+            "execution.jsonl",
+        )
+    )
+    summary = json.loads((artifact_dir / "summary.json").read_text())
+    assert summary["stats"]["template_count"] == 1
+    assert summary["stats"]["project_requirement_count"] == 2
+    assert summary["stats"]["supplemental_material_count"] == 1
+    assert summary["stats"]["llm_total_calls"] == 0
+
+
+def test_llm_template_segments_replace_coarse_fallback_and_ignore_materials_in_template_region(
+    tmp_path,
+):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"tender")
+    blocks = [
+        block("b1", "heading", "响应文件格式", "响应文件格式", 1),
+        block("b2", "paragraph", "模板一\n须提供营业执照。", "响应文件格式", 2),
+        block("b3", "paragraph", "模板二", "响应文件格式", 3),
     ]
-    assert result["project_requirements"] == [
-        {
-            "requirement": "投标有效期 | 90 天",
-            "value": "90 天",
-            "source_block_ids": ["b0602"],
-        }
+
+    class Parser:
+        def parse(self, path):
+            return blocks
+
+    class LLM:
+        model = "test-model"
+
+        def extract(self, batch):
+            return {
+                "templates": [
+                    {"name": "投标函", "source_block_ids": ["b2"]},
+                    {"name": "授权委托书", "source_block_ids": ["b3"]},
+                ],
+                "project_requirements": [],
+                "supplemental_materials": [
+                    {
+                        "name": "营业执照",
+                        "material": "须提供营业执照。",
+                        "source_block_ids": ["b2"],
+                    }
+                ],
+            }
+
+    result = extract_tender_compliance_objects(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=Parser(),
+        llm=LLM(),
+    )
+
+    assert [item["name"] for item in result["templates"]] == [
+        "投标函",
+        "授权委托书",
     ]
     assert result["supplemental_materials"] == []
 
 
-def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:
-    body = []
-    for text, style in paragraphs:
-        style_xml = f'<w:pStyle w:val="{style}"/>' if style else ""
-        body.append(f"<w:p>{style_xml}<w:r><w:t>{text}</w:t></w:r></w:p>")
-    document = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        f"<w:body>{''.join(body)}</w:body></w:document>"
-    ).encode()
-    output = BytesIO()
-    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
-        archive.writestr("word/document.xml", document)
-    return output.getvalue()
-
-
-def test_parse_docx_recovers_ordered_blocks_and_sections(tmp_path):
-    path = tmp_path / "tender.docx"
-    path.write_bytes(
-        make_docx(
-            ("第六章 投标文件格式", "Heading1"),
-            ("投标人名称：____", None),
-            ("法定代表人应签字并加盖公章。", None),
-        )
-    )
-
-    blocks = parse_docx_document(path)
-
-    assert [block.block_id for block in blocks] == ["b0001", "b0002", "b0003"]
-    assert blocks[0].type == "heading"
-    assert blocks[1].section == "第六章 投标文件格式"
-    assert blocks[1].text == "投标人名称：____"
-
-
-def test_parse_docx_recovers_table_as_single_ordered_block(tmp_path):
-    path = tmp_path / "tender.docx"
-    document = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        "<w:body><w:tbl>"
-        "<w:tr><w:tc><w:p><w:r><w:t>人员姓名</w:t></w:r></w:p></w:tc>"
-        "<w:tc><w:p><w:r><w:t>身份证明</w:t></w:r></w:p></w:tc></w:tr>"
-        "</w:tbl></w:body></w:document>"
-    ).encode()
-    output = BytesIO()
-    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
-        archive.writestr("word/document.xml", document)
-    path.write_bytes(output.getvalue())
-
-    blocks = parse_docx_document(path)
-
-    assert len(blocks) == 1
-    assert blocks[0].type == "table"
-    assert blocks[0].text == "人员姓名 | 身份证明"
-
-
-def test_candidate_selection_keeps_compliance_and_excludes_scoring_text():
+def test_main_extractor_reuses_parser_and_result_cache(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"tender")
     blocks = [
-        StructuredBlock("b0001", "heading", "商务评分标准", "商务评分标准", 1),
-        StructuredBlock(
-            "b0002", "paragraph", "商务评分满分 20 分。", "商务评分标准", 2
-        ),
-        StructuredBlock("b0003", "heading", "投标文件格式", "投标文件格式", 3),
-        StructuredBlock(
-            "b0004", "paragraph", "投标人名称应填写完整。", "投标文件格式", 4
-        ),
-        StructuredBlock(
-            "b0005", "paragraph", "法定代表人应签字并加盖公章。", "投标文件格式", 5
-        ),
-    ]
-
-    candidates = select_compliance_candidates(blocks)
-
-    assert len(candidates) == 1
-    assert candidates[0].block_ids == ["b0004", "b0005"]
-    assert "评分" not in candidates[0].text
-
-
-def test_candidate_selection_drops_table_of_contents_field_codes():
-    blocks = [
-        StructuredBlock(
-            "b0001",
-            "paragraph",
-            "3.1 投标文件的组成 PAGEREF _Toc123 \\h 26",
-            "目录",
-            1,
-        ),
-        StructuredBlock(
-            "b0002", "paragraph", "投标文件应加盖公章。", "投标文件格式", 2
-        ),
-    ]
-
-    candidates = select_compliance_candidates(blocks)
-
-    assert [candidate.block_ids for candidate in candidates] == [["b0002"]]
-
-
-def test_candidate_batches_are_bounded_to_eight_by_default():
-    candidates = [
-        CandidateWindow(
-            block_ids=[f"b{i:04d}"],
-            section=f"第{i}章",
-            text=f"第{i}章投标人名称应填写。",
-            order=i,
-        )
-        for i in range(1, 16)
-    ]
-
-    batches = build_candidate_batches(candidates)
-
-    assert len(batches) == 8
-    assert all(batch for batch in batches)
-
-
-def test_real_extractor_restores_source_text_and_deduplicates(tmp_path):
-    blocks = [
-        StructuredBlock("b0001", "heading", "投标文件格式", "投标文件格式", 1),
-        StructuredBlock(
-            "b0002", "paragraph", "投标人名称应填写完整。", "投标文件格式", 2
-        ),
-        StructuredBlock(
-            "b0003", "paragraph", "投标人名称应填写完整。", "投标文件格式", 3
-        ),
+        block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+        block("b2", "heading", "投标函", "投标文件格式", 2),
+        block("b3", "paragraph", "投标人名称：____", "投标文件格式", 3),
     ]
 
     class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FakeLLM:
-        def __init__(self):
-            self.calls = []
-
-        def extract(self, batch):
-            self.calls.append(batch)
-            return [
-                {
-                    "name": "投标文件格式完整性",
-                    "rule": "投标人名称应填写完整。",
-                    "condition": None,
-                    "source_block_ids": ["b0002", "b0003"],
-                },
-                {
-                    "name": "投标文件格式完整性",
-                    "rule": "投标人名称应填写完整。",
-                    "condition": None,
-                    "source_block_ids": ["b0002"],
-                },
-            ]
-
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-    fake_llm = FakeLLM()
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", 1, str(tender)),
-        parser=FakeParser(),
-        llm=fake_llm,
-    )
-
-    assert len(fake_llm.calls) == 1
-    assert len(result) == 1
-    assert result[0]["id"] == "tender_requirement_001"
-    assert result[0]["source"]["block_ids"] == ["b0002", "b0003"]
-    assert result[0]["source"]["source_text"] == (
-        "投标人名称应填写完整。\n投标人名称应填写完整。"
-    )
-
-
-def test_real_extractor_rejects_invalid_llm_schema(tmp_path):
-    class FakeParser:
-        def parse(self, path):
-            return [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "", 1)]
-
-    class BadLLM:
-        def extract(self, batch):
-            return [{"name": "缺字段"}]
-
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-    with pytest.raises(ComplianceExtractionError, match="Schema"):
-        extract_compliance_requirements_real(
-            FileMetadata("招标文件.docx", 1, str(tender)),
-            parser=FakeParser(),
-            llm=BadLLM(),
-        )
-
-
-def test_real_extractor_rejects_legacy_execution_schema(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-
-    class FakeParser:
-        def parse(self, path):
-            return [
-                StructuredBlock(
-                    "b0001",
-                    "paragraph",
-                    "非事业单位须提供营业执照副本扫描件。",
-                    "资格材料",
-                    1,
-                )
-            ]
-
-    class LegacyShapeLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "name": "投标人主体资格证明",
-                    "category": "attachment",
-                    "target": "投标人主体资格证明",
-                    "checks": [
-                        "非事业单位须提供营业执照副本扫描件",
-                        "事业单位须提供法人证书扫描件",
-                    ],
-                    "applicability": "所有投标人",
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    with pytest.raises(ComplianceExtractionError, match="Schema"):
-        extract_compliance_requirements_real(
-            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-            parser=FakeParser(),
-            llm=LegacyShapeLLM(),
-        )
-
-
-def test_real_extractor_rejects_execution_fields_even_with_source_shape(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-
-    class FakeParser:
-        def parse(self, path):
-            return [
-                StructuredBlock(
-                    "b0001", "paragraph", "必须提供营业执照。", "资格材料", 1
-                )
-            ]
-
-    class FakeLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "id": "model-id",
-                    "name": "营业执照",
-                    "category": "attachment",
-                    "target": {"name": "资格材料", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "id": "model-check-id",
-                            "requirement": "必须提供营业执照。",
-                            "check_type": "attachment_exists",
-                            "evidence_type": "structure",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
-                    "source": {"block_ids": ["b0001"], "source_text": "伪造文本"},
-                }
-            ]
-
-    with pytest.raises(ComplianceExtractionError, match="Schema"):
-        extract_compliance_requirements_real(
-            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-            parser=FakeParser(),
-            llm=FakeLLM(),
-        )
-
-
-def test_normalization_rejects_legacy_execution_metadata(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-
-    class FakeParser:
-        def parse(self, path):
-            return [
-                StructuredBlock(
-                    "b0001",
-                    "paragraph",
-                    "须提供身份证人像面和国徽面。",
-                    "法定代表人身份证明",
-                    1,
-                )
-            ]
-
-    class AliasLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "name": "法定代表人身份证明",
-                    "category": "存在性检查",
-                    "target": {
-                        "name": "投标文件商务部分",
-                        "scope": "投标文件商务部分",
-                    },
-                    "checks": [
-                        {
-                            "requirement": "须提供身份证人像面和国徽面。",
-                            "check_type": "存在性检查",
-                            "evidence_type": "自由生成值",
-                        }
-                    ],
-                    "applicability": {
-                        "type": "所有投标人",
-                        "condition": "所有投标人",
-                    },
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    with pytest.raises(ComplianceExtractionError, match="Schema"):
-        extract_compliance_requirements_real(
-            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-            parser=FakeParser(),
-            llm=AliasLLM(),
-        )
-
-
-def test_normalization_rejects_unknown_or_missing_simplified_fields(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-
-    class FakeParser:
-        def parse(self, path):
-            return [StructuredBlock("b0001", "paragraph", "必须填写。", "格式", 1)]
-
-    class UnknownEnumLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "name": "未知规则",
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    with pytest.raises(ComplianceExtractionError, match="Schema"):
-        extract_compliance_requirements_real(
-            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-            parser=FakeParser(),
-            llm=UnknownEnumLLM(),
-        )
-
-
-def test_normalization_filters_non_executable_and_project_conflict_rules(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"docx")
-
-    class FakeParser:
-        def parse(self, path):
-            return [
-                StructuredBlock(
-                    "b0001",
-                    "paragraph",
-                    "本项目不接受联合体投标。",
-                    "投标人资格要求",
-                    1,
-                ),
-                StructuredBlock(
-                    "b0002",
-                    "paragraph",
-                    "投标人名称应填写，须提供身份证人像面和国徽面。",
-                    "投标文件格式",
-                    2,
-                ),
-                StructuredBlock(
-                    "b0003",
-                    "paragraph",
-                    "投标文件封面项目名称和日期应填写。",
-                    "商务投标文件封面",
-                    3,
-                ),
-            ]
-
-    class BoundaryLLM:
-        def extract(self, batch):
-            def item(name, rule, block_id):
-                return {
-                    "name": name,
-                    "rule": rule,
-                    "condition": None,
-                    "source_block_ids": [block_id],
-                }
-
-            return [
-                item(
-                    "封面字段",
-                    "投标人名称应填写。",
-                    "b0002",
-                ),
-                item(
-                    "身份证附件",
-                    "须提供身份证人像面和国徽面。",
-                    "b0002",
-                ),
-                item(
-                    "电子采购系统上传",
-                    "应在电子采购系统完成加密上传。",
-                    "b0002",
-                ),
-                item(
-                    "履约阶段安全告知书",
-                    "合同签订后的履约期间安全告知书需签名。",
-                    "b0002",
-                ),
-                item(
-                    "联合体协议书",
-                    "联合体各方应签订联合体协议书。",
-                    "b0001",
-                ),
-            ]
-
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=BoundaryLLM(),
-    )
-
-    names = {item["name"] for item in result}
-    assert {"封面字段", "身份证附件"} <= names
-    assert "电子采购系统上传" not in names
-    assert "履约阶段安全告知书" not in names
-    assert "联合体协议书" not in names
-
-
-def test_real_extractor_caches_source_grounded_result(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"same tender")
-    blocks = [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)]
-
-    class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FakeLLM:
         def __init__(self):
             self.calls = 0
 
-        def extract(self, batch):
+        def parse(self, path):
             self.calls += 1
-            return [
-                {
-                    "name": "投标人信息",
-                    "rule": "投标人名称应填写。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
+            return blocks
 
+    parser = FakeParser()
     cache = InMemoryRequirementCache()
-    llm = FakeLLM()
+    parser_cache = InMemoryRequirementCache()
     metadata = FileMetadata("招标文件.docx", tender.stat().st_size, str(tender))
-    first = extract_compliance_requirements_real(
-        metadata, parser=FakeParser(), llm=llm, cache=cache
+    first = extract_tender_compliance_objects(
+        metadata, parser=parser, cache=cache, parser_cache=parser_cache
     )
-    second = extract_compliance_requirements_real(
-        metadata, parser=FakeParser(), llm=llm, cache=cache
+    second_recorder = ComplianceExtractionRecorder(tmp_path / "task-002")
+    second = extract_tender_compliance_objects(
+        metadata,
+        parser=parser,
+        cache=cache,
+        parser_cache=parser_cache,
+        recorder=second_recorder,
     )
 
     assert first == second
-    assert llm.calls == 1
+    assert parser.calls == 1
+    summary = json.loads((second_recorder.artifact_dir / "summary.json").read_text())
+    assert summary["stats"]["cache_hit"] is True
+    assert summary["stats"]["parser_cache_hit"] is False
 
 
-def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
-                            }
-                        }
-                    ]
-                }
-            ).encode()
-
-    def fake_urlopen(request, timeout):
-        captured["payload"] = json.loads(request.data.decode())
-        captured["timeout"] = timeout
-        return FakeResponse()
-
-    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
-    llm = extraction_module.OpenAICompatibleLLM(api_key="test-key", timeout_seconds=17)
-    result = llm.extract([CandidateWindow(["b0001"], "格式", "投标人名称应填写。", 1)])
-
-    assert result == {
-        "templates": [],
-        "project_requirements": [],
-        "supplemental_materials": [],
-    }
-    assert captured["payload"]["enable_thinking"] is False
-    assert captured["payload"]["max_tokens"] == 8192
-    assert captured["timeout"] == 17
-    prompt = captured["payload"]["messages"][1]["content"]
-    assert "templates" in prompt
-    assert "project_requirements" in prompt
-    assert "supplemental_materials" in prompt
-    assert "不得生成 check_type" in prompt
-
-
-def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_path):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"tender")
-    blocks = [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)]
-
-    class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FlakyLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def extract(self, batch):
-            self.calls += 1
-            if self.calls == 1:
-                try:
-                    raise TimeoutError("temporary timeout")
-                except TimeoutError as exc:
-                    raise ComplianceExtractionError("请求超时") from exc
-            return [
-                {
-                    "name": "投标人信息",
-                    "rule": "投标人名称应填写。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    llm = FlakyLLM()
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=llm,
-        max_retries=1,
-    )
-
-    assert result[0]["name"] == "投标人信息"
-    assert llm.calls == 2
-
-
-def test_real_extractor_logs_each_pipeline_stage(tmp_path, caplog):
-    tender = tmp_path / "tender.docx"
-    tender.write_bytes(b"tender")
-    blocks = [StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1)]
-
-    class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FakeLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "name": "投标人信息",
-                    "rule": "投标人名称应填写。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    caplog.set_level(logging.INFO, logger="app.compliance_extraction")
-    extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=FakeLLM(),
-    )
-
-    messages = [record.getMessage() for record in caplog.records]
-    for event in (
-        "compliance.extract.start",
-        "cache.check.end",
-        "document.parse.end",
-        "candidate.filter.end",
-        "batch.build.end",
-        "compliance.batch.end",
-        "requirements.normalize.end",
-        "compliance.extract.end",
-    ):
-        assert any(event in message for message in messages), event
-
-
-def test_openai_compatible_llm_logs_call_start_and_end(monkeypatch, caplog):
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
-                            }
-                        }
-                    ]
-                }
-            ).encode()
-
-    def fake_urlopen(request, timeout):
-        return FakeResponse()
-
-    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
-    caplog.set_level(logging.INFO, logger="app.compliance_extraction")
-    llm = extraction_module.OpenAICompatibleLLM(api_key="test-key", model="test-model")
-    llm.extract([CandidateWindow(["b0001"], "格式", "投标人名称应填写。", 1)])
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("llm.call.start" in message for message in messages)
-    assert any("llm.call.end" in message for message in messages)
-    assert all("test-key" not in message for message in messages)
-
-
-def test_openai_compatible_llm_persists_raw_http_exchange(monkeypatch, tmp_path):
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "id": "response-1",
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "content": '{"templates": [], "project_requirements": [], "supplemental_materials": []}'
-                            },
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 11,
-                        "completion_tokens": 7,
-                        "total_tokens": 18,
-                    },
-                }
-            ).encode()
-
-    def fake_urlopen(request, timeout):
-        return FakeResponse()
-
-    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
-    recorder = ComplianceExtractionRecorder(tmp_path / "task-001")
-    call_id = recorder.start_llm_call(
-        batch_index=1,
-        batch_count=1,
-        attempt=1,
-        model="test-model",
-        batch=[{"block_ids": ["b0001"], "text": "须提供证明材料"}],
-    )
-    llm = extraction_module.OpenAICompatibleLLM(
-        api_key="test-key",
-        model="test-model",
-    )
-    llm.set_call_context(recorder=recorder, call_id=call_id)
-    result = llm.extract([CandidateWindow(["b0001"], "资格", "须提供证明材料", 1)])
-    assert result == {
-        "templates": [],
-        "project_requirements": [],
-        "supplemental_materials": [],
-    }
-    recorder.complete_llm_call(call_id, parsed_requirements=result, elapsed_ms=2)
-
-    input_payload = json.loads(
-        (recorder.artifact_dir / "llm" / f"{call_id}_input.json").read_text()
-    )
-    output_payload = json.loads(
-        (recorder.artifact_dir / "llm" / f"{call_id}_output.json").read_text()
-    )
-    assert input_payload["request_payload"]["model"] == "test-model"
-    assert "Authorization" not in json.dumps(input_payload)
-    assert output_payload["raw_response"]["id"] == "response-1"
-    assert output_payload["finish_reason"] == "stop"
-    assert output_payload["usage"]["total_tokens"] == 18
-
-
-def test_real_extractor_persists_intermediates_and_summary(tmp_path):
-    task_dir = tmp_path / "task-001"
-    tender = task_dir / "tender.docx"
+def test_ambiguous_llm_failure_keeps_structural_artifacts(tmp_path):
+    task_dir = tmp_path / "task-003"
     task_dir.mkdir()
+    tender = task_dir / "tender.docx"
     tender.write_bytes(b"tender")
     blocks = [
-        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式", 1),
-        StructuredBlock("b0002", "paragraph", "须提供营业执照扫描件。", "资格", 2),
+        block("b1", "heading", "响应文件格式", "响应文件格式", 1),
+        block("b2", "paragraph", "投标人名称：____", "响应文件格式", 2),
     ]
 
     class FakeParser:
         def parse(self, path):
             return blocks
 
-    class FakeLLM:
-        def extract(self, batch):
-            return [
-                {
-                    "name": "投标人要求",
-                    "rule": "投标人名称应填写。",
-                    "condition": None,
-                    "source_block_ids": [batch[0].block_ids[0]],
-                }
-            ]
-
-    recorder = ComplianceExtractionRecorder(task_dir)
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=FakeLLM(),
-        recorder=recorder,
-        max_batches=2,
-    )
-
-    artifact_dir = task_dir / "compliance_extraction"
-    assert result
-    for name in (
-        "01_parsed_blocks.json",
-        "02_candidates.json",
-        "03_batches.json",
-        "04_raw_requirements.json",
-        "05_normalized_requirements.json",
-        "06_filter_report.json",
-        "summary.json",
-        "execution.jsonl",
-        "llm/call_001_input.json",
-        "llm/call_001_output.json",
-    ):
-        assert (artifact_dir / name).is_file(), name
-
-    parsed = json.loads((artifact_dir / "01_parsed_blocks.json").read_text())
-    candidates = json.loads((artifact_dir / "02_candidates.json").read_text())
-    batches = json.loads((artifact_dir / "03_batches.json").read_text())
-    input_payload = json.loads((artifact_dir / "llm/call_001_input.json").read_text())
-    output = json.loads((artifact_dir / "llm/call_001_output.json").read_text())
-    raw = json.loads((artifact_dir / "04_raw_requirements.json").read_text())
-    normalized = json.loads(
-        (artifact_dir / "05_normalized_requirements.json").read_text()
-    )
-    summary = json.loads((artifact_dir / "summary.json").read_text())
-    events = [
-        json.loads(line)
-        for line in (artifact_dir / "execution.jsonl").read_text().splitlines()
-    ]
-
-    assert len(parsed["blocks"]) == 2
-    assert candidates["window_count"] == 2
-    assert batches["batch_count"] == 2
-    assert input_payload["batch_index"] == 1
-    assert input_payload["batch"]
-    assert output["status"] == "success"
-    assert output["schema_valid"] is True
-    assert output["elapsed_ms"] is not None
-    assert output["parsed_requirements"] == raw["requirements"][:1]
-    assert normalized["requirements"] == result
-    assert normalized["filter_count"] == 0
-    assert json.loads((artifact_dir / "06_filter_report.json").read_text()) == []
-    assert summary["status"] == "complete"
-    assert summary["stats"]["llm_total_calls"] == 2
-    assert summary["stats"]["final_requirements"] == len(result)
-    assert summary["stats"]["cache_elapsed_ms"] is not None
-    assert summary["stats"]["parser_elapsed_ms"] is not None
-    assert summary["stats"]["candidate_filter_elapsed_ms"] is not None
-    assert summary["stats"]["batch_build_elapsed_ms"] is not None
-    assert summary["stats"]["normalization_elapsed_ms"] is not None
-    assert summary["stats"]["total_elapsed_ms"] is not None
-    event_names = [event["event"] for event in events]
-    assert "compliance.extract.start" in event_names
-    assert "llm.call.start" in event_names
-    assert "llm.call.end" in event_names
-    assert "compliance.extract.finalize" in event_names
-
-
-def test_real_extractor_keeps_prior_artifacts_when_later_llm_call_fails(tmp_path):
-    task_dir = tmp_path / "task-001"
-    tender = task_dir / "tender.docx"
-    task_dir.mkdir()
-    tender.write_bytes(b"tender")
-    blocks = [
-        StructuredBlock("b0001", "paragraph", "投标人名称应填写。", "格式一", 1),
-        StructuredBlock("b0002", "paragraph", "营业执照须提供。", "格式二", 2),
-    ]
-
-    class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FlakyLLM:
-        def __init__(self):
-            self.calls = 0
+    class FailingLLM:
+        model = "test-model"
 
         def extract(self, batch):
-            self.calls += 1
-            if self.calls == 2:
-                raise ComplianceExtractionError("模拟第二批失败")
-            return [
-                {
-                    "name": "投标人要求",
-                    "rule": "投标人名称应填写。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
+            raise ComplianceExtractionError("模拟对象识别失败")
 
     recorder = ComplianceExtractionRecorder(task_dir)
-    with pytest.raises(ComplianceExtractionError, match="第二批失败"):
-        extract_compliance_requirements_real(
+    with pytest.raises(ComplianceExtractionError, match="对象识别失败"):
+        extract_tender_compliance_objects(
             FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
             parser=FakeParser(),
-            llm=FlakyLLM(),
+            llm=FailingLLM(),
             recorder=recorder,
-            max_batches=2,
             max_retries=0,
         )
 
     artifact_dir = task_dir / "compliance_extraction"
     assert (artifact_dir / "01_parsed_blocks.json").is_file()
-    assert (artifact_dir / "02_candidates.json").is_file()
-    assert (artifact_dir / "03_batches.json").is_file()
+    assert (artifact_dir / "02_functional_regions.json").is_file()
+    assert (artifact_dir / "03_templates.json").is_file() is False
     assert (artifact_dir / "llm/call_001_output.json").is_file()
-    assert (artifact_dir / "llm/call_002_output.json").is_file()
     summary = json.loads((artifact_dir / "summary.json").read_text())
     assert summary["status"] == "failed"
-    assert summary["failed_stage"] == "llm"
-    assert summary["stats"]["llm_total_calls"] == 2
-    assert "llm.call.error" in (artifact_dir / "execution.jsonl").read_text()
-
-
-def test_real_extractor_records_retry_attempts_and_call_metadata(tmp_path):
-    task_dir = tmp_path / "task-001"
-    tender = task_dir / "tender.docx"
-    task_dir.mkdir()
-    tender.write_bytes(b"tender")
-    blocks = [StructuredBlock("b0001", "paragraph", "须提供营业执照。", "资格", 1)]
-
-    class FakeParser:
-        def parse(self, path):
-            return blocks
-
-    class FlakyLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def extract(self, batch):
-            self.calls += 1
-            if self.calls == 1:
-                try:
-                    raise TimeoutError("temporary")
-                except TimeoutError as exc:
-                    raise ComplianceExtractionError("请求超时") from exc
-            return [
-                {
-                    "name": "资格材料",
-                    "rule": "须提供营业执照。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    recorder = ComplianceExtractionRecorder(task_dir)
-    extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=FlakyLLM(),
-        recorder=recorder,
-        max_retries=1,
-    )
-
-    artifact_dir = task_dir / "compliance_extraction"
-    first = json.loads((artifact_dir / "llm/call_001_output.json").read_text())
-    second_input = json.loads((artifact_dir / "llm/call_002_input.json").read_text())
-    second = json.loads((artifact_dir / "llm/call_002_output.json").read_text())
-    summary = json.loads((artifact_dir / "summary.json").read_text())
-    assert first["status"] == "failed"
-    assert first["error_type"] == "ComplianceExtractionError"
-    assert second_input["attempt"] == 2
-    assert second_input["retry"] is True
-    assert second["status"] == "success"
-    assert summary["stats"]["llm_total_calls"] == 2
-    assert summary["stats"]["llm_retries"] == 1
+    assert summary["stats"]["llm_total_calls"] == 1
     assert summary["stats"]["llm_failed_calls"] == 1
-    assert summary["stats"]["schema_valid_calls"] == 1
 
 
-def test_real_extractor_records_requirement_cache_hit(tmp_path):
-    task_dir = tmp_path / "task-001"
-    tender = task_dir / "tender.docx"
-    task_dir.mkdir()
-    tender.write_bytes(b"tender")
-    blocks = [StructuredBlock("b0001", "paragraph", "须提供营业执照。", "资格", 1)]
-
-    class FakeParser:
-        def __init__(self):
-            self.calls = 0
-
-        def parse(self, path):
-            self.calls += 1
-            return blocks
-
-    class FakeLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def extract(self, batch):
-            self.calls += 1
-            return [
-                {
-                    "name": "资格材料",
-                    "rule": "须提供营业执照。",
-                    "condition": None,
-                    "source_block_ids": ["b0001"],
-                }
-            ]
-
-    cache = InMemoryRequirementCache()
-    parser = FakeParser()
-    llm = FakeLLM()
-    metadata = FileMetadata("招标文件.docx", tender.stat().st_size, str(tender))
-    extract_compliance_requirements_real(
-        metadata,
-        parser=parser,
-        llm=llm,
-        cache=cache,
-        recorder=ComplianceExtractionRecorder(task_dir),
+def test_deterministic_fallback_has_no_execution_rule_fields():
+    result = extraction_module.DeterministicComplianceLLM().extract(
+        [CandidateWindow(["b1"], "投标文件格式", "投标函\n投标人名称：____", 1)]
     )
 
-    second_recorder = ComplianceExtractionRecorder(tmp_path / "task-002")
-    result = extract_compliance_requirements_real(
-        metadata,
-        parser=parser,
-        llm=llm,
-        cache=cache,
-        recorder=second_recorder,
-    )
+    assert result == {
+        "templates": [{"name": "投标函", "source_block_ids": ["b1"]}],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
 
-    summary = json.loads((second_recorder.artifact_dir / "summary.json").read_text())
-    raw = json.loads(
-        (second_recorder.artifact_dir / "04_raw_requirements.json").read_text()
-    )
-    assert result
-    assert parser.calls == 1
-    assert llm.calls == 1
-    assert summary["stats"]["cache_hit"] is True
-    assert summary["stats"]["cache_elapsed_ms"] is not None
-    assert raw["source"] == "requirements_cache"
+
+def test_parse_docx_recovers_order_and_table_as_structured_blocks(tmp_path):
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>响应文件格式</w:t></w:r></w:p>'
+        "<w:p><w:r><w:t>投标函</w:t></w:r></w:p>"
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>字段</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>填写</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        "</w:body></w:document>"
+    ).encode()
+    path = tmp_path / "tender.docx"
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+
+    blocks = parse_docx_document(path)
+
+    assert [item.type for item in blocks] == ["heading", "paragraph", "table"]
+    assert blocks[0].section == "响应文件格式"
+    assert blocks[2].text == "字段 | 填写"

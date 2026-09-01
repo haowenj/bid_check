@@ -30,11 +30,11 @@ from app.compliance_extraction import (
     JsonRequirementCache,
     MinerUDocumentParser,
     OpenAICompatibleLLM,
-    extract_compliance_requirements_real,
+    extract_tender_compliance_objects,
 )
 from app.config import Settings, load_settings
 from app.mock_services import (
-    MOCK_COMPLIANCE_REQUIREMENTS,
+    empty_tender_extraction_result,
     parse_bid_document,
     run_compliance_review,
 )
@@ -45,7 +45,7 @@ from app.workflow import BidCheckServices, BidCheckWorkflow
 CheckModeInput = Literal["compliance", "evaluation", "full"]
 logger = logging.getLogger(__name__)
 STAGE_LABELS = {
-    "requirements": "提取合规性检查要求",
+    "requirements": "提取招标文件检查对象",
     "bid_parse": "解析投标文件",
     "review": "执行合规性检查",
 }
@@ -71,7 +71,7 @@ def build_default_workflow(
 
     def extract_requirements(file_metadata: FileMetadata):
         try:
-            return extract_compliance_requirements_real(
+            return extract_tender_compliance_objects(
                 file_metadata,
                 parser=parser,
                 llm=llm,
@@ -85,10 +85,10 @@ def build_default_workflow(
             # as extracted requirements in normal DOCX requests.
             if not zipfile.is_zipfile(file_metadata.storage_path):
                 logger.warning(
-                    "requirements.compatibility_fallback file=%s reason=non_docx_fixture",
+                    "tender_objects.compatibility_fallback file=%s reason=non_docx_fixture",
                     file_metadata.filename,
                 )
-                return deepcopy(MOCK_COMPLIANCE_REQUIREMENTS)
+                return deepcopy(empty_tender_extraction_result())
             raise
 
     services = BidCheckServices(

@@ -10,6 +10,10 @@ import pytest
 from app.workflow import BidCheckServices, BidCheckWorkflow
 
 
+def empty_objects():
+    return {"templates": [], "project_requirements": [], "supplemental_materials": []}
+
+
 def test_requirements_and_parse_enter_concurrently(task_repository):
     barrier = Barrier(2, timeout=2)
     entered: list[str] = []
@@ -17,7 +21,7 @@ def test_requirements_and_parse_enter_concurrently(task_repository):
     def extract(file_metadata):
         entered.append("requirements")
         barrier.wait()
-        return [{"id": "compliance_001"}]
+        return empty_objects()
 
     def parse(file_metadata):
         entered.append("bid_parse")
@@ -79,7 +83,7 @@ def test_parallel_stage_failure_is_persisted(
     def extract(file_metadata):
         if failing_service == "extract":
             raise RuntimeError(message)
-        return [{"id": "compliance_001"}]
+        return empty_objects()
 
     def parse(file_metadata):
         if failing_service == "parse":
@@ -151,7 +155,7 @@ def test_both_parallel_failures_are_recorded_without_overwriting_primary_error(
 
 def test_review_failure_is_persisted(task_repository):
     services = BidCheckServices(
-        extract=lambda file_metadata: [{"id": "compliance_001"}],
+        extract=lambda file_metadata: empty_objects(),
         parse=lambda file_metadata: {"status": "success"},
         review=lambda requirements, parsed: (_ for _ in ()).throw(
             RuntimeError("模拟合规性检查失败")
@@ -176,7 +180,7 @@ def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog
     caplog.set_level(logging.INFO, logger="app.workflow")
     workflow = make_workflow(
         task_repository,
-        lambda file_metadata: [{"id": "compliance_001"}],
+        lambda file_metadata: empty_objects(),
         lambda file_metadata: {"status": "success"},
         [],
     )
@@ -202,7 +206,7 @@ def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog
 def test_workflow_persists_task_execution_log_and_summary(task_repository):
     workflow = make_workflow(
         task_repository,
-        lambda file_metadata: [{"id": "compliance_001"}],
+        lambda file_metadata: empty_objects(),
         lambda file_metadata: {"status": "success"},
         [],
     )

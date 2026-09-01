@@ -25,7 +25,7 @@
       <div>
         <span class="eyebrow">任务已完成</span>
         <h1>标书合规性校验结果</h1>
-        <p>本次共提取 {{ task.result.requirements|length }} 项合规性检查要求</p>
+        <p>本次识别 {{ task.result.templates|length }} 个模板、{{ task.result.project_requirements|length }} 条项目专用编制要求和 {{ task.result.supplemental_materials|length }} 项补充证明材料</p>
       </div>
       <a class="button" href="/bid-check">创建新任务</a>
     </header>
@@ -33,7 +33,7 @@
     <div class="notice notice-info" role="note">
       <span class="notice-icon" aria-hidden="true">i</span>
       <div>
-        <strong>当前版本仅展示提取出的合规性检查要求</strong>
+        <strong>当前版本仅展示招标文件中的检查对象</strong>
         <p>尚未执行真实投标文件内容校验，不代表任何要求已经通过或未通过。</p>
       </div>
     </div>
@@ -56,40 +56,76 @@
       <div class="section-heading result-section-heading">
         <div>
           <span class="section-number">RESULT</span>
-          <h2 id="requirements-heading">合规性检查要求</h2>
+          <h2 id="requirements-heading">招标文件检查对象</h2>
         </div>
-        <span class="requirement-count">{{ task.result.requirements|length }} 项</span>
+        <span class="requirement-count">{{ task.result.templates|length }} 个模板</span>
       </div>
 
       <div class="requirements-list">
-        {% for requirement in task.result.requirements %}
+        {% for template in task.result.templates %}
           <article class="card requirement-card">
             <div class="requirement-index">{{ "%02d"|format(loop.index) }}</div>
             <div class="requirement-content">
               <div class="requirement-heading">
                 <div>
-                  <h3>{{ requirement.name }}</h3>
+                  <h3>{{ template.name }}</h3>
+                  <span class="eyebrow">完整模板</span>
                 </div>
               </div>
               <div class="requirement-fields">
                 <div class="field-row">
-                  <strong>简要规则</strong>
-                  <span>{{ requirement.rule }}</span>
+                  <strong>所属章节</strong>
+                  <span>{{ template.section }}</span>
                 </div>
-                {% if requirement.condition %}
+                <div class="field-row">
+                  <strong>模板正文</strong>
+                  <span>{{ template.body }}</span>
+                </div>
+                {% if template.fields %}
                   <div class="field-row">
-                    <strong>适用条件</strong>
-                    <span>{{ requirement.condition }}</span>
+                    <strong>填写项</strong>
+                    <span>{{ template.fields|join("、") }}</span>
+                  </div>
+                {% endif %}
+                {% if template.attachments %}
+                  <div class="field-row">
+                    <strong>附件说明</strong>
+                    <span>{{ template.attachments|join("；") }}</span>
                   </div>
                 {% endif %}
                 <div class="field-row source-row">
-                  <strong>来源章节</strong>
-                  <span>{{ requirement.source.section }}</span>
+                  <strong>来源 block</strong>
+                  <span>{{ template.source.block_ids|join("、") }}</span>
                 </div>
-                <div class="field-row source-row">
-                  <strong>来源原文</strong>
-                  <span>{{ requirement.source.source_text }}</span>
-                </div>
+              </div>
+            </div>
+          </article>
+        {% endfor %}
+
+        {% for requirement in task.result.project_requirements %}
+          <article class="card requirement-card">
+            <div class="requirement-index">P{{ "%02d"|format(loop.index) }}</div>
+            <div class="requirement-content">
+              <div class="requirement-heading"><h3>项目专用编制要求</h3></div>
+              <div class="requirement-fields">
+                <div class="field-row"><strong>要求</strong><span>{{ requirement.requirement }}</span></div>
+                {% if requirement.value %}<div class="field-row"><strong>项目具体值</strong><span>{{ requirement.value }}</span></div>{% endif %}
+                <div class="field-row source-row"><strong>来源章节</strong><span>{{ requirement.source.section }}</span></div>
+                <div class="field-row source-row"><strong>来源原文</strong><span>{{ requirement.source.source_text }}</span></div>
+              </div>
+            </div>
+          </article>
+        {% endfor %}
+
+        {% for material in task.result.supplemental_materials %}
+          <article class="card requirement-card">
+            <div class="requirement-index">M{{ "%02d"|format(loop.index) }}</div>
+            <div class="requirement-content">
+              <div class="requirement-heading"><h3>{{ material.name }}</h3></div>
+              <div class="requirement-fields">
+                <div class="field-row"><strong>补充材料</strong><span>{{ material.material }}</span></div>
+                <div class="field-row source-row"><strong>来源章节</strong><span>{{ material.source.section }}</span></div>
+                <div class="field-row source-row"><strong>来源原文</strong><span>{{ material.source.source_text }}</span></div>
               </div>
             </div>
           </article>
@@ -147,7 +183,7 @@
         <div class="parallel-stages" data-parallel-stages>
           <article class="stage-card status-surface-{{ task.requirements_status }}" data-stage="requirements">
             <span class="stage-number">2</span>
-            <div><strong>提取合规性检查要求</strong><small>从招标文件恢复来源并整理要求</small></div>
+            <div><strong>提取招标文件检查对象</strong><small>识别完整模板、项目编制要求和补充材料</small></div>
             {{ status_badge(task.requirements_status) }}
           </article>
           <article class="stage-card status-surface-{{ task.bid_parse_status }}" data-stage="bid_parse">
@@ -169,7 +205,7 @@
 
         <article class="stage-card status-surface-{{ 'failed' if task.status == 'failed' else 'pending' }}" data-stage="result">
           <span class="stage-number">5</span>
-          <div><strong>检查结果</strong><small>展示提取出的合规性检查要求</small></div>
+          <div><strong>检查对象结果</strong><small>展示模板、项目要求和补充材料</small></div>
           {{ status_badge("failed" if task.status == "failed" else "pending") }}
         </article>
       </div>

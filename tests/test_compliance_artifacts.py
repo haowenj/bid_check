@@ -58,7 +58,11 @@ def test_recorder_persists_llm_input_output_and_metadata(tmp_path):
     recorder.complete_llm_call(
         call_id,
         raw_response={"choices": [{"message": {"content": "raw"}}]},
-        parsed_requirements=[{"name": "主体资格"}],
+        parsed_objects={
+            "templates": [],
+            "project_requirements": [],
+            "supplemental_materials": [{"name": "营业执照"}],
+        },
         finish_reason="stop",
         usage={"prompt_tokens": 21, "completion_tokens": 8, "total_tokens": 29},
         schema_valid=True,
@@ -73,7 +77,11 @@ def test_recorder_persists_llm_input_output_and_metadata(tmp_path):
     assert "Authorization" not in json.dumps(input_payload)
     assert output_payload["finish_reason"] == "stop"
     assert output_payload["usage"]["total_tokens"] == 29
-    assert output_payload["parsed_requirements"] == [{"name": "主体资格"}]
+    assert output_payload["parsed_objects"] == {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [{"name": "营业执照"}],
+    }
     assert output_payload["schema_valid"] is True
 
 
@@ -95,7 +103,7 @@ def test_recorder_preserves_prior_artifacts_when_call_fails(tmp_path):
     )
     recorder.finalize(
         status="failed",
-        stats={"llm_total_calls": 1, "final_requirements": 0},
+        stats={"llm_total_calls": 1, "template_count": 0},
         failed_stage="llm",
     )
 

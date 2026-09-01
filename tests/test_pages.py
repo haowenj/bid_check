@@ -43,10 +43,10 @@ def test_running_task_page_shows_parallel_workflow(
 
     assert response.status_code == 200
     assert "上传文件" in response.text
-    assert "提取合规性检查要求" in response.text
+    assert "提取招标文件检查对象" in response.text
     assert "解析投标文件" in response.text
     assert "执行合规性检查" in response.text
-    assert "检查结果" in response.text
+    assert "检查对象结果" in response.text
     assert "并行执行" in response.text
     assert "data-parallel-stages" in response.text
     assert response.text.count("运行中") >= 2
@@ -57,14 +57,14 @@ def test_failed_task_page_names_failed_stage(client, repository, stored_task):
     repository.fail(
         stored_task.task_id,
         "requirements",
-        "模拟合规性要求提取失败",
+        "模拟招标文件检查对象提取失败",
     )
 
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "失败阶段：提取合规性检查要求" in response.text
-    assert "模拟合规性要求提取失败" in response.text
+    assert "失败阶段：提取招标文件检查对象" in response.text
+    assert "模拟招标文件检查对象提取失败" in response.text
 
 
 def test_complete_page_renders_requirements_without_fake_verdict(
@@ -81,11 +81,9 @@ def test_complete_page_renders_requirements_without_fake_verdict(
 
     assert response.status_code == 200
     assert "标书合规性校验结果" in response.text
-    assert "本次共提取 5 项合规性检查要求" in response.text
-    assert "商务投标文件封面" in response.text
-    assert "应填写投标人名称和日期" in response.text
-    assert "业绩材料" in response.text
-    assert "当前版本仅展示提取出的合规性检查要求" in response.text
+    assert "本次识别 0 个模板、0 条项目专用编制要求和 0 项补充证明材料" in response.text
+    assert "招标文件检查对象" in response.text
+    assert "当前版本仅展示招标文件中的检查对象" in response.text
     assert "尚未执行真实投标文件内容校验" in response.text
     assert "section_count" not in response.text
     assert "章节数" in response.text

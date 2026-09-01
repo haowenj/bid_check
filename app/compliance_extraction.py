@@ -19,25 +19,22 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from xml.etree import ElementTree
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import (
     FileMetadata,
     ProjectRequirement,
     SupplementalMaterial,
     TenderExtractionResult,
-    TenderRequirement,
     TenderTemplate,
 )
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-# Keep the old import name as a data-only compatibility alias.  The former
-# execution-oriented fields are no longer part of either shape.
-ComplianceRequirement = TenderRequirement
 logger = logging.getLogger(__name__)
-REQUIREMENT_PROMPT_VERSION = "tender-requirement-prompt-v3"
-REQUIREMENT_CACHE_VERSION = f"tender-requirement-v4-source-repaired:{REQUIREMENT_PROMPT_VERSION}"
+REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
+# Bump the object-result cache when deterministic segmentation or source
+# reconciliation changes.  The parsed MinerU document cache intentionally has
+# its own stable version and remains reusable.
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v13:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v1"
 
 
@@ -103,16 +100,16 @@ class RequirementLLM(Protocol):
 
 
 class RequirementCache(Protocol):
-    def get(self, key: str) -> list[dict[str, Any]] | None: ...
+    def get(self, key: str) -> Any | None: ...
 
-    def set(self, key: str, value: list[dict[str, Any]]) -> None: ...
+    def set(self, key: str, value: Any) -> None: ...
 
 
 class InMemoryRequirementCache:
     def __init__(self):
-        self._values: dict[str, list[dict[str, Any]]] = {}
+        self._values: dict[str, Any] = {}
 
-    def get(self, key: str) -> list[dict[str, Any]] | None:
+    def get(self, key: str) -> Any | None:
         logger.info("cache.read.start backend=in_memory key=%s", key[:12])
         value = self._values.get(key)
         logger.info(
@@ -122,15 +119,15 @@ class InMemoryRequirementCache:
         )
         return deepcopy(value) if value is not None else None
 
-    def set(self, key: str, value: list[dict[str, Any]]) -> None:
+    def set(self, key: str, value: Any) -> None:
         logger.info(
-            "cache.write.start backend=in_memory key=%s requirements=%d",
+            "cache.write.start backend=in_memory key=%s objects=%d",
             key[:12],
             len(value),
         )
         self._values[key] = deepcopy(value)
         logger.info(
-            "cache.write.end backend=in_memory key=%s requirements=%d",
+            "cache.write.end backend=in_memory key=%s objects=%d",
             key[:12],
             len(value),
         )
@@ -144,7 +141,7 @@ class JsonRequirementCache:
     def _path(self, key: str) -> Path:
         return self.directory / f"{key}.json"
 
-    def get(self, key: str) -> list[dict[str, Any]] | None:
+    def get(self, key: str) -> Any | None:
         started_at = time.perf_counter()
         logger.info("cache.read.start backend=json key=%s", key[:12])
         try:
@@ -156,9 +153,9 @@ class JsonRequirementCache:
                 _elapsed_ms(started_at),
             )
             return None
-        value = deepcopy(payload) if isinstance(payload, list) else None
+        value = deepcopy(payload) if isinstance(payload, (list, dict)) else None
         logger.info(
-            "cache.read.end backend=json key=%s status=%s requirements=%d elapsed_ms=%d",
+            "cache.read.end backend=json key=%s status=%s objects=%d elapsed_ms=%d",
             key[:12],
             "hit" if value is not None else "miss",
             len(value) if value is not None else 0,
@@ -166,10 +163,10 @@ class JsonRequirementCache:
         )
         return value
 
-    def set(self, key: str, value: list[dict[str, Any]]) -> None:
+    def set(self, key: str, value: Any) -> None:
         started_at = time.perf_counter()
         logger.info(
-            "cache.write.start backend=json key=%s requirements=%d",
+            "cache.write.start backend=json key=%s objects=%d",
             key[:12],
             len(value),
         )
@@ -180,7 +177,7 @@ class JsonRequirementCache:
         )
         os.replace(temporary, target)
         logger.info(
-            "cache.write.end backend=json key=%s requirements=%d elapsed_ms=%d",
+            "cache.write.end backend=json key=%s objects=%d elapsed_ms=%d",
             key[:12],
             len(value),
             _elapsed_ms(started_at),
@@ -467,7 +464,19 @@ def _functional_region_kind(title: str) -> FunctionalRegionKind | None:
 
 
 def _is_region_title_block(block: StructuredBlock) -> bool:
-    return block.type == "heading" or block.text.strip() == block.section.strip()
+    if block.type == "heading" or block.text.strip() == block.section.strip():
+        return True
+    if block.type != "paragraph":
+        return False
+    text = block.text.strip()
+    # DOCX/MinerU exports can flatten a standalone functional title into a
+    # paragraph.  Table-of-contents entries carry field codes and must not
+    # start a real extraction region.
+    if re.search(r"\b(?:TOC|PAGEREF|_Toc|HYPERLINK)\b", text, re.IGNORECASE):
+        return False
+    if re.search(r"[。；;，,：:]", text):
+        return False
+    return len(text) <= 80 and _functional_region_kind(text) is not None
 
 
 def identify_functional_regions(
@@ -490,6 +499,25 @@ def identify_functional_regions(
             current_section = ""
             current_blocks = []
             return
+        # A chapter title followed only by a field-code TOC line is not an
+        # extraction region.  Drop it here so callers do not mistake the TOC
+        # itself for a real template area.
+        if current_kind == "templates":
+            region_text = "\n".join(block.text for block in current_blocks)
+            if len(current_blocks) == 1 or (
+                region_text.count("PAGEREF") >= 2
+                or region_text.count("_Toc") >= 2
+                or current_blocks[1:]
+                and all(
+                    re.search(r"\b(?:TOC|PAGEREF|_Toc|HYPERLINK)\b", block.text, re.IGNORECASE)
+                    for block in current_blocks[1:]
+                )
+            ):
+                current_kind = None
+                current_title = ""
+                current_section = ""
+                current_blocks = []
+                return
         regions.append(
             FunctionalRegion(
                 kind=current_kind,
@@ -533,6 +561,14 @@ def identify_functional_regions(
         if is_excluded_title or is_major_boundary:
             flush()
             continue
+        if (
+            current_kind == "project_requirements"
+            and any(item.type == "table" for item in current_blocks[1:])
+            and block.type != "table"
+            and title_kind is None
+        ):
+            flush()
+            continue
         if current_kind is not None:
             current_blocks.append(block)
 
@@ -543,8 +579,10 @@ def identify_functional_regions(
 _TEMPLATE_ITEM_NAME_RE = re.compile(
     r"封面|投标函|响应函|法定代表人身份证明|身份证明|授权委托书|"
     r"廉洁承诺|关联关系|诉讼仲裁|基本账户|账户信息|业绩情况|业绩表|"
-    r"知识产权|安全承诺|资格审查|报价表|情况表|声明|承诺函|"
-    r"保证金|保函|缴纳|纸质|正本|副本|密封|包封"
+    r"知识产权|安全承诺|资格审查(?:文件|表)|报价表|情况表|声明|承诺函|"
+    r"保证金|保函|缴纳|纸质|正本|副本|密封|包封|联合体|授权函|"
+    r"特定关系|控股|管理关系|申报表|偏离表|索引表|开源软件|第三方软件|"
+    r"元器件|来源清单|一览表|投标产品承诺|增值税专用发票"
 )
 _TEMPLATE_NUMBER_PREFIX_RE = re.compile(
     r"^\s*(?:[一二三四五六七八九十百千万0-9]+[、.)．]|\([一二三四五六七八九十百千万0-9]+\))\s*"
@@ -557,22 +595,77 @@ _TABLE_FIELD_RE = re.compile(
     r"(?:^|\n|\|)\s*([^|\n：:]{1,20})\s*\|\s*(?=_{2,}|[…·.]{2,}|$)"
 )
 _ATTACHMENT_RE = re.compile(
-    r"(?:附|附件|须附|应附)[：:\s]*(.+?)(?=[。；;\n]|$)"
+    r"(?:附件|须附|应附|附)(?!加|带|近)[：:\s]+(.+?)(?=[。；;\n]|$)"
 )
 
 
 def _template_name(value: str) -> str:
-    name = _TEMPLATE_NUMBER_PREFIX_RE.sub("", value.strip())
+    name = re.sub(r"^\s*\d+(?:\.\d+)+\s*", "", value.strip())
+    name = _TEMPLATE_NUMBER_PREFIX_RE.sub("", name)
     name = _TEMPLATE_FORMAT_SUFFIX_RE.sub("", name).strip()
+    name = re.sub(r"[★☆*]\s*", "", name, count=1)
+    name = re.sub(r"\s*[（(]如有[）)]\s*$", "", name).strip()
     return name.strip(" ：:。；;") or "投标文件模板"
+
+
+def _is_template_index_region(region: FunctionalRegion) -> bool:
+    text = region.text
+    return text.count("PAGEREF") >= 2 or text.count("_Toc") >= 2
+
+
+def _template_index_block_ids(region: FunctionalRegion) -> set[str]:
+    """Find a plain-text table-of-contents prefix in a flattened chapter."""
+
+    def key(value: str) -> str:
+        return re.sub(r"\s+", "", value).strip()
+
+    directory_index = next(
+        (
+            index
+            for index, block in enumerate(region.blocks)
+            if key(block.text) in {"目录", "目錄"}
+        ),
+        None,
+    )
+    if directory_index is None:
+        return set()
+    for index in range(directory_index + 1, len(region.blocks)):
+        candidate = key(region.blocks[index].text)
+        if not re.match(r"^[一二三四五六七八九十]+、", candidate):
+            continue
+        duplicate_index = next(
+            (
+                later_index
+                for later_index in range(index + 1, len(region.blocks))
+                if key(region.blocks[later_index].text) == candidate
+            ),
+            None,
+        )
+        if duplicate_index is not None:
+            return {
+                block.block_id
+                for block in region.blocks[directory_index:duplicate_index]
+            }
+    return set()
+
+
+_TEMPLATE_MATERIAL_ONLY_RE = re.compile(
+    r"营业执照|事业单位法人证书|合同关键页|身份证明复印件|扫描件"
+)
 
 
 def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) -> bool:
     if block.block_id == region.block_ids[0] or block.text.strip() == region.title.strip():
         return False
-    if block.type != "heading":
+    if block.type == "paragraph":
+        text = block.text.strip()
+        if len(text) > 80 or re.search(r"[。；;，,：:]", text):
+            return False
+    elif block.type != "heading":
         return False
     name = _template_name(block.text)
+    if re.match(r"(?:中国电信在职员工|中国电信员工的近亲属)", name):
+        return False
     if _functional_region_kind(name) is not None:
         return False
     return bool(_TEMPLATE_ITEM_NAME_RE.search(name))
@@ -643,11 +736,66 @@ def extract_templates_from_regions(
     for region in regions:
         if region.kind != "templates":
             continue
-        item_indexes = [
+        if _is_template_index_region(region):
+            continue
+        index_block_ids = _template_index_block_ids(region)
+        candidate_indexes = [
             index
             for index, block in enumerate(region.blocks)
-            if _is_template_item_title(block, region)
+            if block.block_id not in index_block_ids
+            and _is_template_item_title(block, region)
         ]
+        item_indexes: list[int] = []
+        for candidate_index in candidate_indexes:
+            candidate = region.blocks[candidate_index]
+            candidate_key = _compact_source_text(_template_name(candidate.text))
+            if item_indexes:
+                previous = region.blocks[item_indexes[-1]]
+                previous_key = _compact_source_text(_template_name(previous.text))
+                if (
+                    candidate_key == previous_key
+                    and candidate_index - item_indexes[-1] <= 2
+                ):
+                    continue
+                if (
+                    "如有" in previous.text
+                    and candidate_index - item_indexes[-1] <= 2
+                    and (
+                        previous_key[:10] in candidate_key
+                        or candidate_key[:10] in previous_key
+                    )
+                ):
+                    continue
+                if (
+                    previous_key
+                    and previous_key in candidate_key
+                    and candidate_index - item_indexes[-1] <= 2
+                    and candidate.text.strip().startswith("近")
+                ):
+                    continue
+            has_structural_prefix = bool(
+                _TEMPLATE_NUMBER_PREFIX_RE.match(candidate.text.strip())
+                or re.match(r"^\s*\d+(?:\.\d+)+", candidate.text.strip())
+            )
+            if has_structural_prefix:
+                next_candidate = next(
+                    (
+                        next_index
+                        for next_index in candidate_indexes
+                        if next_index > candidate_index
+                        and next_index - candidate_index <= 2
+                        and _compact_source_text(
+                            _template_name(region.blocks[next_index].text)
+                        )
+                        == candidate_key
+                    ),
+                    None,
+                )
+                if next_candidate is not None:
+                    continue
+            item_indexes.append(candidate_index)
+        if len(region.blocks) == 1:
+            continue
         if not item_indexes:
             content_blocks = region.blocks[1:] or region.blocks
             templates.append(
@@ -659,8 +807,6 @@ def extract_templates_from_regions(
                 )
             )
             continue
-        if item_indexes[0] > 1:
-            item_indexes[0] = 1
         for item_number, start in enumerate(item_indexes):
             end = item_indexes[item_number + 1] if item_number + 1 < len(item_indexes) else len(region.blocks)
             template_blocks = region.blocks[start:end]
@@ -672,13 +818,30 @@ def extract_templates_from_regions(
                     index=len(templates) + 1,
                 )
             )
-    return templates
+    deduplicated: list[TenderTemplate] = []
+    for template in templates:
+        same_name = [
+            existing
+            for existing in deduplicated
+            if _compact_source_text(existing["name"])
+            == _compact_source_text(template["name"])
+            and template["name"] != "投标一览表"
+        ]
+        if not same_name:
+            deduplicated.append(template)
+            continue
+        existing = same_name[0]
+        if len(template["body"]) > len(existing["body"]):
+            deduplicated[deduplicated.index(existing)] = template
+    for index, template in enumerate(deduplicated, start=1):
+        template["id"] = f"tender_template_{index:03d}"
+    return deduplicated
 
 
 _PROJECT_COMPILATION_RE = re.compile(
-    r"组成|分别编制|编制|文件大小|文件容量|容量|大小|清晰|可读|签字盖章|扫描件|"
-    r"投标有效期|有效期|保证金|备选|加密电子|电子投标文件|纸质|正本|副本|"
-    r"报价.*(?:小数|位数|格式)|保留.*小数"
+    r"投标文件组成|分别编制|电子投标文件的编制|文件大小|文件容量|容量|大小|"
+    r"清晰|可读|签字盖章|扫描件|投标有效期|有效期|投标保证金|备选|"
+    r"加密电子|投标文件形式|投标文件份数|递交方式|上传形式|报价.*(?:小数|位数|格式)|保留.*小数"
 )
 _PROJECT_NON_COMPILATION_RE = re.compile(
     r"评分|评标|评审因素|评标委员会|招标代理|中标候选人|履约|合同签订后|"
@@ -697,6 +860,13 @@ def _project_rows(region: FunctionalRegion) -> Iterable[tuple[StructuredBlock, s
             text = line.strip()
             if text:
                 yield block, text
+
+
+def _project_row_label(row: str) -> str:
+    columns = [column.strip() for column in row.split("|")]
+    if len(columns) >= 2:
+        return " | ".join(columns[:2])
+    return row
 
 
 def _project_value(row: str) -> str | None:
@@ -720,10 +890,20 @@ def extract_project_requirements_from_regions(
     for region in regions:
         if region.kind != "project_requirements":
             continue
+        no_bid_bond = bool(_NO_BID_BOND_RE.search(region.text))
         for block, row in _project_rows(region):
-            if not _PROJECT_COMPILATION_RE.search(row):
+            if row.startswith("招标文件否决投标条款汇总"):
+                break
+            row_label = _project_row_label(row)
+            if not _PROJECT_COMPILATION_RE.search(row_label):
                 continue
             if _PROJECT_NON_COMPILATION_RE.search(row):
+                continue
+            if (
+                no_bid_bond
+                and re.search(r"保证金|保函", row_label)
+                and not _NO_BID_BOND_RE.search(row)
+            ):
                 continue
             normalized_row = re.sub(r"\s+", " ", row).strip()
             if normalized_row in seen:
@@ -769,7 +949,43 @@ def _supplemental_material_names(text: str) -> list[str]:
         names.append("资格证书")
     if "检测报告" in text:
         names.append("检测报告")
+    if re.search(r"制造商.{0,12}(?:登记|注册)证明文件|登记（或注册）证明文件", text):
+        names.append("制造商登记证明")
     return names
+
+
+def _supplemental_evidence_snippet(text: str, name: str) -> str:
+    keyword = {
+        "营业执照": "营业执照",
+        "授权书": "授权",
+        "业绩证明": "业绩证明",
+        "合同关键页": "合同关键页",
+        "制造商登记证明": "登记",
+        "资格证书": "资格证书",
+        "检测报告": "检测报告",
+    }.get(name, name)
+    boundaries = "。；;，,\n"
+    snippets: list[str] = []
+    for match in re.finditer(re.escape(keyword), text):
+        start = max(
+            (text.rfind(mark, 0, match.start()) for mark in boundaries),
+            default=-1,
+        )
+        end_candidates = [text.find(mark, match.end()) for mark in boundaries]
+        end_candidates = [index for index in end_candidates if index >= 0]
+        end = min(end_candidates, default=len(text))
+        snippets.append(text[start + 1 : end].strip())
+    valid_snippets = [
+        snippet
+        for snippet in snippets
+        if (
+            _SUPPLEMENTAL_SUBMISSION_RE.search(snippet)
+            and not _SUPPLEMENTAL_EXCLUDED_RE.search(snippet)
+        )
+    ]
+    if valid_snippets:
+        return min(valid_snippets, key=len)
+    return snippets[0] if snippets else ""
 
 
 def extract_supplemental_materials_from_regions(
@@ -784,14 +1000,17 @@ def extract_supplemental_materials_from_regions(
             continue
         for block in region.blocks[1:]:
             text = re.sub(r"\s+", " ", block.text).strip()
-            if (
-                not text
-                or not _SUPPLEMENTAL_SUBMISSION_RE.search(text)
-                or _SUPPLEMENTAL_EXCLUDED_RE.search(text)
-            ):
+            if not text:
                 continue
             for name in _supplemental_material_names(text):
-                key = (name, text)
+                material = _supplemental_evidence_snippet(text, name)
+                if (
+                    not material
+                    or not _SUPPLEMENTAL_SUBMISSION_RE.search(material)
+                    or _SUPPLEMENTAL_EXCLUDED_RE.search(material)
+                ):
+                    continue
+                key = (name, material)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -799,7 +1018,7 @@ def extract_supplemental_materials_from_regions(
                     {
                         "id": f"supplemental_material_{len(materials) + 1:03d}",
                         "name": name,
-                        "material": text,
+                        "material": material,
                         "source": {
                             "section": region.section,
                             "block_ids": [block.block_id],
@@ -814,7 +1033,9 @@ _BID_BOND_TEMPLATE_RE = re.compile(r"保证金|保函|缴纳凭证")
 _PAPER_TEMPLATE_RE = re.compile(r"纸质|正本|副本|密封|包封")
 _NO_BID_BOND_RE = re.compile(r"(?:无需|不需要|免于|免交|不递交).{0,12}保证金")
 _ELECTRONIC_ONLY_RE = re.compile(
-    r"(?:只需|仅需|仅|只).{0,12}(?:上传|递交|提交).{0,16}电子投标文件"
+    r"(?:只需|仅需|仅|只).{0,12}(?:上传|递交|提交).{0,16}电子投标文件|"
+    r"(?:上传|递交|提交).{0,20}(?:一份|一套).{0,12}(?:加密)?电子投标文件|"
+    r"(?:加密)?电子投标文件(?:一份|一套)"
 )
 _PAPER_REQUIRED_RE = re.compile(
     r"(?:必须|需要|应当|应|提供|递交).{0,8}(?:纸质|正本|副本)"
@@ -833,17 +1054,31 @@ def apply_project_applicability(
     )
     no_bid_bond = bool(_NO_BID_BOND_RE.search(project_text))
     electronic_only = bool(_ELECTRONIC_ONLY_RE.search(project_text))
-    paper_required = bool(_PAPER_REQUIRED_RE.search(project_text))
+    paper_required = any(
+        _PAPER_REQUIRED_RE.search(text)
+        for text in (
+            f"{item['requirement']} {item.get('value') or ''}"
+            for item in project_requirements
+            if not (
+                no_bid_bond
+                and re.search(r"保证金|保函", item["requirement"])
+            )
+        )
+    )
     filtered: list[TenderTemplate] = []
     report: list[dict[str, Any]] = []
     for template in templates:
-        searchable = " ".join(
-            [template["name"], template["body"], " ".join(template["attachments"])]
-        )
         reason: str | None = None
-        if no_bid_bond and _BID_BOND_TEMPLATE_RE.search(searchable):
+        # A normal bid-letter template may mention the generic bond clause in
+        # its boilerplate.  Only a dedicated bond form/material is removed by
+        # the explicit no-bond project rule.
+        if no_bid_bond and _BID_BOND_TEMPLATE_RE.search(template["name"]):
             reason = "project_no_bid_bond"
-        elif electronic_only and not paper_required and _PAPER_TEMPLATE_RE.search(searchable):
+        elif (
+            electronic_only
+            and not paper_required
+            and _PAPER_TEMPLATE_RE.search(template["name"])
+        ):
             reason = "project_electronic_only"
         if reason is None:
             filtered.append(template)
@@ -901,82 +1136,6 @@ def normalize_tender_extraction_sources(
                 item["block_ids"] = list(item["source"]["block_ids"])
             normalized[key].append(item)  # type: ignore[arg-type]
     return normalized
-
-
-_EXCLUDED_RE = re.compile(
-    r"评分|得分|分值|评标|评审因素|商务评分|技术评分|价格评分|报价评分|综合评分"
-)
-_NOISE_RE = re.compile(r"PAGEREF|_Toc|HYPERLINK|目录")
-_COMPLIANCE_RE = re.compile(
-    r"填写|提供|附[：:]|必须|应当|须|不得|签字|签章|盖章|公章|日期|年[　 ]?月|身份证|营业执照|社保|资格证|证书|合同证明|证明材料|复印件|扫描件|业绩|人员名单|人员信息|人员姓名|联系方式|招标编号|项目名称|投标人名称|姓名|委托代理|法定代表|文件大小|附件大小|文件容量|大附件|清晰|可读|上传|加密|CA|电子投标|文件份数|组成|附件|对应|关联|每项|逐一"
-)
-_PLACEHOLDER_RE = re.compile(
-    r"_{2,}|[…·.]{2,}|【[^】]{1,40}】|\[[^\]]{0,40}\]|（(?:投标人|项目|公司|日期|盖章|签字)[^）]{0,40}）"
-)
-
-
-def _is_candidate_block(block: StructuredBlock) -> bool:
-    if (
-        not block.text
-        or _EXCLUDED_RE.search(block.text)
-        or _NOISE_RE.search(block.text)
-    ):
-        return False
-    return bool(_COMPLIANCE_RE.search(block.text) or _PLACEHOLDER_RE.search(block.text))
-
-
-def select_compliance_candidates(
-    blocks: Iterable[StructuredBlock],
-) -> list[CandidateWindow]:
-    started_at = time.perf_counter()
-    logger.info("candidate.filter.start")
-    selected = [
-        block
-        for block in sorted(blocks, key=lambda item: item.order)
-        if _is_candidate_block(block)
-    ]
-    if not selected:
-        logger.info(
-            "candidate.filter.end selected_blocks=0 windows=0 elapsed_ms=%d",
-            _elapsed_ms(started_at),
-        )
-        return []
-
-    windows: list[CandidateWindow] = []
-    current: list[StructuredBlock] = []
-
-    def flush() -> None:
-        if not current:
-            return
-        windows.append(
-            CandidateWindow(
-                block_ids=[block.block_id for block in current],
-                section=current[0].section,
-                text="\n".join(block.text for block in current),
-                order=current[0].order,
-            )
-        )
-
-    previous: StructuredBlock | None = None
-    for block in selected:
-        contiguous = (
-            previous is not None
-            and block.section == previous.section
-            and block.order <= previous.order + 2
-        )
-        if current and not contiguous:
-            flush()
-            current = []
-        current.append(block)
-        previous = block
-    flush()
-    logger.info(
-        "candidate.filter.end selected_blocks=%d windows=%d elapsed_ms=%d",
-        len(selected),
-        len(windows),
-        _elapsed_ms(started_at),
-    )
-    return windows
 
 
 def build_candidate_batches(
@@ -1061,285 +1220,12 @@ def build_candidate_batches(
     return result
 
 
-class _RawTenderRequirementModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: str = Field(min_length=1)
-    rule: str = Field(min_length=1)
-    condition: str | None = None
-    source_block_ids: list[str] = Field(min_length=1)
-
-
-def _coerce_raw_requirement(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ComplianceExtractionError("LLM Schema 校验失败：要求项不是对象。")
-    # A previous extraction cache could contain a nested source object.  Keep
-    # this narrow compatibility path, but never translate any execution
-    # fields or infer missing requirement semantics.
-    if "source_block_ids" not in raw and isinstance(raw.get("source"), dict):
-        raw = {
-            **{key: value for key, value in raw.items() if key != "source"},
-            "source_block_ids": raw["source"].get("block_ids", []),
-        }
-    for field_name in ("name", "rule"):
-        value = raw.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            raise ComplianceExtractionError(
-                f"LLM Schema 校验失败：{field_name} 不能为空。"
-            )
-    try:
-        model = _RawTenderRequirementModel.model_validate(raw)
-    except ValidationError as exc:
-        raise ComplianceExtractionError(f"LLM Schema 校验失败：{exc}") from exc
-    return model.model_dump(exclude_none=False)
-
-
-_EXTERNAL_SYSTEM_RE = re.compile(
-    r"电子采购系统|电子招标投标系统|电子招标系统|交易平台|采购平台|系统上传|平台上传|系统提交|平台提交|"
-    r"加密电子投标文件|电子投标文件加密|上传至大附件|上传至平台|完成上传|上传投标文件|"
-    r"CA证书|CA锁|证书在使用时有效|加密提交"
-)
-_FUTURE_PERFORMANCE_RE = re.compile(
-    r"合同签订后|签订后的|履约期间|履约阶段|履约过程中|履约期|未来合同|合同订单模板|合同正文|"
-    r"正式提交的合同文件|甲乙双方信息|安全危险因素告知书|安全保密相关协议"
-)
-_CURRENT_BID_RE = re.compile(
-    r"投标文件|投标阶段|投标时|随投标|作为投标文件|当前投标|递交投标|投标人应"
-)
-_JOINT_BID_RE = re.compile(r"联合体协议|联合体各方|联合体牵头|联合体成员|联合体投标")
-_ALTERNATIVE_BID_RE = re.compile(r"备选投标方案|备选方案")
-
-
-def _project_constraints(blocks: Sequence[StructuredBlock]) -> dict[str, bool]:
-    document_text = "\n".join(block.text for block in blocks)
-    return {
-        "joint_disallowed": bool(
-            re.search(r"(?:不接受|不允许|不得采用|禁止).*联合体|联合体.*(?:不接受|不允许|不得采用|禁止)", document_text)
-        ),
-        "alternative_disallowed": bool(
-            re.search(r"(?:不接受|不允许|不得提交|禁止).*备选|备选.*(?:不接受|不允许|不得提交|禁止)", document_text)
-        ),
-    }
-
-
-def _filter_requirement_reason(
-    item: dict[str, Any],
-    *,
-    constraints: dict[str, bool],
-) -> str | None:
-    rule_text = item["rule"]
-    searchable = " ".join(
-        [item["name"], rule_text, item.get("condition") or ""]
-    )
-    if _EXTERNAL_SYSTEM_RE.search(searchable):
-        return "external_system_state"
-    if (
-        _FUTURE_PERFORMANCE_RE.search(searchable)
-        and not _CURRENT_BID_RE.search(searchable)
-    ):
-        return "future_contract_or_performance"
-    if (
-        re.search(r"订单模板|合同条款、附件一", searchable)
-        and not re.search(r"投标文件中|作为投标文件|随投标文件", searchable)
-    ):
-        return "future_contract_or_performance"
-    if (
-        re.search(r"合同条款[-—：: ]*双方信息|合同主体|甲乙双方|合同正文|安全保密相关协议", searchable)
-        and not re.search(r"投标文件中|作为投标文件|随投标文件", searchable)
-    ):
-        return "future_contract_or_performance"
-    if constraints.get("joint_disallowed") and _JOINT_BID_RE.search(searchable):
-        return "project_disallowed_joint_bid"
-    if constraints.get("alternative_disallowed") and _ALTERNATIVE_BID_RE.search(searchable):
-        return "project_disallowed_alternative_bid"
-    return None
-
-
 def _filter_reason_counts(report: Sequence[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for item in report:
         reason = str(item.get("reason", "unknown"))
         counts[reason] = counts.get(reason, 0) + 1
     return counts
-
-
-def _compact_source_text(value: str) -> str:
-    return re.sub(r"[\s，。；、：:（）()【】“”\"'《》…,.!?！？\-—_]", "", value)
-
-
-def _source_text_supports_rule(rule: str, source_text: str) -> bool:
-    compact_rule = _compact_source_text(rule)
-    compact_source = _compact_source_text(source_text)
-    if not compact_rule or compact_rule in compact_source:
-        return bool(compact_rule)
-    # A compressed rule can span several source blocks. Matching a meaningful
-    # clause is enough to identify a supporting block without inventing text.
-    clauses = re.split(r"[，。；、：:,.!?！？]+", rule)
-    return any(
-        len(clause_text) >= 8
-        and _compact_source_text(clause_text) in compact_source
-        for clause_text in clauses
-    )
-
-
-def _repair_source_block_ids(
-    item: dict[str, Any],
-    source_ids: Sequence[str],
-    block_map: dict[str, StructuredBlock],
-    candidate_windows: Sequence[CandidateWindow] | None,
-) -> list[str]:
-    if not candidate_windows:
-        return list(source_ids)
-    source_id_set = set(source_ids)
-    context_ids: list[str] = []
-    for candidate in candidate_windows:
-        if source_id_set.intersection(candidate.block_ids):
-            context_ids.extend(candidate.block_ids)
-    context_ids = list(dict.fromkeys(context_ids))
-    original_supported_ids = [
-        block_id
-        for block_id in source_ids
-        if _source_text_supports_rule(item["rule"], block_map[block_id].text)
-    ]
-    if original_supported_ids:
-        # Keep the model's complete set when at least one cited block directly
-        # supports the rule; a rule may intentionally span several blocks.
-        return list(source_ids)
-    supporting_ids = [
-        block_id
-        for block_id in context_ids
-        if _source_text_supports_rule(item["rule"], block_map[block_id].text)
-    ]
-    if not supporting_ids:
-        return list(source_ids)
-    return sorted(supporting_ids, key=lambda block_id: block_map[block_id].order)
-
-
-def _normalize_requirements(
-    raw_requirements: Iterable[Any],
-    blocks: Sequence[StructuredBlock],
-    *,
-    filter_report: list[dict[str, Any]] | None = None,
-    candidate_windows: Sequence[CandidateWindow] | None = None,
-) -> list[TenderRequirement]:
-    started_at = time.perf_counter()
-    raw_items = list(raw_requirements)
-    logger.info(
-        "requirements.normalize.start raw_requirements=%d source_blocks=%d",
-        len(raw_items),
-        len(blocks),
-    )
-    block_map = {block.block_id: block for block in blocks}
-    constraints = _project_constraints(blocks)
-    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for raw in raw_items:
-        item = _coerce_raw_requirement(raw)
-        searchable_text = " ".join(
-            [item["name"], item["rule"], item.get("condition") or ""]
-        )
-        if _EXCLUDED_RE.search(searchable_text):
-            continue
-        filter_reason = _filter_requirement_reason(
-            item,
-            constraints=constraints,
-        )
-        if filter_reason is not None:
-            if filter_report is not None:
-                filter_report.append(
-                    {
-                        "name": item["name"],
-                        "rule": item["rule"],
-                        "condition": item.get("condition"),
-                        "source_block_ids": list(item["source_block_ids"]),
-                        "reason": filter_reason,
-                    }
-                )
-            logger.info(
-                "requirements.normalize.filter name=%s reason=%s",
-                item["name"],
-                filter_reason,
-            )
-            continue
-        source_ids = list(dict.fromkeys(item["source_block_ids"]))
-        if any(block_id not in block_map for block_id in source_ids):
-            raise ComplianceExtractionError(
-                "LLM Schema 校验失败：来源 block_id 不存在。"
-            )
-        repaired_source_ids = _repair_source_block_ids(
-            item,
-            source_ids,
-            block_map,
-            candidate_windows,
-        )
-        if repaired_source_ids != source_ids:
-            logger.warning(
-                "requirements.source.repair name=%s model_source_count=%d repaired_source_count=%d",
-                item["name"],
-                len(source_ids),
-                len(repaired_source_ids),
-            )
-            source_ids = repaired_source_ids
-        source_blocks = sorted(
-            (block_map[block_id] for block_id in source_ids),
-            key=lambda block: block.order,
-        )
-        source_section = source_blocks[0].section
-        key = (
-            source_section,
-            item["name"].strip(),
-            item["rule"].strip(),
-            (item.get("condition") or "").strip(),
-        )
-        existing = grouped.get(key)
-        if existing is None:
-            grouped[key] = {
-                **item,
-                "source_section": source_section,
-                "source_block_ids": [block.block_id for block in source_blocks],
-            }
-        else:
-            existing["source_block_ids"] = list(
-                dict.fromkeys(
-                    existing["source_block_ids"]
-                    + [block.block_id for block in source_blocks]
-                )
-            )
-
-    normalized: list[dict[str, Any]] = []
-    for item in sorted(
-        grouped.values(),
-        key=lambda value: min(
-            block_map[block_id].order for block_id in value["source_block_ids"]
-        ),
-    ):
-        source_blocks = sorted(
-            (block_map[block_id] for block_id in item["source_block_ids"]),
-            key=lambda block: block.order,
-        )
-        requirement_id = f"tender_requirement_{len(normalized) + 1:03d}"
-        normalized.append(
-            {
-                "id": requirement_id,
-                "name": item["name"].strip(),
-                "rule": item["rule"].strip(),
-                "condition": (
-                    item.get("condition").strip()
-                    if isinstance(item.get("condition"), str)
-                    and item.get("condition").strip()
-                    else None
-                ),
-                "source": {
-                    "section": item["source_section"],
-                    "block_ids": [block.block_id for block in source_blocks],
-                    "source_text": "\n".join(block.text for block in source_blocks),
-                },
-            }
-        )
-    logger.info(
-        "requirements.normalize.end requirements=%d elapsed_ms=%d",
-        len(normalized),
-        _elapsed_ms(started_at),
-    )
-    return normalized
 
 
 def _is_transient_extraction_error(error: ComplianceExtractionError) -> bool:
@@ -1436,7 +1322,7 @@ class OpenAICompatibleLLM:
     def _active_call_context(self) -> dict[str, Any]:
         return getattr(self._call_context, "value", {})
 
-    def extract(self, batch: Sequence[CandidateWindow]) -> list[dict[str, Any]]:
+    def extract(self, batch: Sequence[CandidateWindow]) -> dict[str, list[dict[str, Any]]]:
         started_at = time.perf_counter()
         logger.info(
             "llm.call.start provider=openai_compatible model=%s batch_size=%d candidate_chars=%d",
@@ -1679,7 +1565,7 @@ def _requirement_cache_key(
     max_batches: int,
     max_batch_chars: int,
 ) -> str:
-    """Hash all inputs that can change the extracted TenderRequirement list."""
+    """Hash all inputs that can change the three tender object collections."""
     extraction_descriptor = {
         "parser": _component_descriptor(parser),
         "llm": _component_descriptor(llm),
@@ -1700,7 +1586,440 @@ def _requirement_cache_key(
     ).hexdigest()
 
 
-def extract_compliance_requirements_real(
+def _empty_tender_extraction_result() -> TenderExtractionResult:
+    return {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
+
+
+def _valid_object_result(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(value.get(key), list)
+        for key in ("templates", "project_requirements", "supplemental_materials")
+    )
+
+
+def _coerce_object_output(value: Any) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(value, dict):
+        raise ComplianceExtractionError("LLM Schema 校验失败：对象结果不是 JSON 对象。")
+    allowed_fields = {
+        "templates": {"name", "source_block_ids"},
+        "project_requirements": {"requirement", "value", "source_block_ids"},
+        "supplemental_materials": {"name", "material", "source_block_ids"},
+    }
+    if set(value) - set(allowed_fields):
+        raise ComplianceExtractionError("LLM Schema 校验失败：包含未允许的顶层字段。")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for kind, fields in allowed_fields.items():
+        items = value.get(kind, [])
+        if not isinstance(items, list):
+            raise ComplianceExtractionError(
+                f"LLM Schema 校验失败：{kind} 必须是数组。"
+            )
+        result[kind] = []
+        for item in items:
+            if not isinstance(item, dict) or set(item) - fields:
+                raise ComplianceExtractionError(
+                    f"LLM Schema 校验失败：{kind} 包含未允许字段。"
+                )
+            source_block_ids = item.get("source_block_ids")
+            if not isinstance(source_block_ids, list) or not source_block_ids or not all(
+                isinstance(block_id, str) and block_id for block_id in source_block_ids
+            ):
+                raise ComplianceExtractionError(
+                    f"LLM Schema 校验失败：{kind} 的 source_block_ids 无效。"
+                )
+            if kind == "templates" and (
+                not isinstance(item.get("name"), str) or not item["name"].strip()
+            ):
+                raise ComplianceExtractionError("LLM Schema 校验失败：模板名称为空。")
+            if kind == "project_requirements" and (
+                not isinstance(item.get("requirement"), str)
+                or not item["requirement"].strip()
+                or item.get("value") is not None
+                and not isinstance(item.get("value"), str)
+            ):
+                raise ComplianceExtractionError("LLM Schema 校验失败：项目要求无效。")
+            if kind == "supplemental_materials" and (
+                not isinstance(item.get("name"), str)
+                or not item["name"].strip()
+                or not isinstance(item.get("material"), str)
+                or not item["material"].strip()
+            ):
+                raise ComplianceExtractionError("LLM Schema 校验失败：补充材料无效。")
+            result[kind].append(dict(item))
+    return result
+
+
+def _ambiguous_regions(
+    regions: Sequence[FunctionalRegion],
+) -> list[FunctionalRegion]:
+    ambiguous: list[FunctionalRegion] = []
+    for region in regions:
+        if region.kind == "templates":
+            if _is_template_index_region(region) or len(region.blocks) == 1:
+                continue
+            has_named_template = any(
+                _is_template_item_title(block, region) for block in region.blocks
+            )
+            if not has_named_template and len(region.blocks) > 1:
+                ambiguous.append(region)
+        elif region.kind == "project_requirements":
+            if (
+                not extract_project_requirements_from_regions([region])
+                and _PROJECT_COMPILATION_RE.search(region.text)
+            ):
+                ambiguous.append(region)
+        elif (
+            not extract_supplemental_materials_from_regions([region])
+            and any(
+                _supplemental_material_names(block.text)
+                for block in region.blocks[1:]
+            )
+            and _SUPPLEMENTAL_SUBMISSION_RE.search(region.text)
+        ):
+            ambiguous.append(region)
+    return ambiguous
+
+
+def _object_source_region(
+    source_ids: Sequence[str],
+    region_by_id: dict[str, FunctionalRegion],
+    *,
+    kind: FunctionalRegionKind,
+) -> FunctionalRegion | None:
+    mapped_regions: list[FunctionalRegion] = []
+    for block_id in source_ids:
+        region = region_by_id.get(block_id)
+        if region is None:
+            raise ComplianceExtractionError(
+                "LLM Schema 校验失败：来源 block_id 不存在。"
+            )
+        if all(id(region) != id(existing) for existing in mapped_regions):
+            mapped_regions.append(region)
+    if len(mapped_regions) != 1 or mapped_regions[0].kind != kind:
+        logger.warning(
+            "objects.source.ignore kind=%s source_ids=%s reason=region_mismatch",
+            kind,
+            ",".join(source_ids),
+        )
+        return None
+    return mapped_regions[0]
+
+
+def _compact_source_text(value: str) -> str:
+    return re.sub(r"[\s，。；、：:（）()【】“”\"'《》…,.!?！？\-—_]", "", value)
+
+
+def _source_text_supports_rule(rule: str, source_text: str) -> bool:
+    compact_rule = _compact_source_text(rule)
+    compact_source = _compact_source_text(source_text)
+    if not compact_rule or compact_rule in compact_source:
+        return bool(compact_rule)
+    clauses = re.split(r"[，。；、：:,.!?！？]+", rule)
+    return any(
+        len(clause.strip()) >= 8
+        and _compact_source_text(clause.strip()) in compact_source
+        for clause in clauses
+    )
+
+
+def _template_name_supported(name: str, text: str) -> bool:
+    name_key = _compact_source_text(_template_name(name))
+    text_key = _compact_source_text(_template_name(text))
+    return bool(name_key) and name_key == text_key
+
+
+def _object_source_ids(
+    item: dict[str, Any],
+    *,
+    kind: FunctionalRegionKind,
+    source_ids: Sequence[str],
+    region: FunctionalRegion,
+) -> list[str]:
+    """Repair model-selected IDs only within the same candidate region.
+
+    The model is allowed to name and group objects, but its block references
+    are still checked against the parsed source.  If the cited blocks do not
+    contain the object name/value, search the same functional-region window
+    for the supporting anchor.  This keeps provenance deterministic and avoids
+    accepting a shifted citation from a long flattened DOCX sequence.
+    """
+
+    if kind == "templates":
+        support_text = item["name"]
+        supports = lambda block: _template_name_supported(support_text, block.text)
+        excluded_ids = _template_index_block_ids(region)
+        exact_anchors = [
+            block.block_id
+            for block in region.blocks
+            if block.block_id not in excluded_ids and supports(block)
+        ]
+        if exact_anchors:
+            return exact_anchors
+    elif kind == "project_requirements":
+        support_text = " ".join(
+            value
+            for value in (item.get("requirement", ""), item.get("value") or "")
+            if value
+        )
+        supports = lambda block: _source_text_supports_rule(
+            support_text, block.text
+        )
+    else:
+        support_text = " ".join(
+            value
+            for value in (item.get("name", ""), item.get("material", ""))
+            if value
+        )
+        supports = lambda block: _source_text_supports_rule(
+            support_text, block.text
+        )
+
+    cited_blocks = [block for block in region.blocks if block.block_id in source_ids]
+    if kind == "templates":
+        cited_blocks = [
+            block
+            for block in cited_blocks
+            if block.block_id not in excluded_ids
+        ]
+    if any(supports(block) for block in cited_blocks):
+        return list(source_ids)
+    repaired = [block.block_id for block in region.blocks if supports(block)]
+    if repaired:
+        logger.warning(
+            "objects.source.repair kind=%s name=%s model_source_count=%d repaired_source_count=%d",
+            kind,
+            item.get("name") or item.get("requirement"),
+            len(source_ids),
+            len(repaired),
+        )
+        return repaired
+    if kind == "templates" and source_ids and all(
+        block_id in excluded_ids for block_id in source_ids
+    ):
+        logger.warning(
+            "objects.source.ignore kind=templates source_ids=%s reason=table_of_contents",
+            ",".join(source_ids),
+        )
+        return []
+    # Some valid short names (especially synthetic/test headings) do not occur
+    # verbatim in the flattened text.  Keep the model IDs in that case; the
+    # deterministic block-ID and region checks still apply.
+    return list(source_ids)
+
+
+def _template_span_blocks(
+    region: FunctionalRegion,
+    source_ids: Sequence[str],
+    next_start: int | None,
+) -> list[StructuredBlock]:
+    block_positions = {
+        block.block_id: index for index, block in enumerate(region.blocks)
+    }
+    start = min(block_positions[block_id] for block_id in source_ids)
+    end = next_start if next_start is not None and next_start > start else len(region.blocks)
+    return region.blocks[start:end]
+
+
+def _merge_object_output(
+    result: TenderExtractionResult,
+    output: dict[str, list[dict[str, Any]]],
+    regions: Sequence[FunctionalRegion],
+    *,
+    replace_template_regions: Sequence[FunctionalRegion] = (),
+) -> None:
+    region_by_id = {
+        block.block_id: region
+        for region in regions
+        for block in region.blocks
+    }
+    template_items_by_region: dict[int, list[tuple[dict[str, Any], list[str], FunctionalRegion]]] = {}
+    for item in output["templates"]:
+        if _TEMPLATE_MATERIAL_ONLY_RE.search(item["name"]):
+            logger.warning(
+                "objects.template.ignore name=%s reason=material_only",
+                item["name"],
+            )
+            continue
+        source_ids = list(dict.fromkeys(item["source_block_ids"]))
+        region = _object_source_region(
+            source_ids, region_by_id, kind="templates"
+        )
+        if region is None:
+            continue
+        source_ids = _object_source_ids(
+            item,
+            kind="templates",
+            source_ids=source_ids,
+            region=region,
+        )
+        if not source_ids:
+            continue
+        template_items_by_region.setdefault(id(region), []).append(
+            (item, source_ids, region)
+        )
+
+    # Deterministic extraction deliberately creates a coarse fallback when a
+    # flattened region has no visible heading blocks.  Once the LLM supplies
+    # valid anchors for that same region, replace that fallback so the output
+    # remains one complete object per template rather than one object for the
+    # entire chapter.
+    for region in replace_template_regions:
+        if id(region) not in template_items_by_region:
+            continue
+        region_ids = set(region.block_ids)
+        result["templates"] = [
+            template
+            for template in result["templates"]
+            if not set(template["block_ids"]).issubset(region_ids)
+        ]
+
+    for entries in template_items_by_region.values():
+        ordered_entries = sorted(
+            entries,
+            key=lambda entry: min(
+                next(
+                    index
+                    for index, block in enumerate(entry[2].blocks)
+                    if block.block_id == block_id
+                )
+                for block_id in entry[1]
+            ),
+        )
+        starts = [
+            min(
+                next(
+                    index
+                    for index, block in enumerate(region.blocks)
+                    if block.block_id == block_id
+                )
+                for block_id in source_ids
+            )
+            for _, source_ids, region in ordered_entries
+        ]
+        for entry_index, (item, source_ids, region) in enumerate(ordered_entries):
+            next_start = starts[entry_index + 1] if entry_index + 1 < len(starts) else None
+            source_blocks = _template_span_blocks(region, source_ids, next_start)
+            result["templates"].append(
+                _template_from_blocks(
+                    region=region,
+                    name=item["name"],
+                    blocks=source_blocks,
+                    index=len(result["templates"]) + 1,
+                )
+            )
+    for item in output["project_requirements"]:
+        source_ids = list(dict.fromkeys(item["source_block_ids"]))
+        region = _object_source_region(
+            source_ids, region_by_id, kind="project_requirements"
+        )
+        if region is None:
+            continue
+        if (
+            not _PROJECT_COMPILATION_RE.search(item["requirement"])
+            or _PROJECT_NON_COMPILATION_RE.search(item["requirement"])
+        ):
+            continue
+        source_ids = _object_source_ids(
+            item,
+            kind="project_requirements",
+            source_ids=source_ids,
+            region=region,
+        )
+        if any(
+            existing["requirement"].strip() == item["requirement"].strip()
+            and existing["source"]["block_ids"] == source_ids
+            for existing in result["project_requirements"]
+        ):
+            continue
+        result["project_requirements"].append(
+            {
+                "id": f"project_requirement_{len(result['project_requirements']) + 1:03d}",
+                "requirement": item["requirement"].strip(),
+                "value": item.get("value"),
+                "source": {
+                    "section": "",
+                    "block_ids": source_ids,
+                    "source_text": "",
+                },
+            }
+        )
+    for item in output["supplemental_materials"]:
+        source_ids = list(dict.fromkeys(item["source_block_ids"]))
+        region = _object_source_region(
+            source_ids, region_by_id, kind="supplemental_materials"
+        )
+        if region is None:
+            continue
+        if (
+            not _SUPPLEMENTAL_SUBMISSION_RE.search(item["material"])
+            or _SUPPLEMENTAL_EXCLUDED_RE.search(item["material"])
+        ):
+            continue
+        source_ids = _object_source_ids(
+            item,
+            kind="supplemental_materials",
+            source_ids=source_ids,
+            region=region,
+        )
+        if any(
+            existing["name"] == item["name"].strip()
+            and existing["source"]["block_ids"] == source_ids
+            for existing in result["supplemental_materials"]
+        ):
+            continue
+        result["supplemental_materials"].append(
+            {
+                "id": f"supplemental_material_{len(result['supplemental_materials']) + 1:03d}",
+                "name": item["name"].strip(),
+                "material": item["material"].strip(),
+                "source": {
+                    "section": "",
+                    "block_ids": source_ids,
+                    "source_text": "",
+                },
+            }
+        )
+
+
+def _dedupe_supplemental_materials(
+    materials: Sequence[SupplementalMaterial],
+    templates: Sequence[TenderTemplate],
+) -> list[SupplementalMaterial]:
+    result: list[SupplementalMaterial] = []
+    for material in materials:
+        template_source_ids = {
+            block_id
+            for template in templates
+            for block_id in template["source"]["block_ids"]
+        }
+        template_contains_material = bool(
+            set(material["source"]["block_ids"]).intersection(template_source_ids)
+        )
+        if template_contains_material:
+            continue
+        if any(
+            existing["name"] == material["name"]
+            and existing["material"] == material["material"]
+            for existing in result
+        ):
+            continue
+        result.append(material)
+    for index, material in enumerate(result, start=1):
+        material["id"] = f"supplemental_material_{index:03d}"
+    return result
+
+
+def _serialize_functional_regions(
+    regions: Sequence[FunctionalRegion],
+) -> list[dict[str, Any]]:
+    return [asdict(region) for region in regions]
+
+
+def extract_tender_compliance_objects(
     tender_file: FileMetadata,
     *,
     parser: DocumentParser | None = None,
@@ -1711,59 +2030,51 @@ def extract_compliance_requirements_real(
     max_batches: int = 8,
     max_batch_chars: int = 12000,
     max_retries: int = 2,
-) -> list[TenderRequirement]:
+) -> TenderExtractionResult:
     started_at = time.perf_counter()
-    logger.info(
-        "compliance.extract.start file=%s max_batches=%d max_batch_chars=%d max_retries=%d cache_enabled=%s llm=%s",
-        tender_file.filename,
-        max_batches,
-        max_batch_chars,
-        max_retries,
-        cache is not None,
-        type(llm).__name__ if llm is not None else "default",
-    )
     path = Path(tender_file.storage_path)
     active_parser = parser or MinerUDocumentParser()
-    active_llm = llm or DeterministicComplianceLLM()
+    active_llm = llm
+    cache_llm = llm or DeterministicComplianceLLM()
     active_recorder = recorder
-    blocks: list[StructuredBlock] = []
-    candidates: list[CandidateWindow] = []
-    batches: list[list[CandidateWindow]] = []
-    raw_requirements: list[Any] = []
-    filter_report: list[dict[str, Any]] = []
-    successful_call_ids: list[str] = []
+    if active_recorder is None and path.parent.exists():
+        try:
+            active_recorder = ComplianceExtractionRecorder.from_tender_path(path)
+        except OSError:
+            active_recorder = None
     stats: dict[str, Any] = {
         "filename": tender_file.filename,
         "file_size": tender_file.size,
         "cache_enabled": cache is not None,
-        "cache_kind": "requirements_result",
+        "cache_kind": "tender_compliance_objects",
         "requirement_prompt_version": REQUIREMENT_PROMPT_VERSION,
         "parser_cache_enabled": parser_cache is not None,
         "parser_cache_hit": False,
         "parser_cache_elapsed_ms": None,
         "cache_hit": False,
         "cache_elapsed_ms": None,
-        "parser": None,
+        "parser": type(active_parser).__name__,
         "parser_elapsed_ms": None,
-        "candidate_filter_elapsed_ms": None,
-        "batch_build_elapsed_ms": None,
+        "functional_region_elapsed_ms": None,
+        "template_elapsed_ms": None,
+        "project_requirement_elapsed_ms": None,
+        "supplemental_material_elapsed_ms": None,
+        "applicability_elapsed_ms": None,
         "parsed_blocks": 0,
-        "candidate_selected_blocks": 0,
-        "candidate_windows": 0,
-        "batch_count": 0,
-        "llm_model": None,
+        "functional_regions": 0,
+        "template_count": 0,
+        "project_requirement_count": 0,
+        "supplemental_material_count": 0,
+        "filtered_objects": 0,
+        "filtered_by_reason": {},
+        "llm_model": getattr(active_llm, "model", None),
         "llm_total_calls": 0,
         "llm_completed_calls": 0,
         "llm_failed_calls": 0,
         "llm_retries": 0,
-        "raw_requirements": 0,
-        "filtered_requirements": 0,
-        "filtered_by_reason": {},
+        "llm_elapsed_ms": 0,
         "schema_valid_calls": 0,
-        "normalization_elapsed_ms": None,
-        "final_requirements": 0,
     }
-    current_stage = "initialization"
     run_status = "failed"
     failed_stage: str | None = None
     failure: Exception | None = None
@@ -1792,636 +2103,265 @@ def extract_compliance_requirements_real(
                 type(recorder_error).__name__,
             )
 
+    def persist_result(result: TenderExtractionResult, *, source: str = "extraction") -> None:
+        persist_artifact("03_templates.json", {"source": source, "templates": result["templates"]})
+        persist_artifact(
+            "04_project_requirements.json",
+            {"source": source, "project_requirements": result["project_requirements"]},
+        )
+        persist_artifact(
+            "05_supplemental_materials.json",
+            {"source": source, "supplemental_materials": result["supplemental_materials"]},
+        )
+        persist_artifact("07_result.json", result)
+
     try:
-        if max_retries < 0:
-            raise ValueError("max_retries 不能为负数。")
         if not path.is_file():
             raise FileNotFoundError(path)
-        if active_recorder is None:
-            try:
-                active_recorder = ComplianceExtractionRecorder.from_tender_path(path)
-            except OSError as recorder_error:
-                logger.warning(
-                    "artifact.init.error file=%s error_type=%s",
-                    tender_file.filename,
-                    type(recorder_error).__name__,
-                )
+        if max_retries < 0:
+            raise ValueError("max_retries 不能为负数。")
         if active_recorder is not None:
             stats["artifact_directory"] = str(active_recorder.artifact_dir)
             stats["task_id"] = active_recorder.task_dir.name
         record_event(
             "compliance.extract.start",
             file=tender_file.filename,
-            max_batches=max_batches,
-            max_batch_chars=max_batch_chars,
-            max_retries=max_retries,
             cache_enabled=cache is not None,
-        )
-
-        cache_key: str | None = None
-        current_stage = "cache_check"
-        cache_started_at = time.perf_counter()
-        record_event(
-            "cache.check.start",
-            kind="requirements_result",
-            enabled=cache is not None,
-        )
-        logger.info(
-            "cache.check.start file=%s enabled=%s",
-            tender_file.filename,
-            cache is not None,
-        )
-        if cache is not None:
-            cache_key = _requirement_cache_key(
-                path,
-                active_parser,
-                active_llm,
-                max_batches=max_batches,
-                max_batch_chars=max_batch_chars,
-            )
-            try:
-                cached = cache.get(cache_key)
-            except Exception as exc:
-                stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
-                logger.error(
-                    "cache.check.error file=%s error_type=%s",
-                    tender_file.filename,
-                    type(exc).__name__,
-                )
-                raise
-            if cached is not None:
-                stats["cache_hit"] = True
-                stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
-                logger.info(
-                    "cache.check.end file=%s status=hit requirements=%d",
-                    tender_file.filename,
-                    len(cached),
-                )
-                logger.info(
-                    "compliance.extract.end file=%s status=cache_hit requirements=%d elapsed_ms=%d",
-                    tender_file.filename,
-                    len(cached),
-                    _elapsed_ms(started_at),
-                )
-                record_event(
-                    "cache.check.end",
-                    kind="requirements_result",
-                    status="hit",
-                    requirements=len(cached),
-                    elapsed_ms=stats["cache_elapsed_ms"],
-                )
-                persist_artifact(
-                    "04_raw_requirements.json",
-                    {"source": "requirements_cache", "requirements": cached},
-                )
-                persist_artifact(
-                    "05_normalized_requirements.json",
-                    {
-                        "source": "requirements_cache",
-                        "requirements": cached,
-                        "filtered_requirements": [],
-                        "filter_count": 0,
-                        "filter_by_reason": {},
-                    },
-                )
-                persist_artifact("06_filter_report.json", [])
-                stats["final_requirements"] = len(cached)
-                run_status = "complete"
-                record_event(
-                    "compliance.extract.end",
-                    status="complete",
-                    source="requirements_cache",
-                    requirements=len(cached),
-                    elapsed_ms=_elapsed_ms(started_at),
-                )
-                return cached
-            stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
-            logger.info(
-                "cache.check.end file=%s status=miss key=%s",
-                tender_file.filename,
-                cache_key[:12],
-            )
-            record_event(
-                "cache.check.end",
-                kind="requirements_result",
-                status="miss",
-                key=cache_key[:12],
-                elapsed_ms=stats["cache_elapsed_ms"],
-            )
-        else:
-            stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
-            logger.info(
-                "cache.check.end file=%s status=disabled",
-                tender_file.filename,
-            )
-            record_event(
-                "cache.check.end",
-                kind="requirements_result",
-                status="disabled",
-                elapsed_ms=stats["cache_elapsed_ms"],
-            )
-
-        parser_name = type(active_parser).__name__
-        parser_mode = (
-            "mineru"
-            if isinstance(active_parser, MinerUDocumentParser) and active_parser.command
-            else "docx"
-            if isinstance(active_parser, MinerUDocumentParser)
-            else parser_name
-        )
-        stats["parser"] = parser_mode
-        current_stage = "document_parse"
-        parse_started_at = time.perf_counter()
-        parser_cache_key: str | None = None
-        parser_cache_started_at = time.perf_counter()
-        record_event(
-            "document.parse.start",
-            parser=parser_mode,
-            file=tender_file.filename,
-            cache_enabled=parser_cache is not None,
-        )
-        logger.info(
-            "document.parse.start parser=%s file=%s",
-            parser_name,
-            tender_file.filename,
-        )
-        parse_fn = (
-            active_parser.parse if hasattr(active_parser, "parse") else active_parser
-        )
-        blocks: list[StructuredBlock] | None = None
-        if parser_cache is not None:
-            parser_cache_key = _parsed_document_cache_key(path, active_parser)
-            try:
-                cached_blocks = parser_cache.get(parser_cache_key)
-                blocks = _deserialize_blocks(cached_blocks)
-            except Exception as exc:
-                logger.warning(
-                    "document.parse.cache.error parser=%s file=%s error_type=%s",
-                    parser_name,
-                    tender_file.filename,
-                    type(exc).__name__,
-                )
-            if blocks is not None:
-                stats["parser_cache_hit"] = True
-                stats["parser_cache_elapsed_ms"] = _elapsed_ms(parser_cache_started_at)
-                record_event(
-                    "document.parse.cache",
-                    parser=parser_mode,
-                    status="hit",
-                    blocks=len(blocks),
-                    elapsed_ms=stats["parser_cache_elapsed_ms"],
-                )
-        if blocks is None:
-            try:
-                blocks = parse_fn(path)  # type: ignore[operator]
-            except Exception as exc:
-                stats["parser_elapsed_ms"] = _elapsed_ms(parse_started_at)
-                logger.error(
-                    "document.parse.error parser=%s file=%s error_type=%s",
-                    parser_name,
-                    tender_file.filename,
-                    type(exc).__name__,
-                )
-                raise
-            if parser_cache is not None and parser_cache_key is not None:
-                try:
-                    parser_cache.set(parser_cache_key, _serialize_blocks(blocks))
-                except Exception as exc:
-                    logger.warning(
-                        "document.parse.cache.write.error parser=%s file=%s error_type=%s",
-                        parser_name,
-                        tender_file.filename,
-                        type(exc).__name__,
-                    )
-        stats["parser_cache_elapsed_ms"] = _elapsed_ms(parser_cache_started_at)
-        stats["parser_elapsed_ms"] = _elapsed_ms(parse_started_at)
-        stats["parsed_blocks"] = len(blocks)
-        persist_artifact(
-            "01_parsed_blocks.json",
-            {
-                "filename": tender_file.filename,
-                "parser": parser_mode,
-                "mineru_configured": parser_mode == "mineru",
-                "blocks": _serialize_blocks(blocks),
-            },
-        )
-        record_event(
-            "document.parse.end",
-            parser=parser_mode,
-            blocks=len(blocks),
-            elapsed_ms=stats["parser_elapsed_ms"],
-        )
-        logger.info(
-            "document.parse.end parser=%s file=%s blocks=%d",
-            parser_name,
-            tender_file.filename,
-            len(blocks),
-        )
-
-        candidate_started_at = time.perf_counter()
-        record_event("candidate.filter.start")
-        try:
-            candidates = select_compliance_candidates(blocks)
-        except Exception as exc:
-            stats["candidate_filter_elapsed_ms"] = _elapsed_ms(candidate_started_at)
-            logger.error(
-                "candidate.filter.error file=%s error_type=%s",
-                tender_file.filename,
-                type(exc).__name__,
-            )
-            raise
-        stats["candidate_filter_elapsed_ms"] = _elapsed_ms(candidate_started_at)
-        stats["candidate_selected_blocks"] = sum(
-            len(candidate.block_ids) for candidate in candidates
-        )
-        stats["candidate_windows"] = len(candidates)
-        persist_artifact(
-            "02_candidates.json",
-            {
-                "selected_block_count": stats["candidate_selected_blocks"],
-                "window_count": len(candidates),
-                "candidates": _serialize_candidates(candidates),
-            },
-        )
-        record_event(
-            "candidate.filter.end",
-            selected_blocks=stats["candidate_selected_blocks"],
-            windows=len(candidates),
-            elapsed_ms=stats["candidate_filter_elapsed_ms"],
-        )
-        batch_build_started_at = time.perf_counter()
-        record_event(
-            "batch.build.start",
-            candidates=len(candidates),
             max_batches=max_batches,
             max_batch_chars=max_batch_chars,
         )
-        try:
+
+        cache_key = _requirement_cache_key(
+            path,
+            active_parser,
+            cache_llm,
+            max_batches=max_batches,
+            max_batch_chars=max_batch_chars,
+        )
+        cache_started_at = time.perf_counter()
+        cached = cache.get(cache_key) if cache is not None else None
+        stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
+        if _valid_object_result(cached):
+            result: TenderExtractionResult = cached
+            stats["cache_hit"] = True
+            stats["template_count"] = len(result["templates"])
+            stats["project_requirement_count"] = len(result["project_requirements"])
+            stats["supplemental_material_count"] = len(result["supplemental_materials"])
+            persist_artifact("02_functional_regions.json", {"source": "result_cache", "regions": []})
+            persist_result(result, source="result_cache")
+            run_status = "complete"
+            record_event(
+                "cache.check.end",
+                status="hit",
+                kind="tender_compliance_objects",
+                templates=stats["template_count"],
+                project_requirements=stats["project_requirement_count"],
+                supplemental_materials=stats["supplemental_material_count"],
+            )
+            record_event(
+                "compliance.extract.end",
+                status="complete",
+                source="result_cache",
+                templates=stats["template_count"],
+                project_requirements=stats["project_requirement_count"],
+                supplemental_materials=stats["supplemental_material_count"],
+            )
+            return result
+
+        blocks: list[StructuredBlock]
+        parser_cache_started_at = time.perf_counter()
+        parsed_cache_value = (
+            parser_cache.get(_parsed_document_cache_key(path, active_parser))
+            if parser_cache is not None
+            else None
+        )
+        parsed_cache_blocks = _deserialize_blocks(parsed_cache_value)
+        stats["parser_cache_elapsed_ms"] = _elapsed_ms(parser_cache_started_at)
+        if parsed_cache_blocks is not None:
+            blocks = parsed_cache_blocks
+            stats["parser_cache_hit"] = True
+            record_event("document.parse.cache_hit", blocks=len(blocks))
+        else:
+            parser_started_at = time.perf_counter()
+            blocks = active_parser.parse(path)
+            stats["parser_elapsed_ms"] = _elapsed_ms(parser_started_at)
+            if parser_cache is not None:
+                parser_cache.set(
+                    _parsed_document_cache_key(path, active_parser),
+                    _serialize_blocks(blocks),
+                )
+            record_event(
+                "document.parse.end",
+                parser=type(active_parser).__name__,
+                blocks=len(blocks),
+                elapsed_ms=stats["parser_elapsed_ms"],
+            )
+        stats["parsed_blocks"] = len(blocks)
+        persist_artifact("01_parsed_blocks.json", {"blocks": _serialize_blocks(blocks)})
+
+        region_started_at = time.perf_counter()
+        regions = identify_functional_regions(blocks)
+        stats["functional_region_elapsed_ms"] = _elapsed_ms(region_started_at)
+        stats["functional_regions"] = len(regions)
+        persist_artifact(
+            "02_functional_regions.json",
+            {"regions": _serialize_functional_regions(regions)},
+        )
+        record_event(
+            "functional.region.end",
+            regions=len(regions),
+            elapsed_ms=stats["functional_region_elapsed_ms"],
+        )
+
+        template_started_at = time.perf_counter()
+        templates = extract_templates_from_regions(regions)
+        stats["template_elapsed_ms"] = _elapsed_ms(template_started_at)
+        project_started_at = time.perf_counter()
+        project_requirements = extract_project_requirements_from_regions(regions)
+        stats["project_requirement_elapsed_ms"] = _elapsed_ms(project_started_at)
+        supplemental_started_at = time.perf_counter()
+        supplemental_materials = extract_supplemental_materials_from_regions(regions)
+        stats["supplemental_material_elapsed_ms"] = _elapsed_ms(supplemental_started_at)
+        result = {
+            "templates": templates,
+            "project_requirements": project_requirements,
+            "supplemental_materials": supplemental_materials,
+        }
+
+        ambiguous = _ambiguous_regions(regions)
+        if active_llm is not None and not isinstance(active_llm, DeterministicComplianceLLM) and ambiguous:
+            candidates = [
+                CandidateWindow(
+                    block_ids=region.block_ids,
+                    section=region.section,
+                    text=region.text,
+                    order=region.order,
+                    kind=region.kind,
+                )
+                for region in ambiguous
+            ]
             batches = build_candidate_batches(
                 candidates,
                 max_batches=max_batches,
                 max_batch_chars=max_batch_chars,
             )
-        except Exception as exc:
-            stats["batch_build_elapsed_ms"] = _elapsed_ms(batch_build_started_at)
-            logger.error(
-                "batch.build.error file=%s error_type=%s",
-                tender_file.filename,
-                type(exc).__name__,
-            )
-            raise
-        stats["batch_build_elapsed_ms"] = _elapsed_ms(batch_build_started_at)
-        stats["batch_count"] = len(batches)
-        persist_artifact(
-            "03_batches.json",
-            {
-                "batch_count": len(batches),
-                "max_batches": max_batches,
-                "max_batch_chars": max_batch_chars,
-                "batches": [
-                    {
-                        "index": index,
-                        "candidate_count": len(batch),
-                        "candidate_chars": sum(
-                            len(candidate.text) for candidate in batch
-                        ),
-                        "candidates": _serialize_candidates(batch),
-                    }
-                    for index, batch in enumerate(batches, start=1)
-                ],
-            },
-        )
-        record_event(
-            "batch.build.end",
-            batches=len(batches),
-            candidate_count=len(candidates),
-            elapsed_ms=stats["batch_build_elapsed_ms"],
-        )
-        if not batches:
-            empty_result: list[dict[str, Any]] = []
-            persist_artifact("04_raw_requirements.json", {"requirements": []})
-            persist_artifact(
-                "05_normalized_requirements.json",
-                {
-                    "requirements": empty_result,
-                    "filtered_requirements": [],
-                    "filter_count": 0,
-                    "filter_by_reason": {},
-                },
-            )
-            current_stage = "cache_write"
-            if cache is not None and cache_key is not None:
-                try:
-                    cache.set(cache_key, empty_result)
-                except Exception as exc:
-                    logger.error(
-                        "cache.write.error file=%s error_type=%s",
-                        tender_file.filename,
-                        type(exc).__name__,
-                    )
-                    raise
-            stats["raw_requirements"] = 0
-            stats["filtered_requirements"] = 0
-            stats["final_requirements"] = 0
-            run_status = "complete"
-            record_event(
-                "compliance.extract.end",
-                status="complete",
-                candidates=len(candidates),
-                batches=0,
-                requirements=0,
-                elapsed_ms=_elapsed_ms(started_at),
-            )
-            logger.info(
-                "compliance.extract.end file=%s status=empty candidates=%d requirements=0 elapsed_ms=%d",
-                tender_file.filename,
-                len(candidates),
-                _elapsed_ms(started_at),
-            )
-            return empty_result
-
-        llm_name = type(active_llm).__name__
-        llm_model = getattr(active_llm, "model", llm_name)
-        stats["llm_model"] = llm_model
-        llm_fn = active_llm.extract if hasattr(active_llm, "extract") else active_llm
-        retries_remaining = min(max_retries, max(0, 10 - len(batches)))
-        current_stage = "llm"
-        for batch_index, batch in enumerate(batches, start=1):
-            batch_started_at = time.perf_counter()
-            logger.info(
-                "compliance.batch.start index=%d total=%d llm=%s candidates=%d chars=%d retries_remaining=%d",
-                batch_index,
-                len(batches),
-                llm_name,
-                len(batch),
-                sum(len(candidate.text) for candidate in batch),
-                retries_remaining,
-            )
-            record_event(
-                "compliance.batch.start",
-                index=batch_index,
-                total=len(batches),
-                model=llm_model,
-                candidates=len(batch),
-                chars=sum(len(candidate.text) for candidate in batch),
-                retries_remaining=retries_remaining,
-            )
-            attempts = 0
-            while True:
-                attempts += 1
-                stats["llm_total_calls"] += 1
-                if attempts > 1:
-                    stats["llm_retries"] += 1
-                call_started_at = time.perf_counter()
-                call_id: str | None = None
-                if active_recorder is not None:
-                    try:
-                        call_id = active_recorder.start_llm_call(
+            for batch_index, batch in enumerate(batches, start=1):
+                succeeded = False
+                for attempt in range(1, max_retries + 2):
+                    call_id = (
+                        active_recorder.start_llm_call(
                             batch_index=batch_index,
                             batch_count=len(batches),
-                            attempt=attempts,
-                            model=str(llm_model),
+                            attempt=attempt,
+                            model=getattr(active_llm, "model", type(active_llm).__name__),
                             batch=_serialize_candidates(batch),
                         )
-                    except Exception as recorder_error:
-                        logger.error(
-                            "artifact.llm.start.error batch=%d error_type=%s",
-                            batch_index,
-                            type(recorder_error).__name__,
-                        )
-                if isinstance(active_llm, OpenAICompatibleLLM):
-                    active_llm.set_call_context(
-                        recorder=active_recorder,
-                        call_id=call_id,
+                        if active_recorder is not None
+                        else None
                     )
-                try:
-                    batch_output = llm_fn(batch)  # type: ignore[operator]
-                    break
-                except ComplianceExtractionError as exc:
-                    stats["llm_failed_calls"] += 1
-                    if call_id is not None and active_recorder is not None:
-                        active_recorder.fail_llm_call(
-                            call_id,
-                            error_type=type(exc).__name__,
-                            error_message=str(exc),
-                            elapsed_ms=_elapsed_ms(call_started_at),
+                    stats["llm_total_calls"] += 1
+                    if isinstance(active_llm, OpenAICompatibleLLM):
+                        active_llm.set_call_context(
+                            recorder=active_recorder,
+                            call_id=call_id,
                         )
-                    if retries_remaining and _is_transient_extraction_error(exc):
-                        retries_remaining -= 1
-                        logger.warning(
-                            "compliance.batch.retry index=%d total=%d attempt=%d retries_remaining=%d error_type=%s",
-                            batch_index,
-                            len(batches),
-                            attempts,
-                            retries_remaining,
-                            type(exc).__name__,
+                    call_started_at = time.perf_counter()
+                    try:
+                        raw_output = active_llm.extract(batch)
+                        output = _coerce_object_output(raw_output)
+                        elapsed_ms = _elapsed_ms(call_started_at)
+                        stats["llm_elapsed_ms"] += elapsed_ms
+                        stats["llm_completed_calls"] += 1
+                        stats["schema_valid_calls"] += 1
+                        if active_recorder is not None and call_id is not None:
+                            active_recorder.complete_llm_call(
+                                call_id,
+                                parsed_objects=output,
+                                schema_valid=True,
+                                elapsed_ms=elapsed_ms,
+                            )
+                        _merge_object_output(
+                            result,
+                            output,
+                            regions,
+                            replace_template_regions=[
+                                candidate_region
+                                for candidate_region in ambiguous
+                                if candidate_region.kind == "templates"
+                                and any(
+                                    candidate.block_ids == candidate_region.block_ids
+                                    for candidate in batch
+                                )
+                            ],
                         )
-                        record_event(
-                            "compliance.batch.retry",
-                            index=batch_index,
-                            total=len(batches),
-                            attempt=attempts,
-                            retries_remaining=retries_remaining,
-                            error_type=type(exc).__name__,
+                        succeeded = True
+                        break
+                    except Exception as exc:
+                        elapsed_ms = _elapsed_ms(call_started_at)
+                        stats["llm_elapsed_ms"] += elapsed_ms
+                        stats["llm_failed_calls"] += 1
+                        if active_recorder is not None and call_id is not None:
+                            active_recorder.fail_llm_call(
+                                call_id,
+                                error_type=type(exc).__name__,
+                                error_message=str(exc),
+                                elapsed_ms=elapsed_ms,
+                            )
+                        error = (
+                            exc
+                            if isinstance(exc, ComplianceExtractionError)
+                            else ComplianceExtractionError(str(exc))
                         )
-                        continue
-                    logger.error(
-                        "compliance.batch.error index=%d total=%d attempt=%d error_type=%s elapsed_ms=%d",
-                        batch_index,
-                        len(batches),
-                        attempts,
-                        type(exc).__name__,
-                        _elapsed_ms(batch_started_at),
-                    )
-                    raise
-                except Exception as exc:
-                    stats["llm_failed_calls"] += 1
-                    if call_id is not None and active_recorder is not None:
-                        active_recorder.fail_llm_call(
-                            call_id,
-                            error_type=type(exc).__name__,
-                            error_message=str(exc),
-                            elapsed_ms=_elapsed_ms(call_started_at),
-                        )
-                    raise
-            if isinstance(batch_output, dict):
-                batch_output = batch_output.get("requirements")
-            if not isinstance(batch_output, list):
-                if call_id is not None and active_recorder is not None:
-                    active_recorder.complete_llm_call(
-                        call_id,
-                        parsed_requirements=batch_output,
-                        elapsed_ms=_elapsed_ms(call_started_at),
-                    )
-                    active_recorder.mark_llm_schema(
-                        call_id,
-                        valid=False,
-                        error_message="批次结果不是列表",
-                    )
-                stats["llm_failed_calls"] += 1
-                raise ComplianceExtractionError(
-                    "LLM Schema 校验失败：批次结果不是列表。"
-                )
-            if call_id is not None and active_recorder is not None:
-                active_recorder.complete_llm_call(
-                    call_id,
-                    parsed_requirements=batch_output,
-                    elapsed_ms=_elapsed_ms(call_started_at),
-                )
-                successful_call_ids.append(call_id)
-            stats["llm_completed_calls"] += 1
-            raw_requirements.extend(batch_output)
-            stats["raw_requirements"] = len(raw_requirements)
-            persist_artifact(
-                "04_raw_requirements.json",
-                {
-                    "through_batch": batch_index,
-                    "requirements": raw_requirements,
-                },
-            )
-            record_event(
-                "compliance.batch.end",
-                index=batch_index,
-                total=len(batches),
-                attempts=attempts,
-                requirements=len(batch_output),
-                elapsed_ms=_elapsed_ms(batch_started_at),
-            )
-            logger.info(
-                "compliance.batch.end index=%d total=%d attempts=%d requirements=%d elapsed_ms=%d",
-                batch_index,
-                len(batches),
-                attempts,
-                len(batch_output),
-                _elapsed_ms(batch_started_at),
-            )
+                        if attempt <= max_retries and _is_transient_extraction_error(error):
+                            stats["llm_retries"] += 1
+                            continue
+                        raise error
+                if not succeeded:
+                    raise ComplianceExtractionError("LLM 对象提取未完成。")
 
-        persist_artifact(
-            "04_raw_requirements.json",
-            {"through_batch": len(batches), "requirements": raw_requirements},
+        applicability_started_at = time.perf_counter()
+        filtered_templates, applicability_report = apply_project_applicability(
+            result["templates"], result["project_requirements"]
         )
-        current_stage = "requirements_normalize"
-        record_event(
-            "requirements.normalize.start",
-            raw_requirements=len(raw_requirements),
-            source_blocks=len(blocks),
+        result["templates"] = filtered_templates
+        result["supplemental_materials"] = _dedupe_supplemental_materials(
+            result["supplemental_materials"], result["templates"]
         )
-        normalization_started_at = time.perf_counter()
-        try:
-            normalized = _normalize_requirements(
-                raw_requirements,
-                blocks,
-                filter_report=filter_report,
-                candidate_windows=candidates,
-            )
-        except Exception as exc:
-            stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
-            stats["filtered_requirements"] = len(filter_report)
-            stats["filtered_by_reason"] = _filter_reason_counts(filter_report)
-            persist_artifact("06_filter_report.json", filter_report)
-            persist_artifact(
-                "05_normalized_requirements.json",
-                {
-                    "status": "failed",
-                    "requirements": [],
-                    "filtered_requirements": filter_report,
-                    "filter_count": len(filter_report),
-                    "filter_by_reason": _filter_reason_counts(filter_report),
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                },
-            )
-            for call_id in successful_call_ids:
-                if active_recorder is not None:
-                    active_recorder.mark_llm_schema(
-                        call_id,
-                        valid=False,
-                        error_message=str(exc),
-                    )
-            logger.error(
-                "requirements.normalize.error file=%s error_type=%s",
-                tender_file.filename,
-                type(exc).__name__,
-            )
-            raise
-        stats["normalization_elapsed_ms"] = _elapsed_ms(normalization_started_at)
-        stats["filtered_requirements"] = len(filter_report)
-        stats["filtered_by_reason"] = _filter_reason_counts(filter_report)
-        stats["schema_valid_calls"] = len(successful_call_ids)
-        for call_id in successful_call_ids:
-            if active_recorder is not None:
-                active_recorder.mark_llm_schema(call_id, valid=True)
-        stats["final_requirements"] = len(normalized)
-        persist_artifact(
-            "05_normalized_requirements.json",
-            {
-                "requirements": normalized,
-                "filtered_requirements": filter_report,
-                "filter_count": len(filter_report),
-                "filter_by_reason": _filter_reason_counts(filter_report),
-            },
-        )
-        persist_artifact("06_filter_report.json", filter_report)
-        record_event(
-            "requirements.normalize.end",
-            requirements=len(normalized),
-            filtered_requirements=len(filter_report),
-            filtered_by_reason=_filter_reason_counts(filter_report),
-            elapsed_ms=stats["normalization_elapsed_ms"],
-        )
-        current_stage = "cache_write"
-        if cache is not None and cache_key is not None:
-            try:
-                cache.set(cache_key, normalized)
-            except Exception as exc:
-                logger.error(
-                    "cache.write.error file=%s error_type=%s",
-                    tender_file.filename,
-                    type(exc).__name__,
-                )
-                raise
-        run_status = "complete"
+        stats["applicability_elapsed_ms"] = _elapsed_ms(applicability_started_at)
+        normalized = normalize_tender_extraction_sources(result, blocks)
+        stats["filtered_objects"] = len(applicability_report)
+        stats["filtered_by_reason"] = _filter_reason_counts(applicability_report)
+        stats["template_count"] = len(normalized["templates"])
+        stats["project_requirement_count"] = len(normalized["project_requirements"])
+        stats["supplemental_material_count"] = len(normalized["supplemental_materials"])
+        persist_result(normalized)
+        persist_artifact("06_filter_report.json", applicability_report)
+        if cache is not None:
+            cache.set(cache_key, normalized)
         record_event(
             "compliance.extract.end",
             status="complete",
-            candidates=len(candidates),
-            batches=len(batches),
-            raw_requirements=len(raw_requirements),
-            requirements=len(normalized),
+            templates=stats["template_count"],
+            project_requirements=stats["project_requirement_count"],
+            supplemental_materials=stats["supplemental_material_count"],
+            filtered_objects=stats["filtered_objects"],
             elapsed_ms=_elapsed_ms(started_at),
         )
-        logger.info(
-            "compliance.extract.end file=%s status=complete candidates=%d batches=%d requirements=%d elapsed_ms=%d",
-            tender_file.filename,
-            len(candidates),
-            len(batches),
-            len(normalized),
-            _elapsed_ms(started_at),
-        )
+        run_status = "complete"
         return normalized
     except Exception as exc:
         failure = exc
-        failed_stage = current_stage
-        run_status = "failed"
+        failed_stage = failed_stage or "extraction"
         record_event(
             "compliance.extract.error",
-            stage=current_stage,
+            stage=failed_stage,
             error_type=type(exc).__name__,
             error_message=str(exc),
             elapsed_ms=_elapsed_ms(started_at),
         )
-        logger.error(
-            "compliance.extract.error file=%s error_type=%s elapsed_ms=%d",
-            tender_file.filename,
-            type(exc).__name__,
-            _elapsed_ms(started_at),
-        )
         raise
     finally:
         stats["total_elapsed_ms"] = _elapsed_ms(started_at)
-        stats["raw_requirements"] = len(raw_requirements)
-        if run_status != "complete" and stats["final_requirements"] == 0:
-            stats["final_requirements"] = 0
         if active_recorder is not None:
             try:
                 active_recorder.finalize(
@@ -2437,6 +2377,3 @@ def extract_compliance_requirements_real(
                     "artifact.finalize.error error_type=%s",
                     type(recorder_error).__name__,
                 )
-
-
-extract_compliance_requirements = extract_compliance_requirements_real

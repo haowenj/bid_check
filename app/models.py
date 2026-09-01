@@ -8,21 +8,10 @@ TaskStatus = Literal["pending", "running", "complete", "failed"]
 StageName = Literal["requirements", "bid_parse", "review"]
 
 
-class TenderRequirementSource(TypedDict):
+class TenderSource(TypedDict):
     section: str
     block_ids: list[str]
     source_text: str
-
-
-class TenderRequirement(TypedDict):
-    id: str
-    name: str
-    rule: str
-    condition: str | None
-    source: TenderRequirementSource
-
-
-TenderSource = TenderRequirementSource
 
 
 class TenderTemplateTable(TypedDict):

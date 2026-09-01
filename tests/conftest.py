@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from app.api import build_default_workflow, create_app
 from app.config import Settings
 from app.mock_services import (
-    extract_compliance_requirements,
+    extract_tender_objects,
     parse_bid_document,
     run_compliance_review,
 )
@@ -92,7 +92,7 @@ def stored_task(settings, repository):
 
 @pytest.fixture
 def mock_complete_result(stored_task):
-    requirements = extract_compliance_requirements(
+    extraction_result = extract_tender_objects(
         stored_task.tender_file,
         delay_seconds=0,
     )
@@ -101,7 +101,7 @@ def mock_complete_result(stored_task):
         delay_seconds=0,
     )
     return {
-        "requirements": requirements,
+        **extraction_result,
         "bid_parse": bid_parse,
-        "review_result": run_compliance_review(requirements, bid_parse),
+        "review_result": run_compliance_review(extraction_result, bid_parse),
     }

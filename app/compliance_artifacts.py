@@ -170,7 +170,7 @@ class ComplianceExtractionRecorder:
         call_id: str,
         *,
         raw_response: Any = None,
-        parsed_requirements: Any = None,
+        parsed_objects: Any = None,
         finish_reason: str | None = None,
         usage: Any = None,
         schema_valid: bool | None = None,
@@ -179,7 +179,7 @@ class ComplianceExtractionRecorder:
         with self._lock:
             state = self._calls[call_id]
             if raw_response is None:
-                raw_response = state.get("raw_response", parsed_requirements)
+                raw_response = state.get("raw_response", parsed_objects)
             if finish_reason is None:
                 finish_reason = state.get("finish_reason")
             if usage is None:
@@ -194,7 +194,7 @@ class ComplianceExtractionRecorder:
                 "usage": usage,
                 "schema_valid": schema_valid,
                 "raw_response": raw_response,
-                "parsed_requirements": parsed_requirements,
+                "parsed_objects": parsed_objects,
             }
             self.write_json(state["output_path"], output_payload)
         self.event(
@@ -208,9 +208,15 @@ class ComplianceExtractionRecorder:
             finish_reason=finish_reason,
             usage=usage,
             schema_valid=schema_valid,
-            requirements=len(parsed_requirements)
-            if isinstance(parsed_requirements, list)
-            else None,
+            object_counts=(
+                {
+                    key: len(value)
+                    for key, value in parsed_objects.items()
+                    if isinstance(value, list)
+                }
+                if isinstance(parsed_objects, dict)
+                else None
+            ),
         )
 
     def fail_llm_call(
@@ -236,7 +242,7 @@ class ComplianceExtractionRecorder:
                 "usage": None,
                 "schema_valid": False,
                 "raw_response": raw_response,
-                "parsed_requirements": None,
+                "parsed_objects": None,
                 "error_type": error_type,
                 "error_message": error_message,
             }

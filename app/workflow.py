@@ -29,10 +29,10 @@ def _result_summary(value: Any) -> str:
 
 @dataclass(frozen=True)
 class BidCheckServices:
-    extract: Callable[[FileMetadata], list[dict[str, Any]]]
+    extract: Callable[[FileMetadata], dict[str, Any]]
     parse: Callable[[FileMetadata], dict[str, Any]]
     review: Callable[
-        [list[dict[str, Any]], dict[str, Any]],
+        [dict[str, Any], dict[str, Any]],
         dict[str, str],
     ]
 
@@ -244,7 +244,7 @@ class BidCheckWorkflow:
             self.repository.complete(
                 task_id,
                 {
-                    "requirements": outputs["requirements"],
+                    **outputs["requirements"],
                     "bid_parse": outputs["bid_parse"],
                     "review_result": review_result,
                 },
