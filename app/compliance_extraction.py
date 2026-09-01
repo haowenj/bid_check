@@ -740,6 +740,72 @@ def extract_project_requirements_from_regions(
     return requirements
 
 
+_SUPPLEMENTAL_SUBMISSION_RE = re.compile(
+    r"提供|提交|附|随投标文件|作为资格证明|上传"
+)
+_SUPPLEMENTAL_EXCLUDED_RE = re.compile(
+    r"商业信誉|项目经验|服务能力|7\s*[×xX*]\s*24|履约|合同签订后|"
+    r"终验|人员(?:请假|调班|更换|替换|报备)|知识产权归属|违约责任|售后服务"
+)
+
+
+def _supplemental_material_names(text: str) -> list[str]:
+    names: list[str] = []
+    if "营业执照" in text or "事业单位法人证书" in text:
+        names.append("营业执照")
+    if re.search(r"授权书|授权文件|分支机构授权", text):
+        names.append("授权书")
+    if re.search(r"业绩证明|同类业绩|业绩材料", text):
+        names.append("业绩证明")
+    if "合同关键页" in text:
+        names.append("合同关键页")
+    if "制造商登记证明" in text:
+        names.append("制造商登记证明")
+    if "资格证书" in text:
+        names.append("资格证书")
+    if "检测报告" in text:
+        names.append("检测报告")
+    return names
+
+
+def extract_supplemental_materials_from_regions(
+    regions: Sequence[FunctionalRegion],
+) -> list[SupplementalMaterial]:
+    """Extract explicit bid-submission evidence outside complete templates."""
+
+    materials: list[SupplementalMaterial] = []
+    seen: set[tuple[str, str]] = set()
+    for region in regions:
+        if region.kind != "supplemental_materials":
+            continue
+        for block in region.blocks[1:]:
+            text = re.sub(r"\s+", " ", block.text).strip()
+            if (
+                not text
+                or not _SUPPLEMENTAL_SUBMISSION_RE.search(text)
+                or _SUPPLEMENTAL_EXCLUDED_RE.search(text)
+            ):
+                continue
+            for name in _supplemental_material_names(text):
+                key = (name, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                materials.append(
+                    {
+                        "id": f"supplemental_material_{len(materials) + 1:03d}",
+                        "name": name,
+                        "material": text,
+                        "source": {
+                            "section": region.section,
+                            "block_ids": [block.block_id],
+                            "source_text": block.text,
+                        },
+                    }
+                )
+    return materials
+
+
 _EXCLUDED_RE = re.compile(
     r"评分|得分|分值|评标|评审因素|商务评分|技术评分|价格评分|报价评分|综合评分"
 )

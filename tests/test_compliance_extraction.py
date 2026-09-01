@@ -19,6 +19,7 @@ from app.compliance_extraction import (
     build_candidate_batches,
     extract_compliance_requirements_real,
     extract_project_requirements_from_regions,
+    extract_supplemental_materials_from_regions,
     extract_templates_from_regions,
     identify_functional_regions,
     parse_docx_document,
@@ -343,6 +344,98 @@ def test_project_requirement_extraction_does_not_turn_qualifications_into_rules(
     assert all("商业信誉" not in item["requirement"] for item in requirements)
     assert all("软件项目经验" not in item["requirement"] for item in requirements)
     assert any("分别编制" in item["requirement"] for item in requirements)
+
+
+def test_supplemental_material_extraction_keeps_explicit_submission_evidence():
+    blocks = [
+        StructuredBlock(
+            "b0400",
+            "heading",
+            "投标人资格要求",
+            "投标人资格要求",
+            400,
+        ),
+        StructuredBlock(
+            "b0401",
+            "paragraph",
+            "须随投标文件提供营业执照或事业单位法人证书复印件。",
+            "投标人资格要求",
+            401,
+        ),
+        StructuredBlock(
+            "b0402",
+            "paragraph",
+            "分支机构投标的，应附总公司出具的授权书。",
+            "投标人资格要求",
+            402,
+        ),
+        StructuredBlock(
+            "b0403",
+            "paragraph",
+            "应提供近三年同类业绩证明及合同关键页。",
+            "投标人资格要求",
+            403,
+        ),
+        StructuredBlock(
+            "b0404",
+            "heading",
+            "制造商资格要求",
+            "制造商资格要求",
+            404,
+        ),
+        StructuredBlock(
+            "b0405",
+            "paragraph",
+            "投标产品须提交制造商登记证明。",
+            "制造商资格要求",
+            405,
+        ),
+    ]
+
+    materials = extract_supplemental_materials_from_regions(
+        identify_functional_regions(blocks)
+    )
+
+    names = "\n".join(item["name"] for item in materials)
+    assert {"营业执照", "授权书", "业绩证明", "合同关键页", "制造商登记证明"} <= set(
+        names.splitlines()
+    )
+    assert len(materials) == 5
+    assert all(item["source"]["block_ids"] for item in materials)
+    assert all(item["source"]["source_text"] for item in materials)
+    assert all("须" in item["material"] or "应" in item["material"] for item in materials)
+
+
+def test_supplemental_material_extraction_excludes_qualifications_and_future_duties():
+    blocks = [
+        StructuredBlock(
+            "b0410",
+            "heading",
+            "资格条件",
+            "资格条件",
+            410,
+        ),
+        StructuredBlock(
+            "b0411",
+            "paragraph",
+            "具有良好的商业信誉，具备丰富的软件项目经验，能够提供 7×24 小时服务。",
+            "资格条件",
+            411,
+        ),
+        StructuredBlock(
+            "b0412",
+            "paragraph",
+            "中标后人员更换需要报备，终验后的质保义务由中标人承担。",
+            "资格条件",
+            412,
+        ),
+    ]
+
+    materials = extract_supplemental_materials_from_regions(
+        identify_functional_regions(blocks)
+    )
+
+    assert materials == []
 
 
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:
