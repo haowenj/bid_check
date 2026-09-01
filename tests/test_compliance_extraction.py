@@ -160,30 +160,14 @@ def test_real_extractor_restores_source_text_and_deduplicates(tmp_path):
             return [
                 {
                     "name": "投标文件格式完整性",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写完整。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写完整。",
+                    "condition": None,
                     "source_block_ids": ["b0002", "b0003"],
                 },
                 {
                     "name": "投标文件格式完整性",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写完整。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写完整。",
+                    "condition": None,
                     "source_block_ids": ["b0002"],
                 },
             ]
@@ -199,7 +183,7 @@ def test_real_extractor_restores_source_text_and_deduplicates(tmp_path):
 
     assert len(fake_llm.calls) == 1
     assert len(result) == 1
-    assert result[0]["id"] == "compliance_001"
+    assert result[0]["id"] == "tender_requirement_001"
     assert result[0]["source"]["block_ids"] == ["b0002", "b0003"]
     assert result[0]["source"]["source_text"] == (
         "投标人名称应填写完整。\n投标人名称应填写完整。"
@@ -225,7 +209,7 @@ def test_real_extractor_rejects_invalid_llm_schema(tmp_path):
         )
 
 
-def test_real_extractor_coerces_legacy_string_schema_fields(tmp_path):
+def test_real_extractor_rejects_legacy_execution_schema(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"docx")
 
@@ -257,25 +241,15 @@ def test_real_extractor_coerces_legacy_string_schema_fields(tmp_path):
                 }
             ]
 
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=LegacyShapeLLM(),
-    )
-
-    assert result[0]["target"] == {
-        "name": "投标人主体资格证明",
-        "scope": "single_section",
-    }
-    assert [check["requirement"] for check in result[0]["checks"]] == [
-        "非事业单位须提供营业执照副本扫描件",
-        "事业单位须提供法人证书扫描件",
-    ]
-    assert result[0]["checks"][0]["check_type"] == "attachment_exists"
-    assert result[0]["applicability"] == {"type": "always", "condition": None}
+    with pytest.raises(ComplianceExtractionError, match="Schema"):
+        extract_compliance_requirements_real(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=FakeParser(),
+            llm=LegacyShapeLLM(),
+        )
 
 
-def test_real_extractor_accepts_legacy_source_shape_and_replaces_ids(tmp_path):
+def test_real_extractor_rejects_execution_fields_even_with_source_shape(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"docx")
 
@@ -308,18 +282,15 @@ def test_real_extractor_accepts_legacy_source_shape_and_replaces_ids(tmp_path):
                 }
             ]
 
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=FakeLLM(),
-    )
-
-    assert result[0]["id"] == "compliance_001"
-    assert result[0]["checks"][0]["id"] == "compliance_001_01"
-    assert result[0]["source"]["source_text"] == "必须提供营业执照。"
+    with pytest.raises(ComplianceExtractionError, match="Schema"):
+        extract_compliance_requirements_real(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=FakeParser(),
+            llm=FakeLLM(),
+        )
 
 
-def test_normalization_canonicalizes_enum_aliases_and_derives_evidence(tmp_path):
+def test_normalization_rejects_legacy_execution_metadata(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"docx")
 
@@ -360,20 +331,15 @@ def test_normalization_canonicalizes_enum_aliases_and_derives_evidence(tmp_path)
                 }
             ]
 
-    result = extract_compliance_requirements_real(
-        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
-        parser=FakeParser(),
-        llm=AliasLLM(),
-    )
-
-    assert result[0]["target"]["scope"] == "single_section"
-    assert result[0]["applicability"]["type"] == "always"
-    assert result[0]["checks"][0]["check_type"] == "attachment_content"
-    assert result[0]["checks"][0]["evidence_type"] == "vision"
-    assert result[0]["category"] != "存在性检查"
+    with pytest.raises(ComplianceExtractionError, match="Schema"):
+        extract_compliance_requirements_real(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=FakeParser(),
+            llm=AliasLLM(),
+        )
 
 
-def test_normalization_rejects_unknown_enum_alias(tmp_path):
+def test_normalization_rejects_unknown_or_missing_simplified_fields(tmp_path):
     tender = tmp_path / "tender.docx"
     tender.write_bytes(b"docx")
 
@@ -386,16 +352,6 @@ def test_normalization_rejects_unknown_enum_alias(tmp_path):
             return [
                 {
                     "name": "未知规则",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "未知范围"},
-                    "checks": [
-                        {
-                            "requirement": "必须填写。",
-                            "check_type": "unknown_check",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -440,19 +396,11 @@ def test_normalization_filters_non_executable_and_project_conflict_rules(tmp_pat
 
     class BoundaryLLM:
         def extract(self, batch):
-            def item(name, requirement, target_name, block_id):
+            def item(name, rule, block_id):
                 return {
                     "name": name,
-                    "category": "required_field",
-                    "target": {"name": target_name, "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": requirement,
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": rule,
+                    "condition": None,
                     "source_block_ids": [block_id],
                 }
 
@@ -460,31 +408,26 @@ def test_normalization_filters_non_executable_and_project_conflict_rules(tmp_pat
                 item(
                     "封面字段",
                     "投标人名称应填写。",
-                    "商务投标文件封面",
                     "b0002",
                 ),
                 item(
                     "身份证附件",
                     "须提供身份证人像面和国徽面。",
-                    "法定代表人身份证明",
                     "b0002",
                 ),
                 item(
                     "电子采购系统上传",
                     "应在电子采购系统完成加密上传。",
-                    "电子投标文件",
                     "b0002",
                 ),
                 item(
                     "履约阶段安全告知书",
                     "合同签订后的履约期间安全告知书需签名。",
-                    "安全告知书",
                     "b0002",
                 ),
                 item(
                     "联合体协议书",
                     "联合体各方应签订联合体协议书。",
-                    "联合体协议书",
                     "b0001",
                 ),
             ]
@@ -520,16 +463,8 @@ def test_real_extractor_caches_source_grounded_result(tmp_path):
             return [
                 {
                     "name": "投标人信息",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -577,9 +512,8 @@ def test_openai_compatible_llm_disables_thinking_and_bounds_output(monkeypatch):
     assert captured["payload"]["max_tokens"] == 8192
     assert captured["timeout"] == 17
     prompt = captured["payload"]["messages"][1]["content"]
-    assert "target 必须是对象" in prompt
-    assert "checks 每项必须是对象" in prompt
-    assert "applicability 必须是对象" in prompt
+    assert "name、rule、condition、source_block_ids" in prompt
+    assert "不得生成 check_type" in prompt
 
 
 def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_path):
@@ -605,16 +539,8 @@ def test_real_extractor_retries_transient_llm_timeout_with_global_budget(tmp_pat
             return [
                 {
                     "name": "投标人信息",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -645,16 +571,8 @@ def test_real_extractor_logs_each_pipeline_stage(tmp_path, caplog):
             return [
                 {
                     "name": "投标人信息",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -786,16 +704,8 @@ def test_real_extractor_persists_intermediates_and_summary(tmp_path):
             return [
                 {
                     "name": "投标人要求",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写。",
+                    "condition": None,
                     "source_block_ids": [batch[0].block_ids[0]],
                 }
             ]
@@ -893,16 +803,8 @@ def test_real_extractor_keeps_prior_artifacts_when_later_llm_call_fails(tmp_path
             return [
                 {
                     "name": "投标人要求",
-                    "category": "required_field",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "投标人名称应填写。",
-                            "check_type": "required_field",
-                            "evidence_type": "text",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "投标人名称应填写。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -956,16 +858,8 @@ def test_real_extractor_records_retry_attempts_and_call_metadata(tmp_path):
             return [
                 {
                     "name": "资格材料",
-                    "category": "attachment",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "须提供营业执照。",
-                            "check_type": "attachment_exists",
-                            "evidence_type": "structure",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "须提供营业执照。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]
@@ -1019,16 +913,8 @@ def test_real_extractor_records_requirement_cache_hit(tmp_path):
             return [
                 {
                     "name": "资格材料",
-                    "category": "attachment",
-                    "target": {"name": "投标文件", "scope": "single_section"},
-                    "checks": [
-                        {
-                            "requirement": "须提供营业执照。",
-                            "check_type": "attachment_exists",
-                            "evidence_type": "structure",
-                        }
-                    ],
-                    "applicability": {"type": "always", "condition": None},
+                    "rule": "须提供营业执照。",
+                    "condition": None,
                     "source_block_ids": ["b0001"],
                 }
             ]

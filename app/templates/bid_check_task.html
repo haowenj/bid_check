@@ -68,27 +68,27 @@
             <div class="requirement-content">
               <div class="requirement-heading">
                 <div>
-                  <span class="category-label">{{ requirement.category }}</span>
                   <h3>{{ requirement.name }}</h3>
                 </div>
-                <span class="scope-label">{{ requirement.target.scope }}</span>
               </div>
               <div class="requirement-fields">
                 <div class="field-row">
-                  <strong>检查对象</strong>
-                  <span>{{ requirement.target.name }}</span>
+                  <strong>简要规则</strong>
+                  <span>{{ requirement.rule }}</span>
                 </div>
-                <div class="field-row">
-                  <strong>检查要求</strong>
-                  <ul>
-                    {% for check in requirement.checks %}
-                      <li>{{ check.requirement }}</li>
-                    {% endfor %}
-                  </ul>
+                {% if requirement.condition %}
+                  <div class="field-row">
+                    <strong>适用条件</strong>
+                    <span>{{ requirement.condition }}</span>
+                  </div>
+                {% endif %}
+                <div class="field-row source-row">
+                  <strong>来源章节</strong>
+                  <span>{{ requirement.source.section }}</span>
                 </div>
                 <div class="field-row source-row">
-                  <strong>来源</strong>
-                  <span>{{ requirement.source.section }}</span>
+                  <strong>来源原文</strong>
+                  <span>{{ requirement.source.source_text }}</span>
                 </div>
               </div>
             </div>

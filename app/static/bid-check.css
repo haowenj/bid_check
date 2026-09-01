@@ -264,8 +264,6 @@ h1 { margin-bottom: 5px; font-size: clamp(25px, 3vw, 32px); line-height: 1.25; }
 .requirement-index { position: absolute; inset: 0 auto 0 0; width: 55px; background: #eff4f9; color: #6b829b; display: grid; place-items: center; font-size: 16px; font-weight: 750; letter-spacing: .04em; }
 .requirement-heading { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 12px; }
 .requirement-heading h3 { margin: 2px 0 0; font-size: 17px; }
-.category-label { color: #718197; font: 11px/1.3 ui-monospace, SFMono-Regular, monospace; text-transform: uppercase; }
-.scope-label { align-self: flex-start; padding: 3px 8px; border-radius: 999px; background: #e8eef5; color: #53677f; font: 11px/1.4 ui-monospace, SFMono-Regular, monospace; }
 .field-row { padding: 9px 0; border-top: 1px solid #e5ebf2; display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; }
 .field-row > strong { color: #41546c; }
 .field-row ul { margin: 0; padding-left: 19px; }
@@ -292,7 +290,6 @@ h1 { margin-bottom: 5px; font-size: clamp(25px, 3vw, 32px); line-height: 1.25; }
   .requirement-index { position: static; width: 32px; height: 25px; margin-bottom: 8px; border-radius: 7px; }
   .requirement-heading, .field-row { grid-template-columns: 1fr; }
   .requirement-heading { display: block; }
-  .scope-label { display: inline-block; margin-top: 7px; }
   .section-card { padding: 17px; }
   .button.primary { width: 100%; }
 }

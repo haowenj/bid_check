@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
-
+from typing import Any, Literal, TypedDict
 
 CheckMode = Literal["compliance", "evaluation", "full"]
 TaskStatus = Literal["pending", "running", "complete", "failed"]
 StageName = Literal["requirements", "bid_parse", "review"]
+
+
+class TenderRequirementSource(TypedDict):
+    section: str
+    block_ids: list[str]
+    source_text: str
+
+
+class TenderRequirement(TypedDict):
+    id: str
+    name: str
+    rule: str
+    condition: str | None
+    source: TenderRequirementSource
 
 
 @dataclass(frozen=True)
@@ -57,4 +70,3 @@ class BidCheckTask:
         if self.result is not None:
             payload.update(self.result)
         return payload
-

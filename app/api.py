@@ -26,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 from app.compliance_extraction import (
     ComplianceExtractionError,
     DeterministicComplianceLLM,
+    JsonDocumentCache,
     JsonRequirementCache,
     MinerUDocumentParser,
     OpenAICompatibleLLM,
@@ -40,7 +41,6 @@ from app.mock_services import (
 from app.models import FileMetadata
 from app.repository import BidCheckRepository
 from app.workflow import BidCheckServices, BidCheckWorkflow
-
 
 CheckModeInput = Literal["compliance", "evaluation", "full"]
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ def build_default_workflow(
 ) -> BidCheckWorkflow:
     parser = MinerUDocumentParser(settings.mineru_command)
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
+    parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
     if settings.llm_api_key:
         llm = OpenAICompatibleLLM(
             api_key=settings.llm_api_key,
@@ -75,6 +76,7 @@ def build_default_workflow(
                 parser=parser,
                 llm=llm,
                 cache=cache,
+                parser_cache=parser_cache,
                 max_batches=settings.compliance_max_batches,
             )
         except ComplianceExtractionError:

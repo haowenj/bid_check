@@ -17,13 +17,13 @@ def test_extract_returns_five_structured_requirements(tmp_path):
     )
 
     assert [item["id"] for item in requirements] == [
-        "compliance_001",
-        "compliance_002",
-        "compliance_003",
-        "compliance_004",
-        "compliance_005",
+        "tender_requirement_001",
+        "tender_requirement_002",
+        "tender_requirement_003",
+        "tender_requirement_004",
+        "tender_requirement_005",
     ]
-    assert [len(item["checks"]) for item in requirements] == [2, 3, 5, 3, 4]
+    assert all(set(item) == {"id", "name", "rule", "condition", "source"} for item in requirements)
     assert all(item["source"]["section"] for item in requirements)
 
 

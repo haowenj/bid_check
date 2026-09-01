@@ -82,9 +82,9 @@ def test_complete_page_renders_requirements_without_fake_verdict(
     assert response.status_code == 200
     assert "标书合规性校验结果" in response.text
     assert "本次共提取 5 项合规性检查要求" in response.text
-    assert "商务投标文件封面完整性" in response.text
-    assert "投标人名称应填写完整" in response.text
-    assert "项目人员材料" in response.text
+    assert "商务投标文件封面" in response.text
+    assert "应填写投标人名称和日期" in response.text
+    assert "业绩材料" in response.text
     assert "当前版本仅展示提取出的合规性检查要求" in response.text
     assert "尚未执行真实投标文件内容校验" in response.text
     assert "section_count" not in response.text
