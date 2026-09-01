@@ -225,6 +225,62 @@ def test_template_fields_read_underline_styles_from_flat_content_runs():
     assert extraction_module._template_fields(blocks) == ["法定代表人"]
 
 
+def test_template_fields_use_underlined_semantic_text_without_placeholder_syntax():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "投标人名称", "style": ["underline"]},
+                    {"type": "text", "content": "（联系人）", "style": ["underline"]},
+                    {
+                        "type": "text",
+                        "content": "复制、查阅和传播含有以下内容的信息",
+                        "style": ["underline"],
+                    },
+                ]
+            },
+        }
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["投标人名称", "联系人"]
+
+
+def test_template_fields_do_not_promote_narrative_before_blank_underline_to_field():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "自愿组成："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "现就联合体投标事宜订立如下协议："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "投标人名称："},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                ]
+            },
+        }
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["投标人名称"]
+
+
+def test_template_table_fields_require_a_structural_label_for_blank_cells():
+    table = (
+        "<table><tr><td>项目名称</td><td></td></tr>"
+        "<tr><td></td><td></td></tr></table>"
+    )
+
+    blocks = [block("b1", "table", table, "模板", 1)]
+
+    assert extraction_module._template_fields(blocks) == ["项目名称"]
+
+
 def test_template_fields_keep_literal_placeholders_and_noun_phrase_fallbacks():
     block_value = (
         "成立时间：____年____月____日；"
@@ -423,6 +479,88 @@ def test_template_fields_choose_detailed_header_over_group_header_and_total_row(
         "职务",
         "联系方式",
     ]
+
+
+def test_template_fields_do_not_use_narrative_prefix_for_explicit_placeholder_label():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "【XX公司、XX公司[所有成员单位名称]】",
+                        "style": ["underline"],
+                    },
+                    {"type": "text", "content": "自愿组成："},
+                    {
+                        "type": "text",
+                        "content": "【XX和XX[联合体名称]】",
+                        "style": ["underline"],
+                    },
+                    {
+                        "type": "text",
+                        "content": "联合体，共同参加【2026年云网络项目[项目名称]】【XX标包[标包名称]】投标。",
+                        "style": ["underline"],
+                    },
+                    {"type": "text", "content": "现就联合体投标事宜订立如下协议："},
+                ]
+            },
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "1. "},
+                    {
+                        "type": "text",
+                        "content": "【XX公司[某成员单位名称]】",
+                        "style": ["underline"],
+                    },
+                    {"type": "text", "content": "为联合体牵头人。"},
+                ]
+            },
+        },
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == [
+        "所有成员单位名称",
+        "联合体名称",
+        "项目名称",
+        "某成员单位名称",
+    ]
+
+
+def test_template_fields_recognize_date_slots_without_date_label():
+    payload = [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "____年____月____日"}
+                ]
+            },
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "年"},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "月"},
+                    {"type": "text", "content": "       ", "style": ["underline"]},
+                    {"type": "text", "content": "日"},
+                ]
+            },
+        },
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+
+    assert extraction_module._template_fields(blocks) == ["日期"]
 
 
 def test_template_does_not_become_one_requirement_per_block():

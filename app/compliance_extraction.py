@@ -39,7 +39,7 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v19:{REQUIREMENT_PROMPT_VERSION}"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v21:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v5"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
@@ -1270,10 +1270,10 @@ _TABLE_FIELD_RE = re.compile(
 )
 _FIELD_LABEL_SUFFIX_RE = re.compile(
     r"(?:名称|姓名|性别|年龄|职务|地址|电话|手机|邮箱|邮编|日期|时间|期限|"
-    r"性质|单位|联系人|负责人|法人|账号|账户|开户行|编号|证号|代码|金额|"
+    r"性质|单位|联系人|负责人|法人|代表人|账号|账户|开户行|编号|证号|代码|金额|"
     r"数量|比例|方式|类别|类型|内容|事项|专业|学历|等级|资质|网址|传真|"
     r"税号|注册资本|经营范围|全称|简称|签字|盖章|印章|证明文件|证明材料|"
-    r"页码|型号|厂商|软件|银行)$"
+    r"页码|型号|厂商|软件|银行|编码|机关)$"
 )
 _FIELD_NARRATIVE_RE = re.compile(
     r"^(?:我方|我司)(?:承诺|声明|保证|确认|同意|提供|将|在)"
@@ -1473,8 +1473,25 @@ def _is_text_placeholder(value: str) -> bool:
     )
 
 
+def _has_filling_position(
+    value: str,
+    styles: frozenset[str] = frozenset(),
+) -> bool:
+    """Return structural evidence that a value area is reserved for input.
+
+    The marker's spelling is deliberately not interpreted as a field name.  It
+    only supports the surrounding label or table structure as evidence that an
+    input position exists.
+    """
+
+    return "underline" in styles or _is_text_placeholder(value)
+
+
 def _is_table_placeholder(value: str) -> bool:
-    return not value.strip() or _is_text_placeholder(value)
+    # An empty table cell is evidence only after a row label or matrix header
+    # has supplied the field semantics.  The caller must never append a field
+    # from this predicate alone.
+    return not value.strip() or _has_filling_position(value)
 
 
 def _field_value_segment(value: str) -> str:
@@ -1500,6 +1517,7 @@ def _trailing_field_label(
     value: str,
     *,
     reject_narrative: bool = True,
+    require_field_suffix: bool = False,
 ) -> str | None:
     text = value.rstrip()
     matches = list(_TEMPLATE_FIELD_RE.finditer(text))
@@ -1513,9 +1531,16 @@ def _trailing_field_label(
     if last_closing >= 0 and last_closing < len(raw_label) - 1:
         raw_label = raw_label[last_closing + 1 :]
     label = _normalize_field_label(raw_label)
+    compact = re.sub(r"\s+", "", label)
+    if require_field_suffix and len(compact) > 16:
+        return None
     return (
         label
-        if _is_field_label_candidate(label, reject_narrative=reject_narrative)
+        if _is_field_label_candidate(
+            label,
+            require_field_suffix=require_field_suffix,
+            reject_narrative=reject_narrative,
+        )
         else None
     )
 
@@ -1538,28 +1563,83 @@ def _placeholder_field_labels(text: str) -> list[str]:
     return labels
 
 
+def _underlined_field_labels(text: str) -> list[str]:
+    """Extract semantic labels from an underlined input run.
+
+    MinerU's underline style identifies the input position.  The run itself
+    may contain a label (possibly enclosed in a parenthetical group), while
+    literal examples such as XX or bracket placeholders are only optional
+    naming evidence.
+    """
+
+    labels = _placeholder_field_labels(text)
+    candidates: list[str] = []
+    trailing_label = _trailing_field_label(
+        text,
+        reject_narrative=True,
+        require_field_suffix=True,
+    )
+    if trailing_label:
+        candidates.append(trailing_label)
+
+    stripped = text.strip()
+    if stripped:
+        candidates.append(stripped)
+        if stripped[0] in _PARENTHETICAL_PAIRS:
+            end = _bracket_group_end(stripped)
+            if end is not None and not stripped[end + 1 :].strip(" \t：:，,；;。"):
+                candidates.append(stripped[1:end])
+
+    for candidate in candidates:
+        label = _normalize_field_label(candidate)
+        compact = re.sub(r"\s+", "", label)
+        if (
+            _EXTERNAL_PLACEHOLDER_LABEL_RE.search(compact)
+            or not _is_field_label_candidate(
+                label,
+                require_field_suffix=True,
+                reject_narrative=True,
+            )
+            or label in labels
+        ):
+            continue
+        labels.append(label)
+    return labels
+
+
 def _template_text_fields(text: str) -> list[str]:
     fields: list[str] = []
     for match in _TEMPLATE_FIELD_RE.finditer(text):
         label = _normalize_field_label(match.group(1))
         remainder = text[match.end() :]
         value = _field_value_segment(remainder)
-        has_placeholder = _is_text_placeholder(value)
-        if not _is_field_label_candidate(label, reject_narrative=not has_placeholder):
+        has_filling_position = _has_filling_position(value)
+        if not _is_field_label_candidate(
+            label,
+            reject_narrative=not has_filling_position,
+        ):
             continue
-        if has_placeholder and not _is_field_label_candidate(
+        if has_filling_position and not _is_field_label_candidate(
             label,
             require_field_suffix=True,
             reject_narrative=True,
         ):
             continue
-        if has_placeholder or (
+        if has_filling_position or (
             not value.strip(" \t\r\n。；;，,")
             and _is_field_label_candidate(label, require_field_suffix=True)
         ):
             if label not in fields:
                 fields.append(label)
     return fields
+
+
+def _has_labeled_date_slot(text: str) -> bool:
+    for match in _TEMPLATE_FIELD_RE.finditer(text):
+        value = _field_value_segment(text[match.end() :])
+        if _FIELD_DATE_SLOT_RE.search(value):
+            return True
+    return False
 
 
 def _mineru_content_runs(
@@ -1608,10 +1688,6 @@ def _block_mineru_content_runs(
     return [(block.text, frozenset(str(style).casefold() for style in styles))]
 
 
-def _is_underline_input_run(text: str, styles: frozenset[str]) -> bool:
-    return "underline" in styles and not text.strip()
-
-
 def _template_styled_fields(
     blocks: Sequence[StructuredBlock],
 ) -> list[tuple[int, str]]:
@@ -1624,23 +1700,39 @@ def _template_styled_fields(
         for text, styles in runs:
             is_underlined = "underline" in styles
             if is_underlined and text.strip():
-                for label in _placeholder_field_labels(text):
+                for label in _underlined_field_labels(text):
                     if label not in seen:
                         fields.append((block_index, label))
                         seen.add(label)
-            if is_underlined or _is_text_placeholder(text):
+            if _has_filling_position(text, styles):
                 label = _trailing_field_label(
                     prefix,
                     reject_narrative=True,
+                    require_field_suffix=True,
                 ) or _trailing_field_label(
                     previous_text,
                     reject_narrative=True,
+                    require_field_suffix=True,
                 )
                 if label and label not in seen:
                     fields.append((block_index, label))
                     seen.add(label)
             prefix += text
         meaningful_text = "".join(text for text, styles in runs if text.strip())
+        has_date_marker = any(
+            "underline" in styles
+            or "_" in text
+            or _FIELD_PLAIN_X_PLACEHOLDER_RE.search(text)
+            for text, styles in runs
+        )
+        if (
+            _FIELD_DATE_SLOT_RE.search(block.text)
+            and has_date_marker
+            and not _has_labeled_date_slot(block.text)
+        ):
+            if "日期" not in seen:
+                fields.append((block_index, "日期"))
+                seen.add("日期")
         if meaningful_text:
             previous_text = meaningful_text
     return fields
@@ -1742,7 +1834,7 @@ def _template_table_fields(block: StructuredBlock) -> list[str]:
                 continue
             if any(
                 len(row) > index
-                and (not row[index].strip() or _is_text_placeholder(row[index]))
+                and _is_table_placeholder(row[index])
                 for row in data_rows
             ):
                 append(label)
