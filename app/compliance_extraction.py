@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -10,14 +12,18 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
 from xml.etree import ElementTree
+
+import httpx
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import (
@@ -34,8 +40,14 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Bump the object-result cache when deterministic segmentation or source
 # reconciliation changes.  The parsed MinerU document cache intentionally has
 # its own stable version and remains reusable.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v13:{REQUIREMENT_PROMPT_VERSION}"
-PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v1"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v14:{REQUIREMENT_PROMPT_VERSION}"
+PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v2"
+MINERU_TASKS_PROTOCOL_VERSION = "pdf-trans-tasks-v1"
+MINERU_TASKS_PROTOCOL_LABEL = "pdf_trans_tasks"
+DEFAULT_MINERU_BACKEND = "hybrid-engine"
+SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
+DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
+DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 2.0
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -44,6 +56,33 @@ def _elapsed_ms(started_at: float) -> int:
 
 def _serialize_blocks(blocks: Sequence[StructuredBlock]) -> list[dict[str, Any]]:
     return [asdict(block) for block in blocks]
+
+
+def _block_structure_stats(blocks: Sequence[StructuredBlock]) -> dict[str, Any]:
+    type_counts = {kind: 0 for kind in ("heading", "paragraph", "table", "image")}
+    heading_levels: set[int] = set()
+    metadata_keys: set[str] = set()
+    blocks_with_metadata = 0
+    for block in blocks:
+        type_counts[block.type] = type_counts.get(block.type, 0) + 1
+        if block.metadata:
+            blocks_with_metadata += 1
+            metadata_keys.update(str(key) for key in block.metadata)
+        if block.type == "heading":
+            for key in ("text_level", "heading_level", "level"):
+                value = block.metadata.get(key)
+                try:
+                    if int(value) > 0:
+                        heading_levels.add(int(value))
+                        break
+                except (TypeError, ValueError):
+                    continue
+    return {
+        "parsed_block_counts": type_counts,
+        "parsed_heading_levels": sorted(heading_levels),
+        "parsed_blocks_with_metadata": blocks_with_metadata,
+        "parsed_metadata_keys": sorted(metadata_keys),
+    }
 
 
 def _serialize_candidates(
@@ -240,8 +279,8 @@ def _is_heading(text: str, style: str) -> bool:
 def parse_docx_document(path: Path) -> list[StructuredBlock]:
     """Recover ordered paragraph/table blocks from a DOCX package.
 
-    This is the local structural fallback used when a MinerU command is not
-    configured.  It deliberately does not infer compliance semantics.
+    This parser is intentionally only a development/test fallback.  Normal
+    tender extraction must use the project's MinerU service integration.
     """
 
     started_at = time.perf_counter()
@@ -319,8 +358,15 @@ def parse_docx_document(path: Path) -> list[StructuredBlock]:
 
 
 def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
+    """Convert MinerU content-list objects without compiling them into rules."""
     if isinstance(payload, dict):
-        payload = payload.get("blocks", payload.get("content", payload.get("items")))
+        payload = payload.get(
+            "blocks",
+            payload.get(
+                "content",
+                payload.get("items", payload.get("content_list")),
+            ),
+        )
     if not isinstance(payload, list):
         raise ComplianceExtractionError("MinerU 返回结果不是结构化内容列表。")
 
@@ -329,23 +375,61 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
     for index, raw in enumerate(payload, start=1):
         if not isinstance(raw, dict):
             continue
-        text = str(raw.get("text", raw.get("content", ""))).strip()
-        if not text:
-            continue
-        kind = str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
-        if kind in {"title", "heading", "header"}:
+        raw_type = str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
+        level = raw.get("text_level", raw.get("heading_level", raw.get("level", 0)))
+        try:
+            has_heading_level = int(level or 0) > 0
+        except (TypeError, ValueError):
+            has_heading_level = False
+        if raw_type in {"title", "heading", "header"} or (
+            raw_type in {"text", "paragraph"} and has_heading_level
+        ):
             kind = "heading"
+        elif raw_type == "table":
+            kind = "table"
+        elif raw_type in {"image", "figure"}:
+            kind = "image"
+        else:
+            kind = "paragraph"
+
+        text = ""
+        for text_key in (
+            "text",
+            "content",
+            "table_body",
+            "html",
+            "caption",
+            "alt",
+            "img_path",
+        ):
+            value = raw.get(text_key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+        if not text:
+            # Keep an image as a real source block even when MinerU has no
+            # caption; the raw image reference remains in metadata.
+            if kind == "image":
+                text = "[MinerU image]"
+            else:
+                continue
+
+        if kind == "heading":
             section = text
         elif kind not in {"paragraph", "table", "image"}:
             kind = "paragraph"
         block_id = str(raw.get("block_id", raw.get("id", f"b{index:04d}")))
+        try:
+            order = int(raw.get("order", index))
+        except (TypeError, ValueError):
+            order = index
         blocks.append(
             StructuredBlock(
                 block_id=block_id,
                 type=kind,  # type: ignore[arg-type]
                 text=text,
                 section=str(raw.get("section", section)),
-                order=int(raw.get("order", index)),
+                order=order,
                 metadata={
                     key: value
                     for key, value in raw.items()
@@ -367,31 +451,158 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
 
 
 class MinerUDocumentParser:
-    """MinerU-compatible parser with a command adapter and local DOCX fallback."""
+    """Use the existing MinerU ``/tasks`` service, with explicit test fallback.
 
-    def __init__(self, command: str | None = None):
-        self.command = command if command is not None else os.getenv("MINERU_COMMAND")
+    ``MINERU_COMMAND`` remains a compatibility adapter for an explicitly
+    configured MinerU command.  It is never used as the signal for whether a
+    normal business parse is allowed.  When neither the existing service nor
+    the command adapter is configured, this class fails unless
+    ``allow_docx_fallback`` is explicitly enabled.
+    """
+
+    def __init__(
+        self,
+        command: str | None = None,
+        *,
+        mineru_url: str | None = None,
+        mineru_api_key: str | None = None,
+        mineru_backend: str | None = None,
+        mineru_server_url: str | None = None,
+        timeout_seconds: float = DEFAULT_MINERU_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
+        allow_docx_fallback: bool = False,
+        http_client: httpx.Client | None = None,
+    ):
+        self.command = (
+            command if command is not None else os.getenv("MINERU_COMMAND")
+        )
+        self.mineru_url = (
+            mineru_url
+            if mineru_url is not None
+            else os.getenv("PDF_TRANS_MINERU_URL")
+            or os.getenv("MINERU_API_URL")
+        )
+        self.mineru_api_key = (
+            mineru_api_key
+            if mineru_api_key is not None
+            else os.getenv("MINERU_API_KEY")
+            or os.getenv("PDF_TRANS_MINERU_API_KEY")
+        )
+        self.mineru_backend = mineru_backend or os.getenv(
+            "PDF_TRANS_MINERU_BACKEND",
+            os.getenv("MINERU_BACKEND", DEFAULT_MINERU_BACKEND),
+        )
+        self.mineru_server_url = (
+            mineru_server_url
+            if mineru_server_url is not None
+            else os.getenv("PDF_TRANS_MINERU_SERVER_URL")
+            or os.getenv("MINERU_SERVER_URL")
+        )
+        self.timeout_seconds = float(timeout_seconds)
+        self.poll_interval_seconds = float(poll_interval_seconds)
+        self.allow_docx_fallback = allow_docx_fallback
+        self._http_client = http_client
+        self.parse_diagnostics: dict[str, Any] = {
+            "parser": self.parser_name,
+            "mineru_called": False,
+            "service_protocol": None,
+            "elapsed_ms": None,
+        }
+
+    @property
+    def parser_name(self) -> str:
+        if (self.mineru_url or "").strip() or (self.command or "").strip():
+            return "mineru"
+        return "docx_fallback" if self.allow_docx_fallback else "mineru"
+
+    @property
+    def cache_descriptor(self) -> dict[str, Any]:
+        if (self.mineru_url or "").strip():
+            transport = "pdf_trans_tasks"
+        elif (self.command or "").strip():
+            transport = "command"
+        else:
+            transport = "docx_fallback"
+        return {
+            "parser": self.parser_name,
+            "transport": transport,
+            "protocol": MINERU_TASKS_PROTOCOL_VERSION if transport == "pdf_trans_tasks" else None,
+            "url": (self.mineru_url or "").strip(),
+            "backend": self.mineru_backend,
+            "server_url": (self.mineru_server_url or "").strip(),
+            "command": (self.command or "").strip(),
+        }
 
     def parse(self, path: Path) -> list[StructuredBlock]:
         started_at = time.perf_counter()
-        parser_name = "mineru" if self.command else "docx"
         logger.info(
-            "document.parse.dispatch.start parser=%s file=%s", parser_name, path.name
+            "document.parse.dispatch.start parser=%s file=%s",
+            self.parser_name,
+            path.name,
         )
-        if not self.command:
-            blocks = parse_docx_document(path)
-            logger.info(
-                "document.parse.dispatch.end parser=%s file=%s blocks=%d elapsed_ms=%d",
-                parser_name,
-                path.name,
-                len(blocks),
-                _elapsed_ms(started_at),
-            )
-            return blocks
-        command = [part.format(input=str(path)) for part in shlex.split(self.command)]
-        if "{input}" not in self.command:
-            command.append(str(path))
         try:
+            if (self.mineru_url or "").strip():
+                blocks = self._parse_with_mineru_service(path)
+            elif (self.command or "").strip():
+                blocks = self._parse_with_mineru_command(path)
+            elif self.allow_docx_fallback:
+                blocks = parse_docx_document(path)
+                self.parse_diagnostics = {
+                    "parser": "docx_fallback",
+                    "mineru_called": False,
+                    "service_protocol": None,
+                    "elapsed_ms": _elapsed_ms(started_at),
+                }
+            else:
+                raise ComplianceExtractionError(
+                    "MinerU 未配置：请配置 PDF_TRANS_MINERU_URL（或 MINERU_API_URL）"
+                    "，正常业务不允许自动使用 DOCX XML fallback。"
+                )
+        except ComplianceExtractionError:
+            self.parse_diagnostics = {
+                "parser": self.parser_name,
+                "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
+                "service_protocol": (
+                    MINERU_TASKS_PROTOCOL_LABEL
+                    if (self.mineru_url or "").strip()
+                    else "command" if (self.command or "").strip() else None
+                ),
+                "elapsed_ms": _elapsed_ms(started_at),
+            }
+            raise
+        except Exception as exc:
+            self.parse_diagnostics = {
+                "parser": self.parser_name,
+                "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
+                "service_protocol": (
+                    MINERU_TASKS_PROTOCOL_LABEL
+                    if (self.mineru_url or "").strip()
+                    else "command" if (self.command or "").strip() else None
+                ),
+                "elapsed_ms": _elapsed_ms(started_at),
+            }
+            raise ComplianceExtractionError(
+                f"MinerU 文档解析失败：{type(exc).__name__}。"
+            ) from exc
+
+        self.parse_diagnostics["elapsed_ms"] = _elapsed_ms(started_at)
+        logger.info(
+            "document.parse.dispatch.end parser=%s file=%s blocks=%d elapsed_ms=%d",
+            self.parser_name,
+            path.name,
+            len(blocks),
+            self.parse_diagnostics["elapsed_ms"],
+        )
+        return blocks
+
+    def _parse_with_mineru_command(self, path: Path) -> list[StructuredBlock]:
+        command_text = str(self.command)
+        try:
+            command = [
+                part.format(input=str(path)) for part in shlex.split(command_text)
+            ]
+            if "{input}" not in command_text:
+                command.append(str(path))
             completed = subprocess.run(
                 command,
                 check=True,
@@ -400,23 +611,216 @@ class MinerUDocumentParser:
                 timeout=300,
             )
             blocks = _blocks_from_mineru_payload(json.loads(completed.stdout))
-            logger.info(
-                "document.parse.dispatch.end parser=%s file=%s blocks=%d elapsed_ms=%d",
-                parser_name,
-                path.name,
-                len(blocks),
-                _elapsed_ms(started_at),
-            )
-            return blocks
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             logger.error(
-                "document.parse.dispatch.error parser=%s file=%s error_type=%s elapsed_ms=%d",
-                parser_name,
+                "document.parse.dispatch.error parser=mineru transport=command file=%s error_type=%s",
                 path.name,
                 type(exc).__name__,
-                _elapsed_ms(started_at),
             )
-            raise ComplianceExtractionError("MinerU 文档解析失败。") from exc
+            raise ComplianceExtractionError("MinerU 命令解析失败。") from exc
+        self.parse_diagnostics.update(
+            {
+                "parser": "mineru",
+                "mineru_called": True,
+                "service_protocol": "command",
+            }
+        )
+        return blocks
+
+    def _parse_with_mineru_service(self, path: Path) -> list[StructuredBlock]:
+        if self.mineru_backend not in SUPPORTED_MINERU_BACKENDS:
+            raise ComplianceExtractionError(
+                "MinerU backend 仅支持 hybrid-engine 或 hybrid-http-client。"
+            )
+        if self.mineru_backend == "hybrid-http-client" and not (
+            self.mineru_server_url or ""
+        ).strip():
+            raise ComplianceExtractionError(
+                "hybrid-http-client 模式下必须配置 PDF_TRANS_MINERU_SERVER_URL。"
+            )
+        if self.timeout_seconds <= 0 or self.poll_interval_seconds < 0:
+            raise ComplianceExtractionError("MinerU 超时或轮询间隔配置无效。")
+
+        base_url = str(self.mineru_url).strip().rstrip("/")
+        headers = (
+            {"Authorization": f"Bearer {self.mineru_api_key.strip()}"}
+            if self.mineru_api_key and self.mineru_api_key.strip()
+            else {}
+        )
+        form = {
+            "parse_method": "auto",
+            "effort": "medium",
+            "formula_enable": "true",
+            "table_enable": "true",
+            "image_analysis": "false",
+            "return_md": "false",
+            "return_middle_json": "false",
+            "return_model_output": "false",
+            "return_content_list": "true",
+            "return_images": "true",
+            "response_format_zip": "true",
+            "backend": self.mineru_backend,
+        }
+        if self.mineru_backend == "hybrid-http-client":
+            form["server_url"] = str(self.mineru_server_url).strip().rstrip("/")
+
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.Client(
+            timeout=httpx.Timeout(
+                connect=30.0,
+                read=self.timeout_seconds,
+                write=self.timeout_seconds,
+                pool=30.0,
+            ),
+            trust_env=False,
+            follow_redirects=False,
+        )
+        try:
+            try:
+                with path.open("rb") as source:
+                    response = client.post(
+                        f"{base_url}/tasks",
+                        data=form,
+                        files={
+                            "files": (
+                                path.name,
+                                source,
+                                mimetypes.guess_type(path.name)[0]
+                                or "application/octet-stream",
+                            )
+                        },
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+            except (OSError, httpx.HTTPError) as exc:
+                raise ComplianceExtractionError(
+                    f"MinerU 任务提交失败：{type(exc).__name__}。"
+                ) from exc
+            if response.status_code != 202:
+                raise ComplianceExtractionError(
+                    f"MinerU 任务提交失败：HTTP {response.status_code}。"
+                )
+            submission = self._json_object(response, "任务提交")
+            task_id = submission.get("task_id")
+            status_url = self._trusted_task_url(submission.get("status_url"), base_url)
+            result_url = self._trusted_task_url(submission.get("result_url"), base_url)
+            if not isinstance(task_id, str) or not task_id:
+                raise ComplianceExtractionError("MinerU 返回了无效任务响应。")
+
+            deadline = time.monotonic() + self.timeout_seconds
+            while time.monotonic() < deadline:
+                try:
+                    status_response = client.get(
+                        status_url,
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+                except httpx.HTTPError as exc:
+                    raise ComplianceExtractionError(
+                        f"MinerU 任务状态查询失败：{type(exc).__name__}。"
+                    ) from exc
+                if status_response.status_code != 200:
+                    raise ComplianceExtractionError(
+                        f"MinerU 任务状态查询失败：HTTP {status_response.status_code}。"
+                    )
+                status_payload = self._json_object(status_response, "任务状态")
+                status = status_payload.get("status")
+                if status == "completed":
+                    break
+                if status == "failed":
+                    raise ComplianceExtractionError("MinerU 任务处理失败。")
+                if status not in {"pending", "processing"}:
+                    raise ComplianceExtractionError(
+                        f"MinerU 返回未知任务状态：{status!r}。"
+                    )
+                if self.poll_interval_seconds:
+                    time.sleep(self.poll_interval_seconds)
+            else:
+                raise ComplianceExtractionError("MinerU 任务等待超时。")
+
+            try:
+                result_response = client.get(
+                    result_url,
+                    headers=headers,
+                    follow_redirects=False,
+                )
+            except httpx.HTTPError as exc:
+                raise ComplianceExtractionError(
+                    f"MinerU 结果下载失败：{type(exc).__name__}。"
+                ) from exc
+            if result_response.status_code != 200:
+                raise ComplianceExtractionError(
+                    f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
+                )
+            blocks = _blocks_from_mineru_payload(
+                self._content_list_from_zip(result_response.content)
+            )
+            self.parse_diagnostics.update(
+                {
+                    "parser": "mineru",
+                    "mineru_called": True,
+                    "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
+                    "task_id": task_id,
+                }
+            )
+            return blocks
+        finally:
+            if owns_client:
+                client.close()
+
+    @staticmethod
+    def _json_object(response: httpx.Response, label: str) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ComplianceExtractionError(f"MinerU {label}响应不是有效 JSON。") from exc
+        if not isinstance(payload, dict):
+            raise ComplianceExtractionError(f"MinerU {label}响应必须是 JSON 对象。")
+        return payload
+
+    @staticmethod
+    def _trusted_task_url(value: Any, base_url: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ComplianceExtractionError("MinerU 返回了无效任务 URL。")
+        base = urllib.parse.urlsplit(f"{base_url}/")
+        resolved = urllib.parse.urljoin(f"{base_url}/", value)
+        parsed = urllib.parse.urlsplit(resolved)
+        if (
+            parsed.scheme,
+            parsed.hostname,
+            parsed.port,
+        ) != (base.scheme, base.hostname, base.port) or parsed.fragment:
+            raise ComplianceExtractionError("MinerU 返回了不可信任务 URL。")
+        return resolved
+
+    @staticmethod
+    def _content_list_from_zip(raw: bytes) -> list[dict[str, Any]]:
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                members = []
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    normalized = info.filename.replace("\\", "/")
+                    safe_path = PurePosixPath(normalized)
+                    if safe_path.is_absolute() or ".." in safe_path.parts:
+                        raise ComplianceExtractionError(
+                            "MinerU 结果 ZIP 包含不安全路径。"
+                        )
+                    if normalized.lower().endswith(("_content_list.json", "content_list.json")):
+                        members.append(info)
+                if len(members) != 1:
+                    raise ComplianceExtractionError(
+                        "MinerU 结果 ZIP 未返回唯一 content list。"
+                    )
+                payload = json.loads(archive.read(members[0]))
+        except ComplianceExtractionError:
+            raise
+        except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            raise ComplianceExtractionError("无法读取 MinerU 结果 ZIP。") from exc
+        if not isinstance(payload, list):
+            raise ComplianceExtractionError("MinerU content list 必须是 JSON 数组。")
+        return [item for item in payload if isinstance(item, dict)]
 
 
 _FUNCTIONAL_REGION_PATTERNS: tuple[tuple[FunctionalRegionKind, re.Pattern[str]], ...] = (
@@ -1487,11 +1891,22 @@ class OpenAICompatibleLLM:
 
 
 def _parsed_document_cache_key(path: Path, parser: DocumentParser) -> str:
-    # Keep this key format stable so existing MinerU/DOCX parse caches remain
-    # reusable across requirement-schema and prompt changes.
-    parser_descriptor = type(parser).__name__
-    if isinstance(parser, MinerUDocumentParser):
-        parser_descriptor += f"\0{parser.command or ''}"
+    # The parser mode is part of the namespace.  In particular, an old local
+    # DOCX fallback result must never look like a successful MinerU result.
+    parser_descriptor_value = getattr(parser, "cache_descriptor", None)
+    if callable(parser_descriptor_value):
+        parser_descriptor_value = parser_descriptor_value()
+    if parser_descriptor_value is None:
+        parser_descriptor_value = {"type": type(parser).__name__}
+    try:
+        parser_descriptor = json.dumps(
+            parser_descriptor_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        parser_descriptor = str(parser_descriptor_value)
     return hashlib.sha256(
         PARSED_DOCUMENT_CACHE_VERSION.encode("utf-8")
         + b"\0"
@@ -2054,6 +2469,13 @@ def extract_tender_compliance_objects(
         "cache_hit": False,
         "cache_elapsed_ms": None,
         "parser": type(active_parser).__name__,
+        "actual_parser": getattr(
+            active_parser, "parser_name", type(active_parser).__name__
+        ),
+        "parser_transport": None,
+        "mineru_called": False,
+        "mineru_call_elapsed_ms": None,
+        "parser_execution_source": None,
         "parser_elapsed_ms": None,
         "functional_region_elapsed_ms": None,
         "template_elapsed_ms": None,
@@ -2061,6 +2483,10 @@ def extract_tender_compliance_objects(
         "supplemental_material_elapsed_ms": None,
         "applicability_elapsed_ms": None,
         "parsed_blocks": 0,
+        "parsed_block_counts": {},
+        "parsed_heading_levels": [],
+        "parsed_blocks_with_metadata": 0,
+        "parsed_metadata_keys": [],
         "functional_regions": 0,
         "template_count": 0,
         "project_requirement_count": 0,
@@ -2144,6 +2570,12 @@ def extract_tender_compliance_objects(
         if _valid_object_result(cached):
             result: TenderExtractionResult = cached
             stats["cache_hit"] = True
+            stats["parser_execution_source"] = "result_cache"
+            descriptor = getattr(active_parser, "cache_descriptor", None)
+            if callable(descriptor):
+                descriptor = descriptor()
+            if isinstance(descriptor, dict):
+                stats["parser_transport"] = descriptor.get("transport")
             stats["template_count"] = len(result["templates"])
             stats["project_requirement_count"] = len(result["project_requirements"])
             stats["supplemental_material_count"] = len(result["supplemental_materials"])
@@ -2180,11 +2612,30 @@ def extract_tender_compliance_objects(
         if parsed_cache_blocks is not None:
             blocks = parsed_cache_blocks
             stats["parser_cache_hit"] = True
+            stats["parser_execution_source"] = "parser_cache"
+            descriptor = getattr(active_parser, "cache_descriptor", None)
+            if callable(descriptor):
+                descriptor = descriptor()
+            if isinstance(descriptor, dict):
+                stats["parser_transport"] = descriptor.get("transport")
             record_event("document.parse.cache_hit", blocks=len(blocks))
         else:
             parser_started_at = time.perf_counter()
             blocks = active_parser.parse(path)
             stats["parser_elapsed_ms"] = _elapsed_ms(parser_started_at)
+            diagnostics = getattr(active_parser, "parse_diagnostics", {})
+            if isinstance(diagnostics, dict):
+                stats["actual_parser"] = diagnostics.get(
+                    "parser", stats["actual_parser"]
+                )
+                stats["parser_transport"] = diagnostics.get(
+                    "service_protocol", stats["parser_transport"]
+                )
+                stats["mineru_called"] = bool(diagnostics.get("mineru_called"))
+                stats["mineru_call_elapsed_ms"] = diagnostics.get(
+                    "elapsed_ms", stats["parser_elapsed_ms"]
+                )
+            stats["parser_execution_source"] = "parse"
             if parser_cache is not None:
                 parser_cache.set(
                     _parsed_document_cache_key(path, active_parser),
@@ -2192,11 +2643,14 @@ def extract_tender_compliance_objects(
                 )
             record_event(
                 "document.parse.end",
-                parser=type(active_parser).__name__,
+                parser=stats["actual_parser"],
+                parser_transport=stats["parser_transport"],
+                mineru_called=stats["mineru_called"],
                 blocks=len(blocks),
                 elapsed_ms=stats["parser_elapsed_ms"],
             )
         stats["parsed_blocks"] = len(blocks)
+        stats.update(_block_structure_stats(blocks))
         persist_artifact("01_parsed_blocks.json", {"blocks": _serialize_blocks(blocks)})
 
         region_started_at = time.perf_counter()

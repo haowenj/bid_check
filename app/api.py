@@ -55,7 +55,16 @@ def build_default_workflow(
     settings: Settings,
     repository: BidCheckRepository,
 ) -> BidCheckWorkflow:
-    parser = MinerUDocumentParser(settings.mineru_command)
+    parser = MinerUDocumentParser(
+        settings.mineru_command,
+        mineru_url=settings.mineru_url,
+        mineru_api_key=settings.mineru_api_key,
+        mineru_backend=settings.mineru_backend,
+        mineru_server_url=settings.mineru_server_url,
+        timeout_seconds=settings.mineru_timeout_seconds,
+        poll_interval_seconds=settings.mineru_poll_interval_seconds,
+        allow_docx_fallback=settings.allow_docx_fallback,
+    )
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
     parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
     if settings.llm_api_key:
@@ -80,12 +89,18 @@ def build_default_workflow(
                 max_batches=settings.compliance_max_batches,
             )
         except ComplianceExtractionError:
-            # Older API fixtures used non-DOCX byte stubs. Keep those fixtures
-            # runnable without allowing malformed uploaded packages to masquerade
-            # as extracted requirements in normal DOCX requests.
-            if not zipfile.is_zipfile(file_metadata.storage_path):
+            # Only an explicitly enabled development/test fallback may keep
+            # historical byte-stub fixtures runnable.  Normal business
+            # settings always propagate MinerU errors to the failed task.
+            if (
+                settings.allow_docx_fallback
+                and parser.parser_name == "docx_fallback"
+                and not zipfile.is_zipfile(
+                    file_metadata.storage_path
+                )
+            ):
                 logger.warning(
-                    "tender_objects.compatibility_fallback file=%s reason=non_docx_fixture",
+                    "tender_objects.compatibility_fallback file=%s parser=docx_fallback reason=non_docx_fixture",
                     file_metadata.filename,
                 )
                 return deepcopy(empty_tender_extraction_result())

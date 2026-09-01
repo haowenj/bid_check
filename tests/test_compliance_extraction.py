@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
+import zipfile
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+import httpx
 
 import app.compliance_extraction as extraction_module
 from app.compliance_artifacts import ComplianceExtractionRecorder
@@ -672,3 +675,125 @@ def test_parse_docx_recovers_order_and_table_as_structured_blocks(tmp_path):
     assert [item.type for item in blocks] == ["heading", "paragraph", "table"]
     assert blocks[0].section == "响应文件格式"
     assert blocks[2].text == "字段 | 填写"
+
+
+def test_mineru_parser_requires_real_mineru_by_default(tmp_path):
+    path = tmp_path / "tender.docx"
+    path.write_bytes(b"not-a-docx")
+
+    parser = extraction_module.MinerUDocumentParser(
+        command="",
+        mineru_url="",
+        allow_docx_fallback=False,
+    )
+
+    with pytest.raises(ComplianceExtractionError, match="MinerU"):
+        parser.parse(path)
+
+    assert parser.parser_name == "mineru"
+    assert parser.parse_diagnostics["mineru_called"] is False
+
+
+def test_docx_fallback_is_explicit_and_is_not_called_as_mineru(tmp_path):
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:r><w:t>正文</w:t></w:r></w:p></w:body></w:document>"
+    ).encode()
+    path = tmp_path / "tender.docx"
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+
+    parser = extraction_module.MinerUDocumentParser(
+        command="",
+        mineru_url="",
+        allow_docx_fallback=True,
+    )
+    blocks = parser.parse(path)
+
+    assert blocks[0].text == "正文"
+    assert parser.parser_name == "docx_fallback"
+    assert parser.parse_diagnostics["mineru_called"] is False
+
+
+def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metadata(tmp_path):
+    path = tmp_path / "tender.docx"
+    path.write_bytes(b"document bytes")
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "result_content_list.json",
+            json.dumps(
+                [
+                    {"type": "text", "text": "第一章 投标文件格式", "text_level": 1, "page_idx": 0},
+                    {"type": "text", "text": "投标函", "text_level": 2, "page_idx": 0},
+                    {"type": "text", "text": "投标人名称：____", "page_idx": 0},
+                    {"type": "table", "table_body": "<table><tr><td>字段</td></tr></table>", "page_idx": 0},
+                    {"type": "image", "img_path": "images/001.jpg", "page_idx": 0},
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/tasks":
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": "task-1",
+                    "status_url": "https://mineru.example/tasks/task-1",
+                    "result_url": "https://mineru.example/tasks/task-1/result",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                content=archive_bytes.getvalue(),
+                headers={"content-type": "application/zip"},
+            )
+        if request.method == "GET" and request.url.path.endswith("task-1"):
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = extraction_module.MinerUDocumentParser(
+        command="",
+        mineru_url="https://mineru.example",
+        mineru_backend="hybrid-engine",
+        http_client=client,
+        poll_interval_seconds=0,
+    )
+    blocks = parser.parse(path)
+
+    assert [block.type for block in blocks] == [
+        "heading",
+        "heading",
+        "paragraph",
+        "table",
+        "image",
+    ]
+    assert blocks[0].metadata["text_level"] == 1
+    assert blocks[3].text.startswith("<table>")
+    assert blocks[4].metadata["img_path"] == "images/001.jpg"
+    assert parser.parser_name == "mineru"
+    assert parser.parse_diagnostics["mineru_called"] is True
+    assert parser.parse_diagnostics["service_protocol"] == "pdf_trans_tasks"
+    client.close()
+
+
+def test_parse_cache_key_distinguishes_mineru_from_explicit_docx_fallback(tmp_path):
+    path = tmp_path / "tender.docx"
+    path.write_bytes(b"same bytes")
+    mineru = extraction_module.MinerUDocumentParser(
+        command="",
+        mineru_url="https://mineru.example",
+    )
+    fallback = extraction_module.MinerUDocumentParser(
+        command="",
+        mineru_url="",
+        allow_docx_fallback=True,
+    )
+
+    assert extraction_module._parsed_document_cache_key(path, mineru) != (
+        extraction_module._parsed_document_cache_key(path, fallback)
+    )

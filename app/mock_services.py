@@ -7,6 +7,7 @@ from typing import Any
 
 from app.compliance_extraction import (
     ComplianceExtractionError,
+    MinerUDocumentParser,
     extract_tender_compliance_objects,
 )
 from app.models import FileMetadata
@@ -30,7 +31,14 @@ def extract_tender_objects(
         raise FileNotFoundError(source_path)
     time.sleep(delay_seconds)
     try:
-        return extract_tender_compliance_objects(tender_file)
+        return extract_tender_compliance_objects(
+            tender_file,
+            parser=MinerUDocumentParser(
+                command="",
+                mineru_url="",
+                allow_docx_fallback=True,
+            ),
+        )
     except ComplianceExtractionError:
         # Keep historical byte-stub fixtures usable; real DOCX packages never
         # enter this compatibility branch.
