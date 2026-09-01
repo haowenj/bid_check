@@ -18,6 +18,7 @@ from app.compliance_extraction import (
     StructuredBlock,
     build_candidate_batches,
     extract_compliance_requirements_real,
+    extract_templates_from_regions,
     identify_functional_regions,
     parse_docx_document,
     select_compliance_candidates,
@@ -145,6 +146,112 @@ def test_functional_region_type_keeps_source_order_and_blocks():
         "text",
         "order",
     }
+
+
+def test_template_extraction_keeps_one_complete_object_across_contiguous_blocks():
+    blocks = [
+        StructuredBlock(
+            "b0100",
+            "heading",
+            "附件 商务投标文件格式",
+            "附件 商务投标文件格式",
+            100,
+        ),
+        StructuredBlock(
+            "b0101",
+            "heading",
+            "一、法定代表人身份证明（格式）",
+            "附件 商务投标文件格式",
+            101,
+        ),
+        StructuredBlock(
+            "b0102",
+            "paragraph",
+            "姓名：____ 性别：____ 年龄：____ 职务：____",
+            "附件 商务投标文件格式",
+            102,
+        ),
+        StructuredBlock(
+            "b0103",
+            "table",
+            "投标人名称 | ____\n身份证附件 | 国徽面、人像面",
+            "附件 商务投标文件格式",
+            103,
+            metadata={"rows": 2},
+        ),
+        StructuredBlock(
+            "b0104",
+            "paragraph",
+            "附：身份证正反面扫描件。",
+            "附件 商务投标文件格式",
+            104,
+        ),
+        StructuredBlock(
+            "b0105",
+            "heading",
+            "二、授权委托书",
+            "附件 商务投标文件格式",
+            105,
+        ),
+        StructuredBlock(
+            "b0106",
+            "paragraph",
+            "委托代理人姓名：____，附授权委托书。",
+            "附件 商务投标文件格式",
+            106,
+        ),
+    ]
+
+    regions = identify_functional_regions(blocks)
+    templates = extract_templates_from_regions(regions)
+
+    assert [template["name"] for template in templates] == [
+        "法定代表人身份证明",
+        "授权委托书",
+    ]
+    first = templates[0]
+    assert first["block_ids"] == ["b0101", "b0102", "b0103", "b0104"]
+    assert first["section"] == "附件 商务投标文件格式"
+    assert "姓名：____" in first["body"]
+    assert first["tables"] == [
+        {
+            "block_id": "b0103",
+            "text": "投标人名称 | ____\n身份证附件 | 国徽面、人像面",
+            "metadata": {"rows": 2},
+        }
+    ]
+    assert {"姓名", "性别", "年龄", "职务", "投标人名称"} <= set(first["fields"])
+    assert "身份证正反面扫描件" in first["attachments"]
+    assert first["source"] == {
+        "section": "附件 商务投标文件格式",
+        "block_ids": ["b0101", "b0102", "b0103", "b0104"],
+        "source_text": "\n".join(block.text for block in blocks[1:5]),
+    }
+
+
+def test_template_extraction_does_not_create_rule_per_block():
+    blocks = [
+        StructuredBlock(
+            "b0200", "heading", "第九章 投标文件模板", "第九章 投标文件模板", 200
+        ),
+        StructuredBlock(
+            "b0201", "heading", "投标函", "第九章 投标文件模板", 201
+        ),
+        StructuredBlock(
+            "b0202", "paragraph", "项目名称：____", "第九章 投标文件模板", 202
+        ),
+        StructuredBlock(
+            "b0203", "paragraph", "投标人名称：____", "第九章 投标文件模板", 203
+        ),
+    ]
+
+    templates = extract_templates_from_regions(identify_functional_regions(blocks))
+
+    assert len(templates) == 1
+    assert templates[0]["name"] == "投标函"
+    assert templates[0]["block_ids"] == ["b0201", "b0202", "b0203"]
+    assert "项目名称：____" in templates[0]["body"]
+    assert "投标人名称：____" in templates[0]["body"]
 
 
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:

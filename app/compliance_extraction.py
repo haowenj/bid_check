@@ -22,7 +22,7 @@ from xml.etree import ElementTree
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
-from app.models import FileMetadata, TenderRequirement
+from app.models import FileMetadata, TenderRequirement, TenderTemplate
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 # Keep the old import name as a data-only compatibility alias.  The former
@@ -530,6 +530,140 @@ def identify_functional_regions(
 
     flush()
     return regions
+
+
+_TEMPLATE_ITEM_NAME_RE = re.compile(
+    r"封面|投标函|响应函|法定代表人身份证明|身份证明|授权委托书|"
+    r"廉洁承诺|关联关系|诉讼仲裁|基本账户|账户信息|业绩情况|业绩表|"
+    r"知识产权|安全承诺|资格审查|报价表|情况表|声明|承诺函"
+)
+_TEMPLATE_NUMBER_PREFIX_RE = re.compile(
+    r"^\s*(?:[一二三四五六七八九十百千万0-9]+[、.)．]|\([一二三四五六七八九十百千万0-9]+\))\s*"
+)
+_TEMPLATE_FORMAT_SUFFIX_RE = re.compile(r"\s*[（(](?:格式|范本|样式)[）)]\s*$")
+_TEMPLATE_FIELD_RE = re.compile(
+    r"(?<![\w])([^\s：:|,，。；;]{1,20})\s*[：:]\s*(?=_{2,}|[…·.]{2,}|（|\(|\[|$)"
+)
+_TABLE_FIELD_RE = re.compile(
+    r"(?:^|\n|\|)\s*([^|\n：:]{1,20})\s*\|\s*(?=_{2,}|[…·.]{2,}|$)"
+)
+_ATTACHMENT_RE = re.compile(
+    r"(?:附|附件|须附|应附)[：:\s]*(.+?)(?=[。；;\n]|$)"
+)
+
+
+def _template_name(value: str) -> str:
+    name = _TEMPLATE_NUMBER_PREFIX_RE.sub("", value.strip())
+    name = _TEMPLATE_FORMAT_SUFFIX_RE.sub("", name).strip()
+    return name.strip(" ：:。；;") or "投标文件模板"
+
+
+def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) -> bool:
+    if block.block_id == region.block_ids[0] or block.text.strip() == region.title.strip():
+        return False
+    if block.type != "heading":
+        return False
+    name = _template_name(block.text)
+    if _functional_region_kind(name) is not None:
+        return False
+    return bool(_TEMPLATE_ITEM_NAME_RE.search(name))
+
+
+def _template_fields(blocks: Sequence[StructuredBlock]) -> list[str]:
+    fields: list[str] = []
+    for block in blocks:
+        for pattern in (_TEMPLATE_FIELD_RE, _TABLE_FIELD_RE):
+            for match in pattern.finditer(block.text):
+                field = match.group(1).strip(" \t：:|")
+                if field and field not in fields:
+                    fields.append(field)
+    return fields
+
+
+def _template_attachments(blocks: Sequence[StructuredBlock]) -> list[str]:
+    attachments: list[str] = []
+    for block in blocks:
+        for match in _ATTACHMENT_RE.finditer(block.text):
+            attachment = match.group(1).strip(" \t。；;")
+            if attachment and attachment not in attachments:
+                attachments.append(attachment)
+    return attachments
+
+
+def _template_from_blocks(
+    *,
+    region: FunctionalRegion,
+    name: str,
+    blocks: Sequence[StructuredBlock],
+    index: int,
+) -> TenderTemplate:
+    source_blocks = list(blocks)
+    block_ids = [block.block_id for block in source_blocks]
+    source_text = "\n".join(block.text for block in source_blocks)
+    return {
+        "id": f"tender_template_{index:03d}",
+        "name": _template_name(name),
+        "section": region.section,
+        "block_ids": block_ids,
+        "body": source_text,
+        "tables": [
+            {
+                "block_id": block.block_id,
+                "text": block.text,
+                "metadata": dict(block.metadata),
+            }
+            for block in source_blocks
+            if block.type == "table"
+        ],
+        "fields": _template_fields(source_blocks),
+        "attachments": _template_attachments(source_blocks),
+        "source": {
+            "section": region.section,
+            "block_ids": block_ids,
+            "source_text": source_text,
+        },
+    }
+
+
+def extract_templates_from_regions(
+    regions: Sequence[FunctionalRegion],
+) -> list[TenderTemplate]:
+    """Build complete template objects from template regions."""
+
+    templates: list[TenderTemplate] = []
+    for region in regions:
+        if region.kind != "templates":
+            continue
+        item_indexes = [
+            index
+            for index, block in enumerate(region.blocks)
+            if _is_template_item_title(block, region)
+        ]
+        if not item_indexes:
+            content_blocks = region.blocks[1:] or region.blocks
+            templates.append(
+                _template_from_blocks(
+                    region=region,
+                    name=region.title,
+                    blocks=content_blocks,
+                    index=len(templates) + 1,
+                )
+            )
+            continue
+        if item_indexes[0] > 1:
+            item_indexes[0] = 1
+        for item_number, start in enumerate(item_indexes):
+            end = item_indexes[item_number + 1] if item_number + 1 < len(item_indexes) else len(region.blocks)
+            template_blocks = region.blocks[start:end]
+            templates.append(
+                _template_from_blocks(
+                    region=region,
+                    name=template_blocks[0].text,
+                    blocks=template_blocks,
+                    index=len(templates) + 1,
+                )
+            )
+    return templates
 
 
 _EXCLUDED_RE = re.compile(
