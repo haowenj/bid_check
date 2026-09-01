@@ -318,3 +318,122 @@ def test_merge_items_does_not_cross_document_boundaries(items):
 
     assert merged == items
     assert logs == []
+
+
+def test_structure_content_list_keeps_sections_tables_images_and_sources():
+    from app.bid_document import structure_content_list
+
+    items = [
+        _source_item(
+            "title",
+            "第一章 总则",
+            raw_index=0,
+            page_idx=0,
+            bbox=[10, 20, 500, 50],
+            text_level=1,
+        ),
+        _source_item(
+            "paragraph",
+            "投标文件说明。",
+            raw_index=1,
+            page_idx=0,
+            bbox=[10, 60, 500, 100],
+        ),
+        _source_item(
+            "title",
+            "1.1 投标说明",
+            raw_index=2,
+            page_idx=0,
+            bbox=[10, 110, 500, 140],
+            text_level=2,
+        ),
+        _source_item(
+            "paragraph",
+            "本节正文。",
+            raw_index=3,
+            page_idx=0,
+            bbox=[10, 150, 500, 190],
+        ),
+        _source_item(
+            "table",
+            "",
+            raw_index=4,
+            page_idx=1,
+            bbox=[10, 20, 500, 180],
+            table_body=(
+                "<table><tr><th>材料</th><th>状态</th></tr>"
+                "<tr><td>营业执照</td><td>已提供</td></tr></table>"
+            ),
+            table_caption="资格材料表",
+        ),
+        _source_item(
+            "image",
+            "身份证扫描件",
+            raw_index=5,
+            page_idx=1,
+            bbox=[10, 200, 500, 600],
+            img_path="images/id-card.jpg",
+        ),
+        _source_item(
+            "footer",
+            "页脚中的业务备注",
+            raw_index=6,
+            page_idx=1,
+            bbox=[10, 850, 500, 880],
+        ),
+    ]
+
+    document = structure_content_list(
+        items,
+        source_filename="bid.docx",
+        source_sha256="abc123",
+        parser_diagnostics={"parser": "fixture"},
+    )
+
+    assert document["schema_version"] == "bid-document-v1"
+    assert document["source"] == {
+        "filename": "bid.docx",
+        "sha256": "abc123",
+    }
+    assert [block["type"] for block in document["blocks"]] == [
+        "heading",
+        "paragraph",
+        "heading",
+        "paragraph",
+        "table",
+        "image",
+        "paragraph",
+    ]
+    assert document["stats"] == {
+        "block_count": 7,
+        "block_type_counts": {
+            "heading": 2,
+            "paragraph": 3,
+            "table": 1,
+            "image": 1,
+        },
+        "section_count": 2,
+        "table_count": 1,
+        "image_count": 1,
+        "page_count": 2,
+        "unsupported_item_count": 0,
+    }
+    assert document["blocks"][1]["section"] == "第一章 总则"
+    assert document["blocks"][1]["metadata"]["section_path"] == ["第一章 总则"]
+    assert document["blocks"][3]["section"] == "1.1 投标说明"
+    assert document["blocks"][3]["metadata"]["section_path"] == [
+        "第一章 总则",
+        "1.1 投标说明",
+    ]
+    assert document["blocks"][4]["metadata"]["source_item_indices"] == [4]
+    assert document["tables"][0]["block_id"] == document["blocks"][4]["block_id"]
+    assert document["tables"][0]["rows"] == [
+        ["材料", "状态"],
+        ["营业执照", "已提供"],
+    ]
+    assert document["images"][0]["img_path"] == "images/id-card.jpg"
+    assert document["images"][0]["section_path"] == [
+        "第一章 总则",
+        "1.1 投标说明",
+    ]
+    assert document["images"][0]["source"]["raw_item_index"] == 5

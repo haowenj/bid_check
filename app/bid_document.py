@@ -4,6 +4,8 @@ import copy
 import re
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import asdict
+from html.parser import HTMLParser
 from typing import Any
 
 
@@ -440,3 +442,313 @@ def merge_items(items: Sequence[Any]) -> tuple[list[Any], list[dict[str, Any]]]:
         index = next_index if next_index > index + 1 else index + 1
 
     return merged_items, logs
+
+
+class _TableStructureParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "tr":
+            if self._row is not None and self._row:
+                self.rows.append(self._row)
+            self._row = []
+        elif tag in {"td", "th"}:
+            if self._row is None:
+                self._row = []
+            if self._cell is not None:
+                self._row.append("".join(self._cell).strip())
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"td", "th"}:
+            if self._row is None:
+                self._row = []
+            self._row.append("".join(self._cell or []).strip())
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._cell is not None:
+                self._row.append("".join(self._cell).strip())
+                self._cell = None
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _table_rows(table_body: Any) -> list[list[str]]:
+    if not isinstance(table_body, str) or not table_body.strip():
+        return []
+    parser = _TableStructureParser()
+    try:
+        parser.feed(table_body)
+        parser.close()
+    except (TypeError, ValueError):
+        return []
+    if parser._row:
+        if parser._cell is not None:
+            parser._row.append("".join(parser._cell).strip())
+        parser.rows.append(parser._row)
+    return parser.rows
+
+
+def _structure_source(item: dict[str, Any], position: int) -> dict[str, Any]:
+    source = item.get(_SOURCE_KEY)
+    source_ref = copy.deepcopy(source) if isinstance(source, dict) else {}
+    raw_index = source_ref.get("raw_item_index", position)
+    source_ref.setdefault("raw_item_index", raw_index)
+    source_ref.setdefault("source_path", [position])
+    return source_ref
+
+
+def _source_lists(
+    item: dict[str, Any], source: dict[str, Any]
+) -> tuple[list[Any], list[Any], list[Any]]:
+    source_item_indices = item.get("source_item_indices")
+    if not isinstance(source_item_indices, list):
+        source_item_indices = [source.get("raw_item_index")]
+    source_page_indices = item.get("source_page_indices")
+    if not isinstance(source_page_indices, list):
+        page_idx = item.get("page_idx")
+        source_page_indices = [page_idx] if type(page_idx) is int else []
+    source_bboxes = item.get("source_bboxes")
+    if not isinstance(source_bboxes, list):
+        source_bboxes = (
+            [copy.deepcopy(item.get("bbox"))]
+            if item.get("bbox") is not None
+            else []
+        )
+    return (
+        copy.deepcopy(source_item_indices),
+        copy.deepcopy(source_page_indices),
+        copy.deepcopy(source_bboxes),
+    )
+
+
+def _structure_level(item: dict[str, Any], kind: str) -> int | None:
+    level = _block_level(item)
+    if kind == "heading":
+        return level or 1
+    return level
+
+
+def _structure_kind(item: dict[str, Any]) -> tuple[str, int | None]:
+    raw_type = _item_type(item) or "paragraph"
+    level = _block_level(item)
+    if raw_type in {"title", "heading", "header"} or (
+        raw_type in {"text", "paragraph"} and level is not None
+    ):
+        return "heading", level or 1
+    if raw_type == "table":
+        return "table", None
+    if raw_type in {"image", "figure"}:
+        return "image", None
+    return "paragraph", None
+
+
+def _structure_text(item: dict[str, Any], kind: str) -> str:
+    if kind == "table":
+        values = (item.get("table_body"), item.get("text"), item.get("html"))
+    else:
+        values = (item.get("text"), item.get("caption"), item.get("alt"))
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if kind == "table":
+        return "[MinerU table]"
+    if kind == "image":
+        return "[MinerU image]"
+    return ""
+
+
+def _unique_block_id(item: dict[str, Any], order: int, used: set[str]) -> str:
+    candidate = item.get("block_id", item.get("id"))
+    block_id = str(candidate) if candidate is not None and str(candidate) else f"b{order:04d}"
+    if block_id in used:
+        suffix = 2
+        while f"{block_id}_{suffix}" in used:
+            suffix += 1
+        block_id = f"{block_id}_{suffix}"
+    used.add(block_id)
+    return block_id
+
+
+def structure_content_list(
+    items: Sequence[Any],
+    *,
+    source_filename: str,
+    source_sha256: str | None = None,
+    parser_diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build section-aware blocks while retaining tables/images separately.
+
+    ``items`` is expected to be the cleaned and optionally cross-page-merged
+    list. The returned JSON-compatible object is deliberately independent from
+    compliance checks, template matching, and retrieval indexes.
+    """
+
+    from app.compliance_extraction import StructuredBlock
+
+    blocks: list[StructuredBlock] = []
+    sections: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
+    images: list[dict[str, Any]] = []
+    unsupported_items: list[dict[str, Any]] = []
+    section_stack: list[dict[str, Any]] = []
+    used_block_ids: set[str] = set()
+
+    for position, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            unsupported_items.append(
+                {"position": position, "item": copy.deepcopy(raw)}
+            )
+            continue
+
+        kind, heading_level = _structure_kind(raw)
+        text = _structure_text(raw, kind)
+        if not text and kind == "paragraph":
+            unsupported_items.append(
+                {"position": position, "item": copy.deepcopy(raw), "reason": "no_text"}
+            )
+            continue
+
+        order = len(blocks) + 1
+        block_id = _unique_block_id(raw, order, used_block_ids)
+        source = _structure_source(raw, position)
+        source_item_indices, source_page_indices, source_bboxes = _source_lists(
+            raw, source
+        )
+
+        if kind == "heading":
+            level = heading_level or 1
+            while section_stack and section_stack[-1]["level"] >= level:
+                section_stack.pop()
+            parent = section_stack[-1] if section_stack else None
+            section = {
+                "section_id": f"s{len(sections) + 1:04d}",
+                "parent_section_id": parent["section_id"] if parent else None,
+                "level": level,
+                "title": text,
+                "path": [
+                    *(parent["path"] if parent else []),
+                    text,
+                ],
+                "start_order": order,
+                "end_order": order,
+                "block_ids": [],
+                "direct_block_ids": [],
+            }
+            sections.append(section)
+            section_stack.append(section)
+
+        current_section = section_stack[-1] if section_stack else None
+        section_path = [section["title"] for section in section_stack]
+        section_name = current_section["title"] if current_section else ""
+
+        for section in section_stack:
+            section["block_ids"].append(block_id)
+            section["end_order"] = order
+        if current_section is not None:
+            current_section["direct_block_ids"].append(block_id)
+
+        metadata: dict[str, Any] = {
+            "mineru_raw_type": _item_type(raw) or "paragraph",
+            "mineru_source_index": source.get("raw_item_index"),
+            "mineru_source": copy.deepcopy(source),
+            "source_item_indices": source_item_indices,
+            "source_page_indices": source_page_indices,
+            "source_bboxes": source_bboxes,
+            "source_paths": copy.deepcopy(raw.get("source_paths", [source["source_path"]])),
+            "section_id": current_section["section_id"] if current_section else None,
+            "section_path": section_path,
+            "mineru_item": copy.deepcopy(raw),
+        }
+        for key, value in raw.items():
+            if key not in {"type", "block_type", "text", _SOURCE_KEY}:
+                metadata.setdefault(key, copy.deepcopy(value))
+
+        block = StructuredBlock(
+            block_id=block_id,
+            type=kind,  # type: ignore[arg-type]
+            text=text,
+            section=section_name,
+            order=order,
+            metadata=metadata,
+            heading_level=heading_level if kind == "heading" else None,
+        )
+        blocks.append(block)
+
+        common = {
+            "block_id": block_id,
+            "section_id": current_section["section_id"] if current_section else None,
+            "section_path": section_path,
+            "order": order,
+            "page_idx": raw.get("page_idx"),
+            "bbox": copy.deepcopy(raw.get("bbox")),
+            "source": copy.deepcopy(source),
+            "source_item_indices": source_item_indices,
+            "source_page_indices": source_page_indices,
+            "source_bboxes": source_bboxes,
+        }
+        if kind == "table":
+            table_body = raw.get("table_body", raw.get("html", text))
+            tables.append(
+                {
+                    "table_id": f"t{len(tables) + 1:04d}",
+                    **common,
+                    "table_body": table_body if isinstance(table_body, str) else "",
+                    "rows": _table_rows(table_body),
+                    "caption": raw.get("table_caption", raw.get("caption")),
+                }
+            )
+        elif kind == "image":
+            images.append(
+                {
+                    "image_id": f"i{len(images) + 1:04d}",
+                    **common,
+                    "img_path": raw.get("img_path"),
+                    "caption": text if not text.startswith("[MinerU ") else "",
+                }
+            )
+
+    block_dicts = [asdict(block) for block in blocks]
+    page_indices = {
+        page
+        for block in blocks
+        for page in block.metadata.get("source_page_indices", [])
+        if type(page) is int
+    }
+    type_counts = {kind: 0 for kind in ("heading", "paragraph", "table", "image")}
+    for block in blocks:
+        type_counts[block.type] += 1
+
+    return {
+        "schema_version": "bid-document-v1",
+        "source": {
+            "filename": str(source_filename),
+            "sha256": source_sha256,
+        },
+        "diagnostics": copy.deepcopy(parser_diagnostics or {}),
+        "blocks": block_dicts,
+        "sections": sections,
+        "tables": tables,
+        "images": images,
+        "unsupported_items": unsupported_items,
+        "stats": {
+            "block_count": len(blocks),
+            "block_type_counts": type_counts,
+            "section_count": len(sections),
+            "table_count": len(tables),
+            "image_count": len(images),
+            "page_count": len(page_indices),
+            "unsupported_item_count": len(unsupported_items),
+        },
+    }
