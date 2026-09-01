@@ -1,6 +1,6 @@
 # 标书检查
 
-新版“标书检查”Web 工作流。招标文件提取链路以投标文件模板为主要检查对象，并保留少量项目专用编制要求和模板外证明材料；投标文件解析与真实合规审查仍为模拟实现。
+新版“标书检查”Web 工作流。招标文件提取链路以投标文件模板为主要检查对象，并保留少量项目专用编制要求和模板外证明材料；投标文件目前先执行 MinerU 结果清洗与结构整理，真实合规审查仍未启用。
 
 ## 启动
 
@@ -28,7 +28,8 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 - 配置 `LLM_API_KEY` 后，仅在模板边界、模板命名或前附表行存在歧义时使用 OpenAI-compatible Chat Completions；否则使用确定性的结构提取；
 - MinerU/结构解析结果和三类提取结果分别按招标文件内容哈希缓存；
 - 结果页展示完整模板、项目专用编制要求和模板外补充证明材料；
-- 投标文件解析和合规性检查仍为模拟实现，不判断通过、不通过、得分或废标风险。
+- 投标文件清洗阶段已接入真实 MinerU `/tasks` 结果：保留原始 content list、清洗日志、跨页合并日志、章节结构、独立表格和独立图片索引；本阶段不执行模板匹配、附件/字段校验、RAG、LLM 判断、签字盖章识别或最终检查规则。
+- 合规性检查仍为模拟实现，不判断通过、不通过、得分或废标风险。
 
 ## 真实要求提取配置
 
@@ -44,6 +45,24 @@ MinerU 使用项目既有服务配置：
 - `COMPLIANCE_MAX_BATCHES`：候选批次数，范围 1–10，默认 8。
 
 MinerU 未配置、调用失败或结果无法解析时，任务会失败并保留错误原因；不会切换到其他解析器。未配置 LLM 时，系统使用确定性、来源受限的本地对象提取器。解析摘要和执行日志会记录实际解析器（`mineru`）、传输协议、是否真实调用 MinerU、耗时和结构统计。
+
+## 投标文件清洗产物
+
+投标文件解析成功后，在投标文件所在任务目录生成 `bid_document_cleaning/`：
+
+- `raw_content_list.json`：从 MinerU ZIP 原样复制的 content list 字节；
+- `cleaned_content_list.json`、`cleaning_log.json`：仅移除确定性的页码、页眉、空白块和单标点噪声，并逐项记录来源；
+- `merged_content_list.json`、`merge_log.json`：只合并跨连续页、位于页边缘且正文未完结的相邻段落；保留参与合并的原始索引、页码、bbox 和 source path；
+- `structured_document.json`：包含 `blocks[]`、`sections[]`、`tables[]`、`images[]` 和 `unsupported_items[]`。表格不拍平为普通正文，图片保留 `img_path`、资源状态、章节路径和来源关系；
+- `cleaning_summary.json`：记录源文件 SHA-256、各阶段数量、页/章节/表格/图片统计和 artifact 路径。
+
+也可单独运行清洗器，便于人工检查数据质量：
+
+```bash
+uv run python -m app.bid_document \
+  data/tasks/<task_id>/bid.docx \
+  --output-dir data/tasks/<task_id>/bid_document_cleaning
+```
 
 ## 处理日志
 

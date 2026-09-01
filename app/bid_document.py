@@ -1276,11 +1276,16 @@ def parse_bid_document(
             timeout_seconds=settings.mineru_timeout_seconds,
             poll_interval_seconds=settings.mineru_poll_interval_seconds,
         )
-    return parser.parse(
+    result = parser.parse(
         source_path,
         output_dir=output_dir
         or source_path.parent / "bid_document_cleaning",
     )
+    if isinstance(result, dict):
+        result["document_name"] = str(
+            getattr(bid_file, "filename", source_path.name)
+        )
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> None:
