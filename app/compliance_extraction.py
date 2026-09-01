@@ -25,6 +25,8 @@ from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import (
     FileMetadata,
     ProjectRequirement,
+    SupplementalMaterial,
+    TenderExtractionResult,
     TenderRequirement,
     TenderTemplate,
 )
@@ -540,7 +542,8 @@ def identify_functional_regions(
 _TEMPLATE_ITEM_NAME_RE = re.compile(
     r"封面|投标函|响应函|法定代表人身份证明|身份证明|授权委托书|"
     r"廉洁承诺|关联关系|诉讼仲裁|基本账户|账户信息|业绩情况|业绩表|"
-    r"知识产权|安全承诺|资格审查|报价表|情况表|声明|承诺函"
+    r"知识产权|安全承诺|资格审查|报价表|情况表|声明|承诺函|"
+    r"保证金|保函|缴纳|纸质|正本|副本|密封|包封"
 )
 _TEMPLATE_NUMBER_PREFIX_RE = re.compile(
     r"^\s*(?:[一二三四五六七八九十百千万0-9]+[、.)．]|\([一二三四五六七八九十百千万0-9]+\))\s*"
@@ -804,6 +807,99 @@ def extract_supplemental_materials_from_regions(
                     }
                 )
     return materials
+
+
+_BID_BOND_TEMPLATE_RE = re.compile(r"保证金|保函|缴纳凭证")
+_PAPER_TEMPLATE_RE = re.compile(r"纸质|正本|副本|密封|包封")
+_NO_BID_BOND_RE = re.compile(r"(?:无需|不需要|免于|免交|不递交).{0,12}保证金")
+_ELECTRONIC_ONLY_RE = re.compile(
+    r"(?:只需|仅需|仅|只).{0,12}(?:上传|递交|提交).{0,16}电子投标文件"
+)
+_PAPER_REQUIRED_RE = re.compile(
+    r"(?:必须|需要|应当|应|提供|递交).{0,8}(?:纸质|正本|副本)"
+)
+
+
+def apply_project_applicability(
+    templates: Sequence[TenderTemplate],
+    project_requirements: Sequence[ProjectRequirement],
+) -> tuple[list[TenderTemplate], list[dict[str, Any]]]:
+    """Apply only explicit project-specific precedence to generic templates."""
+
+    project_text = "\n".join(
+        f"{item['requirement']} {item.get('value') or ''}"
+        for item in project_requirements
+    )
+    no_bid_bond = bool(_NO_BID_BOND_RE.search(project_text))
+    electronic_only = bool(_ELECTRONIC_ONLY_RE.search(project_text))
+    paper_required = bool(_PAPER_REQUIRED_RE.search(project_text))
+    filtered: list[TenderTemplate] = []
+    report: list[dict[str, Any]] = []
+    for template in templates:
+        searchable = " ".join(
+            [template["name"], template["body"], " ".join(template["attachments"])]
+        )
+        reason: str | None = None
+        if no_bid_bond and _BID_BOND_TEMPLATE_RE.search(searchable):
+            reason = "project_no_bid_bond"
+        elif electronic_only and not paper_required and _PAPER_TEMPLATE_RE.search(searchable):
+            reason = "project_electronic_only"
+        if reason is None:
+            filtered.append(template)
+            continue
+        report.append(
+            {
+                "name": template["name"],
+                "block_ids": list(template["block_ids"]),
+                "source_text": template["source"]["source_text"],
+                "reason": reason,
+            }
+        )
+    return filtered, report
+
+
+def _normalize_source(
+    source: Any,
+    block_map: dict[str, StructuredBlock],
+) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        raise ComplianceExtractionError("提取对象来源结构无效。")
+    source_ids = list(dict.fromkeys(source.get("block_ids", [])))
+    if not source_ids or any(block_id not in block_map for block_id in source_ids):
+        raise ComplianceExtractionError("提取对象来源 block_id 不存在。")
+    source_blocks = sorted(
+        (block_map[block_id] for block_id in source_ids),
+        key=lambda block: block.order,
+    )
+    return {
+        "section": source_blocks[0].section,
+        "block_ids": [block.block_id for block in source_blocks],
+        "source_text": "\n".join(block.text for block in source_blocks),
+    }
+
+
+def normalize_tender_extraction_sources(
+    result: TenderExtractionResult,
+    blocks: Sequence[StructuredBlock],
+) -> TenderExtractionResult:
+    """Validate and restore source metadata for all three object collections."""
+
+    block_map = {block.block_id: block for block in blocks}
+    normalized: TenderExtractionResult = {
+        "templates": [],
+        "project_requirements": [],
+        "supplemental_materials": [],
+    }
+    for key in normalized:
+        for raw_item in result.get(key, []):
+            if not isinstance(raw_item, dict):
+                raise ComplianceExtractionError("提取对象不是有效对象。")
+            item = dict(raw_item)
+            item["source"] = _normalize_source(item.get("source"), block_map)
+            if key == "templates":
+                item["block_ids"] = list(item["source"]["block_ids"])
+            normalized[key].append(item)  # type: ignore[arg-type]
+    return normalized
 
 
 _EXCLUDED_RE = re.compile(

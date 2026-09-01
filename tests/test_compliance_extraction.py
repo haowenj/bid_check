@@ -21,7 +21,9 @@ from app.compliance_extraction import (
     extract_project_requirements_from_regions,
     extract_supplemental_materials_from_regions,
     extract_templates_from_regions,
+    apply_project_applicability,
     identify_functional_regions,
+    normalize_tender_extraction_sources,
     parse_docx_document,
     select_compliance_candidates,
 )
@@ -436,6 +438,123 @@ def test_supplemental_material_extraction_excludes_qualifications_and_future_dut
     )
 
     assert materials == []
+
+
+def test_project_applicability_filters_generic_bid_bond_template():
+    blocks = [
+        StructuredBlock(
+            "b0500", "heading", "投标文件格式", "投标文件格式", 500
+        ),
+        StructuredBlock(
+            "b0501", "heading", "投标保证金缴纳证明", "投标文件格式", 501
+        ),
+        StructuredBlock(
+            "b0502", "paragraph", "附投标保证金缴纳凭证。", "投标文件格式", 502
+        ),
+        StructuredBlock(
+            "b0503", "heading", "投标函", "投标文件格式", 503
+        ),
+        StructuredBlock(
+            "b0504", "paragraph", "投标人名称：____", "投标文件格式", 504
+        ),
+        StructuredBlock(
+            "b0505", "heading", "投标人须知前附表", "投标人须知前附表", 505
+        ),
+        StructuredBlock(
+            "b0506", "paragraph", "投标保证金：无需递交投标保证金。", "投标人须知前附表", 506
+        ),
+    ]
+    regions = identify_functional_regions(blocks)
+    templates = extract_templates_from_regions(regions)
+    project_requirements = extract_project_requirements_from_regions(regions)
+
+    filtered, report = apply_project_applicability(templates, project_requirements)
+
+    assert [template["name"] for template in filtered] == ["投标函"]
+    assert len(report) == 1
+    assert report[0]["name"] == "投标保证金缴纳证明"
+    assert report[0]["reason"] == "project_no_bid_bond"
+    assert report[0]["block_ids"] == ["b0501", "b0502"]
+    assert "投标保证金" in report[0]["source_text"]
+
+
+def test_project_applicability_filters_paper_templates_for_electronic_only_bid():
+    blocks = [
+        StructuredBlock(
+            "b0510", "heading", "响应文件格式", "响应文件格式", 510
+        ),
+        StructuredBlock("b0511", "heading", "纸质正本", "响应文件格式", 511),
+        StructuredBlock("b0512", "paragraph", "纸质正本一份。", "响应文件格式", 512),
+        StructuredBlock("b0513", "heading", "密封包装", "响应文件格式", 513),
+        StructuredBlock("b0514", "paragraph", "外层包封并加盖公章。", "响应文件格式", 514),
+        StructuredBlock("b0515", "heading", "响应函", "响应文件格式", 515),
+        StructuredBlock("b0516", "paragraph", "响应人名称：____", "响应文件格式", 516),
+        StructuredBlock(
+            "b0517", "heading", "项目专用表", "项目专用表", 517
+        ),
+        StructuredBlock(
+            "b0518",
+            "paragraph",
+            "只需上传一份加密电子投标文件。",
+            "项目专用表",
+            518,
+        ),
+    ]
+    regions = identify_functional_regions(blocks)
+    templates = extract_templates_from_regions(regions)
+    project_requirements = extract_project_requirements_from_regions(regions)
+
+    filtered, report = apply_project_applicability(templates, project_requirements)
+
+    assert [template["name"] for template in filtered] == ["响应函"]
+    assert {item["reason"] for item in report} == {"project_electronic_only"}
+    assert {item["name"] for item in report} == {"纸质正本", "密封包装"}
+
+
+def test_source_normalization_rejects_unknown_ids_and_restores_original_text():
+    blocks = [
+        StructuredBlock("b0520", "paragraph", "营业执照复印件。", "资格条件", 520),
+        StructuredBlock("b0521", "paragraph", "投标人名称：____", "格式", 521),
+    ]
+    result = {
+        "templates": [],
+        "project_requirements": [
+            {
+                "id": "project_requirement_001",
+                "requirement": "投标人名称应填写。",
+                "value": None,
+                "source": {
+                    "section": "模型伪造章节",
+                    "block_ids": ["b0521"],
+                    "source_text": "模型伪造来源",
+                },
+            }
+        ],
+        "supplemental_materials": [],
+    }
+
+    normalized = normalize_tender_extraction_sources(result, blocks)
+
+    assert normalized["project_requirements"][0]["source"] == {
+        "section": "格式",
+        "block_ids": ["b0521"],
+        "source_text": "投标人名称：____",
+    }
+    invalid = {
+        **result,
+        "project_requirements": [
+            {
+                **result["project_requirements"][0],
+                "source": {
+                    "section": "格式",
+                    "block_ids": ["missing"],
+                    "source_text": "模型伪造来源",
+                },
+            }
+        ],
+    }
+    with pytest.raises(ComplianceExtractionError, match="block_id"):
+        normalize_tender_extraction_sources(invalid, blocks)
 
 
 def make_docx(*paragraphs: tuple[str, str | None]) -> bytes:
