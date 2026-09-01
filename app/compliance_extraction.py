@@ -7,8 +7,6 @@ import logging
 import mimetypes
 import os
 import re
-import shlex
-import subprocess
 import threading
 import time
 import urllib.error
@@ -21,8 +19,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
-from xml.etree import ElementTree
-
 import httpx
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
@@ -34,7 +30,6 @@ from app.models import (
     TenderTemplate,
 )
 
-W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 logger = logging.getLogger(__name__)
 REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Bump the object-result cache when deterministic segmentation or source
@@ -44,7 +39,6 @@ REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v14:{REQUIREMENT_PROMPT_
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v2"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
-DEFAULT_MINERU_URL = "http://127.0.0.1:7100"
 DEFAULT_MINERU_BACKEND = "hybrid-engine"
 SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
 DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
@@ -256,108 +250,6 @@ def _deserialize_blocks(value: Any) -> list[StructuredBlock] | None:
     return blocks
 
 
-def _element_text(element: ElementTree.Element) -> str:
-    return "".join(element.itertext()).replace("\u00a0", " ").strip()
-
-
-def _paragraph_style(paragraph: ElementTree.Element) -> str:
-    style = paragraph.find(f"{W_NS}pPr/{W_NS}pStyle")
-    return (style.get(f"{W_NS}val") if style is not None else "") or ""
-
-
-def _is_heading(text: str, style: str) -> bool:
-    style_lower = style.lower()
-    if style_lower.startswith("heading") or style_lower in {"title", "subtitle"}:
-        return True
-    return bool(
-        re.match(
-            r"^(?:第[一二三四五六七八九十百千万0-9]+[章节部分篇]|附件|投标文件格式)",
-            text,
-        )
-    )
-
-
-def parse_docx_document(path: Path) -> list[StructuredBlock]:
-    """Recover ordered paragraph/table blocks from a DOCX package.
-
-    This parser is intentionally only a development/test fallback.  Normal
-    tender extraction must use the project's MinerU service integration.
-    """
-
-    started_at = time.perf_counter()
-    logger.info("document.parse.start parser=docx file=%s", path.name)
-    try:
-        with zipfile.ZipFile(path) as archive:
-            root = ElementTree.fromstring(archive.read("word/document.xml"))
-    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-        logger.error(
-            "document.parse.error parser=docx file=%s error_type=%s elapsed_ms=%d",
-            path.name,
-            type(exc).__name__,
-            _elapsed_ms(started_at),
-        )
-        raise ComplianceExtractionError(f"无法解析招标文件结构：{path.name}") from exc
-
-    blocks: list[StructuredBlock] = []
-    current_section = ""
-    order = 0
-    body = root.find(f"{W_NS}body")
-    if body is None:
-        logger.info(
-            "document.parse.end parser=docx file=%s blocks=0 elapsed_ms=%d",
-            path.name,
-            _elapsed_ms(started_at),
-        )
-        return blocks
-
-    for child in body:
-        if child.tag == f"{W_NS}p":
-            text = _element_text(child)
-            if not text:
-                continue
-            order += 1
-            kind = (
-                "heading" if _is_heading(text, _paragraph_style(child)) else "paragraph"
-            )
-            if kind == "heading":
-                current_section = text
-            blocks.append(
-                StructuredBlock(
-                    block_id=f"b{order:04d}",
-                    type=kind,
-                    text=text,
-                    section=current_section,
-                    order=order,
-                )
-            )
-        elif child.tag == f"{W_NS}tbl":
-            rows: list[str] = []
-            for row in child.findall(f"{W_NS}tr"):
-                cells = [_element_text(cell) for cell in row.findall(f"{W_NS}tc")]
-                row_text = " | ".join(cell for cell in cells if cell)
-                if row_text:
-                    rows.append(row_text)
-            if rows:
-                order += 1
-                blocks.append(
-                    StructuredBlock(
-                        block_id=f"b{order:04d}",
-                        type="table",
-                        text="\n".join(rows),
-                        section=current_section,
-                        order=order,
-                        metadata={"rows": len(rows)},
-                    )
-                )
-    logger.info(
-        "document.parse.end parser=docx file=%s blocks=%d elapsed_ms=%d",
-        path.name,
-        len(blocks),
-        _elapsed_ms(started_at),
-    )
-    return blocks
-
-
 def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
     """Convert MinerU content-list objects without compiling them into rules."""
     if isinstance(payload, dict):
@@ -452,50 +344,25 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
 
 
 class MinerUDocumentParser:
-    """Use the existing MinerU ``/tasks`` service, with explicit test fallback.
-
-    ``MINERU_COMMAND`` remains a compatibility adapter for an explicitly
-    configured MinerU command.  It is never used as the signal for whether a
-    normal business parse is allowed.  When neither the existing service nor
-    the command adapter is configured, this class fails unless
-    ``allow_docx_fallback`` is explicitly enabled.
-    """
+    """Use the project's MinerU ``/tasks`` service for every document parse."""
 
     def __init__(
         self,
-        command: str | None = None,
-        *,
         mineru_url: str | None = None,
+        *,
         mineru_api_key: str | None = None,
         mineru_backend: str | None = None,
         mineru_server_url: str | None = None,
         timeout_seconds: float = DEFAULT_MINERU_TIMEOUT_SECONDS,
         poll_interval_seconds: float = DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
-        allow_docx_fallback: bool = False,
         http_client: httpx.Client | None = None,
     ):
-        self.command = (
-            command if command is not None else os.getenv("MINERU_COMMAND")
-        )
-        self.mineru_url = (
-            mineru_url
-            if mineru_url is not None
-            else DEFAULT_MINERU_URL
-        )
-        self.mineru_api_key = (
-            mineru_api_key
-            if mineru_api_key is not None
-            else None
-        )
+        self.mineru_url = mineru_url
+        self.mineru_api_key = mineru_api_key
         self.mineru_backend = mineru_backend or DEFAULT_MINERU_BACKEND
-        self.mineru_server_url = (
-            mineru_server_url
-            if mineru_server_url is not None
-            else None
-        )
+        self.mineru_server_url = mineru_server_url
         self.timeout_seconds = float(timeout_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
-        self.allow_docx_fallback = allow_docx_fallback
         self._http_client = http_client
         self.parse_diagnostics: dict[str, Any] = {
             "parser": self.parser_name,
@@ -506,26 +373,18 @@ class MinerUDocumentParser:
 
     @property
     def parser_name(self) -> str:
-        if (self.mineru_url or "").strip() or (self.command or "").strip():
-            return "mineru"
-        return "docx_fallback" if self.allow_docx_fallback else "mineru"
+        return "mineru"
 
     @property
     def cache_descriptor(self) -> dict[str, Any]:
-        if (self.command or "").strip():
-            transport = "command"
-        elif (self.mineru_url or "").strip():
-            transport = "mineru_tasks"
-        else:
-            transport = "docx_fallback"
+        transport = "mineru_tasks"
         return {
             "parser": self.parser_name,
             "transport": transport,
-            "protocol": MINERU_TASKS_PROTOCOL_VERSION if transport == "mineru_tasks" else None,
+            "protocol": MINERU_TASKS_PROTOCOL_VERSION,
             "url": (self.mineru_url or "").strip(),
             "backend": self.mineru_backend,
             "server_url": (self.mineru_server_url or "").strip(),
-            "command": (self.command or "").strip(),
         }
 
     def parse(self, path: Path) -> list[StructuredBlock]:
@@ -536,47 +395,29 @@ class MinerUDocumentParser:
             path.name,
         )
         try:
-            if (self.command or "").strip():
-                blocks = self._parse_with_mineru_command(path)
-            elif (self.mineru_url or "").strip():
+            if (self.mineru_url or "").strip():
                 blocks = self._parse_with_mineru_service(path)
-            elif self.allow_docx_fallback:
-                blocks = parse_docx_document(path)
-                self.parse_diagnostics = {
-                    "parser": "docx_fallback",
-                    "mineru_called": False,
-                    "service_protocol": None,
-                    "elapsed_ms": _elapsed_ms(started_at),
-                }
             else:
                 raise ComplianceExtractionError(
-                    "MinerU 服务未配置，正常业务不允许自动使用 DOCX XML fallback。"
+                    "MinerU 服务未配置，请配置 MINERU_URL。"
                 )
         except ComplianceExtractionError:
             self.parse_diagnostics = {
                 "parser": self.parser_name,
-                "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
-                "service_protocol": (
-                    "command"
-                    if (self.command or "").strip()
-                    else MINERU_TASKS_PROTOCOL_LABEL
-                    if (self.mineru_url or "").strip()
-                    else None
-                ),
+                "mineru_called": False,
+                "service_protocol": MINERU_TASKS_PROTOCOL_LABEL
+                if (self.mineru_url or "").strip()
+                else None,
                 "elapsed_ms": _elapsed_ms(started_at),
             }
             raise
         except Exception as exc:
             self.parse_diagnostics = {
                 "parser": self.parser_name,
-                "mineru_called": bool((self.mineru_url or "").strip() or (self.command or "").strip()),
-                "service_protocol": (
-                    "command"
-                    if (self.command or "").strip()
-                    else MINERU_TASKS_PROTOCOL_LABEL
-                    if (self.mineru_url or "").strip()
-                    else None
-                ),
+                "mineru_called": bool((self.mineru_url or "").strip()),
+                "service_protocol": MINERU_TASKS_PROTOCOL_LABEL
+                if (self.mineru_url or "").strip()
+                else None,
                 "elapsed_ms": _elapsed_ms(started_at),
             }
             raise ComplianceExtractionError(
@@ -590,38 +431,6 @@ class MinerUDocumentParser:
             path.name,
             len(blocks),
             self.parse_diagnostics["elapsed_ms"],
-        )
-        return blocks
-
-    def _parse_with_mineru_command(self, path: Path) -> list[StructuredBlock]:
-        command_text = str(self.command)
-        try:
-            command = [
-                part.format(input=str(path)) for part in shlex.split(command_text)
-            ]
-            if "{input}" not in command_text:
-                command.append(str(path))
-            completed = subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            blocks = _blocks_from_mineru_payload(json.loads(completed.stdout))
-        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-            logger.error(
-                "document.parse.dispatch.error parser=mineru transport=command file=%s error_type=%s",
-                path.name,
-                type(exc).__name__,
-            )
-            raise ComplianceExtractionError("MinerU 命令解析失败。") from exc
-        self.parse_diagnostics.update(
-            {
-                "parser": "mineru",
-                "mineru_called": True,
-                "service_protocol": "command",
-            }
         )
         return blocks
 

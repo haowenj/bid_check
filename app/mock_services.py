@@ -1,15 +1,9 @@
 from __future__ import annotations
 
 import time
-import zipfile
 from pathlib import Path
 from typing import Any
 
-from app.compliance_extraction import (
-    ComplianceExtractionError,
-    MinerUDocumentParser,
-    extract_tender_compliance_objects,
-)
 from app.models import FileMetadata
 
 
@@ -30,21 +24,7 @@ def extract_tender_objects(
     if not source_path.is_file():
         raise FileNotFoundError(source_path)
     time.sleep(delay_seconds)
-    try:
-        return extract_tender_compliance_objects(
-            tender_file,
-            parser=MinerUDocumentParser(
-                command="",
-                mineru_url="",
-                allow_docx_fallback=True,
-            ),
-        )
-    except ComplianceExtractionError:
-        # Keep historical byte-stub fixtures usable; real DOCX packages never
-        # enter this compatibility branch.
-        if not zipfile.is_zipfile(source_path):
-            return empty_tender_extraction_result()
-        raise
+    return empty_tender_extraction_result()
 
 
 def parse_bid_document(

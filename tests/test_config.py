@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.config import load_settings
 
 
-def test_load_settings_reads_project_env_before_process_environment(
+def test_load_settings_reads_project_and_mineru_env_before_process_environment(
     tmp_path,
     monkeypatch,
 ):
@@ -11,7 +11,10 @@ def test_load_settings_reads_project_env_before_process_environment(
         "LLM_API_KEY=file-key\n"
         "LLM_BASE_URL=https://file.example/v1\n"
         "LLM_MODEL=qwen3.8-27b\n"
-        "LLM_ENABLE_THINKING=false\n",
+        "LLM_ENABLE_THINKING=false\n"
+        "MINERU_URL=https://mineru.file.example\n"
+        "MINERU_BACKEND=hybrid-http-client\n"
+        "MINERU_SERVER_URL=https://mineru-server.file.example\n",
         encoding="utf-8",
     )
     for key in (
@@ -19,6 +22,9 @@ def test_load_settings_reads_project_env_before_process_environment(
         "LLM_BASE_URL",
         "LLM_MODEL",
         "LLM_ENABLE_THINKING",
+        "MINERU_URL",
+        "MINERU_BACKEND",
+        "MINERU_SERVER_URL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -28,12 +34,17 @@ def test_load_settings_reads_project_env_before_process_environment(
     assert settings.llm_base_url == "https://file.example/v1"
     assert settings.llm_model == "qwen3.8-27b"
     assert settings.llm_enable_thinking is False
+    assert settings.mineru_url == "https://mineru.file.example"
+    assert settings.mineru_backend == "hybrid-http-client"
+    assert settings.mineru_server_url == "https://mineru-server.file.example"
 
     monkeypatch.setenv("LLM_MODEL", "process-model")
     assert load_settings(tmp_path).llm_model == "qwen3.8-27b"
+    monkeypatch.setenv("MINERU_URL", "https://mineru.process.example")
+    assert load_settings(tmp_path).mineru_url == "https://mineru.file.example"
 
 
-def test_load_settings_keeps_mineru_on_existing_default_service(tmp_path):
+def test_load_settings_does_not_invent_mineru_endpoint_when_unconfigured(tmp_path):
     (tmp_path / ".env").write_text(
         "LLM_BASE_URL=https://llm.example/v1\n",
         encoding="utf-8",
@@ -41,8 +52,7 @@ def test_load_settings_keeps_mineru_on_existing_default_service(tmp_path):
 
     settings = load_settings(tmp_path)
 
-    assert settings.mineru_url == "http://127.0.0.1:7100"
+    assert settings.mineru_url is None
     assert settings.mineru_backend == "hybrid-engine"
     assert settings.mineru_server_url is None
     assert settings.mineru_api_key is None
-    assert settings.allow_docx_fallback is False

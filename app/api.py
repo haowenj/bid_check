@@ -3,9 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 import uuid
-import zipfile
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -24,8 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.compliance_extraction import (
-    ComplianceExtractionError,
     DeterministicComplianceLLM,
+    DocumentParser,
     JsonDocumentCache,
     JsonRequirementCache,
     MinerUDocumentParser,
@@ -34,7 +32,6 @@ from app.compliance_extraction import (
 )
 from app.config import Settings, load_settings
 from app.mock_services import (
-    empty_tender_extraction_result,
     parse_bid_document,
     run_compliance_review,
 )
@@ -54,16 +51,16 @@ STAGE_LABELS = {
 def build_default_workflow(
     settings: Settings,
     repository: BidCheckRepository,
+    *,
+    document_parser: DocumentParser | None = None,
 ) -> BidCheckWorkflow:
-    parser = MinerUDocumentParser(
-        settings.mineru_command,
-        mineru_url=settings.mineru_url,
+    parser = document_parser or MinerUDocumentParser(
+        settings.mineru_url,
         mineru_api_key=settings.mineru_api_key,
         mineru_backend=settings.mineru_backend,
         mineru_server_url=settings.mineru_server_url,
         timeout_seconds=settings.mineru_timeout_seconds,
         poll_interval_seconds=settings.mineru_poll_interval_seconds,
-        allow_docx_fallback=settings.allow_docx_fallback,
     )
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
     parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
@@ -79,32 +76,14 @@ def build_default_workflow(
         llm = DeterministicComplianceLLM()
 
     def extract_requirements(file_metadata: FileMetadata):
-        try:
-            return extract_tender_compliance_objects(
-                file_metadata,
-                parser=parser,
-                llm=llm,
-                cache=cache,
-                parser_cache=parser_cache,
-                max_batches=settings.compliance_max_batches,
-            )
-        except ComplianceExtractionError:
-            # Only an explicitly enabled development/test fallback may keep
-            # historical byte-stub fixtures runnable.  Normal business
-            # settings always propagate MinerU errors to the failed task.
-            if (
-                settings.allow_docx_fallback
-                and parser.parser_name == "docx_fallback"
-                and not zipfile.is_zipfile(
-                    file_metadata.storage_path
-                )
-            ):
-                logger.warning(
-                    "tender_objects.compatibility_fallback file=%s parser=docx_fallback reason=non_docx_fixture",
-                    file_metadata.filename,
-                )
-                return deepcopy(empty_tender_extraction_result())
-            raise
+        return extract_tender_compliance_objects(
+            file_metadata,
+            parser=parser,
+            llm=llm,
+            cache=cache,
+            parser_cache=parser_cache,
+            max_batches=settings.compliance_max_batches,
+        )
 
     services = BidCheckServices(
         extract=extract_requirements,

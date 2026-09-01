@@ -14,14 +14,12 @@ class Settings:
     database_path: Path
     tasks_dir: Path
     mock_delay_seconds: float = 0.35
-    mineru_command: str | None = None
-    mineru_url: str = "http://127.0.0.1:7100"
+    mineru_url: str | None = None
     mineru_api_key: str | None = None
     mineru_backend: str = "hybrid-engine"
     mineru_server_url: str | None = None
     mineru_timeout_seconds: float = 1800.0
     mineru_poll_interval_seconds: float = 2.0
-    allow_docx_fallback: bool = False
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
@@ -90,7 +88,19 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         mock_delay_seconds=float(
             _env_value(project_env, "MOCK_DELAY_SECONDS", "0.35") or "0.35"
         ),
-        mineru_command=_env_value(project_env, "MINERU_COMMAND") or None,
+        mineru_url=_env_value(project_env, "MINERU_URL") or None,
+        mineru_api_key=_env_value(project_env, "MINERU_API_KEY") or None,
+        mineru_backend=(
+            _env_value(project_env, "MINERU_BACKEND", "hybrid-engine")
+            or "hybrid-engine"
+        ),
+        mineru_server_url=_env_value(project_env, "MINERU_SERVER_URL") or None,
+        mineru_timeout_seconds=float(
+            _env_value(project_env, "MINERU_TIMEOUT_SECONDS", "1800") or "1800"
+        ),
+        mineru_poll_interval_seconds=float(
+            _env_value(project_env, "MINERU_POLL_INTERVAL_SECONDS", "2") or "2"
+        ),
         llm_api_key=_env_value(project_env, "LLM_API_KEY") or None,
         llm_base_url=(
             _env_value(project_env, "LLM_BASE_URL", "https://api.openai.com/v1")

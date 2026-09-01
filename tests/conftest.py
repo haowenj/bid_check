@@ -4,6 +4,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import build_default_workflow, create_app
+from app.compliance_extraction import (
+    MINERU_TASKS_PROTOCOL_LABEL,
+    MINERU_TASKS_PROTOCOL_VERSION,
+    StructuredBlock,
+)
 from app.config import Settings
 from app.mock_services import (
     extract_tender_objects,
@@ -12,6 +17,65 @@ from app.mock_services import (
 )
 from app.models import FileMetadata
 from app.repository import BidCheckRepository
+
+
+class FixtureMineruParser:
+    parser_name = "mineru"
+
+    @property
+    def cache_descriptor(self):
+        return {
+            "parser": "mineru",
+            "transport": MINERU_TASKS_PROTOCOL_LABEL,
+            "protocol": MINERU_TASKS_PROTOCOL_VERSION,
+            "url": "https://fixture-mineru.example",
+            "backend": "hybrid-engine",
+            "server_url": "",
+        }
+
+    def __init__(self):
+        self.parse_diagnostics = {
+            "parser": "mineru",
+            "mineru_called": True,
+            "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
+            "elapsed_ms": 0,
+        }
+
+    def parse(self, path):
+        if path.stat().st_size < 100:
+            return []
+        section = "第六章 投标文件格式"
+        return [
+            StructuredBlock("b1", "heading", section, section, 1),
+            StructuredBlock("b2", "heading", "投标函", section, 2),
+            StructuredBlock("b3", "paragraph", "投标人名称：____", section, 3),
+            StructuredBlock(
+                "b4",
+                "paragraph",
+                "法定代表人应签字并加盖公章。",
+                section,
+                4,
+            ),
+            StructuredBlock("b5", "heading", "法定代表人身份证明", section, 5),
+            StructuredBlock(
+                "b6",
+                "paragraph",
+                "姓名：____，身份证明附国徽面和人像面。",
+                section,
+                6,
+            ),
+            StructuredBlock("b7", "heading", "投标人须知前附表", section, 7),
+            StructuredBlock("b8", "paragraph", "投标有效期 | 90 天", section, 8),
+            StructuredBlock("b9", "heading", "投标人资格要求", section, 9),
+            StructuredBlock(
+                "b10",
+                "paragraph",
+                "须随投标文件提供营业执照或事业单位法人证书。",
+                section,
+                10,
+            ),
+            StructuredBlock("b11", "paragraph", "商务评分满分 20 分。", section, 11),
+        ]
 
 
 @pytest.fixture
@@ -49,8 +113,6 @@ def settings(tmp_path):
         database_path=data_dir / "bid_check.db",
         tasks_dir=data_dir / "tasks",
         mock_delay_seconds=0,
-        mineru_url="",
-        allow_docx_fallback=True,
     )
 
 
@@ -61,7 +123,11 @@ def repository(settings):
 
 @pytest.fixture
 def workflow(settings, repository):
-    return build_default_workflow(settings, repository)
+    return build_default_workflow(
+        settings,
+        repository,
+        document_parser=FixtureMineruParser(),
+    )
 
 
 @pytest.fixture

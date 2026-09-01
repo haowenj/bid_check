@@ -23,7 +23,6 @@ from app.compliance_extraction import (
     extract_tender_compliance_objects,
     identify_functional_regions,
     normalize_tender_extraction_sources,
-    parse_docx_document,
 )
 from app.models import FileMetadata
 
@@ -655,64 +654,18 @@ def test_deterministic_fallback_has_no_execution_rule_fields():
     }
 
 
-def test_parse_docx_recovers_order_and_table_as_structured_blocks(tmp_path):
-    document = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        "<w:body>"
-        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>响应文件格式</w:t></w:r></w:p>'
-        "<w:p><w:r><w:t>投标函</w:t></w:r></w:p>"
-        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>字段</w:t></w:r></w:p></w:tc>"
-        "<w:tc><w:p><w:r><w:t>填写</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
-        "</w:body></w:document>"
-    ).encode()
-    path = tmp_path / "tender.docx"
-    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
-        archive.writestr("word/document.xml", document)
-
-    blocks = parse_docx_document(path)
-
-    assert [item.type for item in blocks] == ["heading", "paragraph", "table"]
-    assert blocks[0].section == "响应文件格式"
-    assert blocks[2].text == "字段 | 填写"
-
-
 def test_mineru_parser_requires_real_mineru_by_default(tmp_path):
     path = tmp_path / "tender.docx"
     path.write_bytes(b"not-a-docx")
 
     parser = extraction_module.MinerUDocumentParser(
-        command="",
         mineru_url="",
-        allow_docx_fallback=False,
     )
 
     with pytest.raises(ComplianceExtractionError, match="MinerU"):
         parser.parse(path)
 
     assert parser.parser_name == "mineru"
-    assert parser.parse_diagnostics["mineru_called"] is False
-
-
-def test_docx_fallback_is_explicit_and_is_not_called_as_mineru(tmp_path):
-    document = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        "<w:body><w:p><w:r><w:t>正文</w:t></w:r></w:p></w:body></w:document>"
-    ).encode()
-    path = tmp_path / "tender.docx"
-    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
-        archive.writestr("word/document.xml", document)
-
-    parser = extraction_module.MinerUDocumentParser(
-        command="",
-        mineru_url="",
-        allow_docx_fallback=True,
-    )
-    blocks = parser.parse(path)
-
-    assert blocks[0].text == "正文"
-    assert parser.parser_name == "docx_fallback"
     assert parser.parse_diagnostics["mineru_called"] is False
 
 
@@ -757,7 +710,6 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     parser = extraction_module.MinerUDocumentParser(
-        command="",
         mineru_url="https://mineru.example",
         mineru_backend="hybrid-engine",
         http_client=client,
@@ -778,22 +730,20 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
     assert parser.parser_name == "mineru"
     assert parser.parse_diagnostics["mineru_called"] is True
     assert parser.parse_diagnostics["service_protocol"] == "mineru_tasks"
+    assert "command" not in parser.cache_descriptor
     client.close()
 
 
-def test_parse_cache_key_distinguishes_mineru_from_explicit_docx_fallback(tmp_path):
+def test_parse_cache_key_distinguishes_mineru_service_configurations(tmp_path):
     path = tmp_path / "tender.docx"
     path.write_bytes(b"same bytes")
-    mineru = extraction_module.MinerUDocumentParser(
-        command="",
+    mineru_a = extraction_module.MinerUDocumentParser(
         mineru_url="https://mineru.example",
     )
-    fallback = extraction_module.MinerUDocumentParser(
-        command="",
-        mineru_url="",
-        allow_docx_fallback=True,
+    mineru_b = extraction_module.MinerUDocumentParser(
+        mineru_url="https://other-mineru.example",
     )
 
-    assert extraction_module._parsed_document_cache_key(path, mineru) != (
-        extraction_module._parsed_document_cache_key(path, fallback)
+    assert extraction_module._parsed_document_cache_key(path, mineru_a) != (
+        extraction_module._parsed_document_cache_key(path, mineru_b)
     )
