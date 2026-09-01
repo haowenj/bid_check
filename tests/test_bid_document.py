@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import io
+import json
+import zipfile
 
+import httpx
 import pytest
 
 
@@ -437,3 +441,91 @@ def test_structure_content_list_keeps_sections_tables_images_and_sources():
         "1.1 投标说明",
     ]
     assert document["images"][0]["source"]["raw_item_index"] == 5
+
+
+def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
+    from app.bid_document import MinerUBidDocumentParser
+
+    bid_path = tmp_path / "bid.docx"
+    bid_path.write_bytes(b"fixture bid")
+    content_payload = [
+        {"schema": "content-list-v2"},
+        [
+            {
+                "type": "title",
+                "page_idx": 0,
+                "bbox": [10, 20, 500, 50],
+                "content": {
+                    "level": 1,
+                    "title_content": [{"type": "text", "content": "第一章"}],
+                },
+            },
+            {
+                "type": "table",
+                "page_idx": 0,
+                "bbox": [10, 60, 500, 160],
+                "content": {"html": "<table><tr><td>材料</td></tr></table>"},
+            },
+            {
+                "type": "image",
+                "page_idx": 0,
+                "bbox": [10, 180, 500, 500],
+                "content": {
+                    "image_caption": [{"type": "text", "content": "证照"}],
+                    "img_path": "images/license.jpg",
+                },
+            },
+            {"type": "paragraph", "text": "附件说明。", "page_idx": 0},
+        ],
+    ]
+    raw_content_bytes = json.dumps(
+        content_payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("results/content_list_v2.json", raw_content_bytes)
+        archive.writestr("results/images/license.jpg", b"license-image")
+        archive.writestr("../outside.jpg", b"must-not-extract")
+    zip_bytes = zip_buffer.getvalue()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tasks":
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": "task-1",
+                    "status_url": "/tasks/task-1",
+                    "result_url": "/tasks/task-1/result",
+                },
+            )
+        if request.url.path == "/tasks/task-1":
+            return httpx.Response(200, json={"status": "completed"})
+        if request.url.path == "/tasks/task-1/result":
+            return httpx.Response(200, content=zip_bytes)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://mineru.example",
+        trust_env=False,
+    )
+    output_dir = tmp_path / "bid_document_cleaning"
+    parser = MinerUBidDocumentParser(
+        "https://mineru.example",
+        poll_interval_seconds=0,
+        http_client=client,
+    )
+
+    result = parser.parse(bid_path, output_dir=output_dir)
+
+    assert result["status"] == "success"
+    assert result["stats"]["raw_item_count"] == 4
+    assert result["stats"]["table_count"] == 1
+    assert result["stats"]["image_count"] == 1
+    assert (output_dir / "raw_content_list.json").read_bytes() == raw_content_bytes
+    assert (output_dir / "images/license.jpg").read_bytes() == b"license-image"
+    assert not (tmp_path / "outside.jpg").exists()
+    structured = json.loads((output_dir / "structured_document.json").read_text())
+    assert structured["tables"][0]["rows"] == [["材料"]]
+    assert structured["images"][0]["asset_status"] == "ready"
+    assert json.loads((output_dir / "cleaning_log.json").read_text()) == []

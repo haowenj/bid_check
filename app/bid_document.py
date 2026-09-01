@@ -1,15 +1,34 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
+import json
+import mimetypes
+import os
 import re
+import tempfile
+import time
 import unicodedata
+import urllib.parse
+import zipfile
 from collections.abc import Sequence
 from dataclasses import asdict
 from html.parser import HTMLParser
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+import httpx
 
 
 _SOURCE_KEY = "_bid_source"
+MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
+MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
+DEFAULT_MINERU_BACKEND = "hybrid-engine"
+SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
+DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
+DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 2.0
+DOCUMENT_SCHEMA_VERSION = "bid-document-v1"
 _EDGE_RATIO = 0.2
 _COMPLETE_ENDINGS = frozenset("。！？.!?；;…")
 _CLOSING_CHARS = frozenset("\"'”’）)]】》」』")
@@ -707,6 +726,7 @@ def structure_content_list(
                     "table_body": table_body if isinstance(table_body, str) else "",
                     "rows": _table_rows(table_body),
                     "caption": raw.get("table_caption", raw.get("caption")),
+                    "img_path": raw.get("img_path"),
                 }
             )
         elif kind == "image":
@@ -731,7 +751,7 @@ def structure_content_list(
         type_counts[block.type] += 1
 
     return {
-        "schema_version": "bid-document-v1",
+        "schema_version": DOCUMENT_SCHEMA_VERSION,
         "source": {
             "filename": str(source_filename),
             "sha256": source_sha256,
@@ -752,3 +772,530 @@ def structure_content_list(
             "unsupported_item_count": len(unsupported_items),
         },
     }
+
+
+class BidDocumentCleaningError(RuntimeError):
+    """Raised when MinerU output cannot be converted into audit artifacts."""
+
+
+class MinerUBidDocumentParser:
+    """Fetch MinerU content and write traceable bid-document artifacts."""
+
+    def __init__(
+        self,
+        mineru_url: str | None = None,
+        *,
+        mineru_api_key: str | None = None,
+        mineru_backend: str | None = None,
+        mineru_server_url: str | None = None,
+        timeout_seconds: float = DEFAULT_MINERU_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        self.mineru_url = mineru_url
+        self.mineru_api_key = mineru_api_key
+        self.mineru_backend = mineru_backend or DEFAULT_MINERU_BACKEND
+        self.mineru_server_url = mineru_server_url
+        self.timeout_seconds = float(timeout_seconds)
+        self.poll_interval_seconds = float(poll_interval_seconds)
+        self._http_client = http_client
+
+    def parse(self, path: Path, *, output_dir: Path) -> dict[str, Any]:
+        source_path = Path(path).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        artifact_dir = Path(output_dir).expanduser().resolve()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        result_zip, task_id = self._run_mineru_task(source_path)
+        payload, raw_content_bytes, content_member, zip_diagnostics = (
+            self._content_list_from_zip(result_zip)
+        )
+        raw_items, _ = _payload_items(payload)
+        flattened = flatten_mineru_content_list(payload)
+        cleaned, cleaning_log = clean_items(flattened)
+        merged, merge_log = merge_items(cleaned)
+
+        source_sha256 = _sha256_file(source_path)
+        diagnostics = {
+            "parser": "mineru_bid_document_cleaner",
+            "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
+            "protocol_version": MINERU_TASKS_PROTOCOL_VERSION,
+            "task_id": task_id,
+            "mineru_backend": self.mineru_backend,
+            "content_member": content_member,
+            **zip_diagnostics,
+        }
+        document = structure_content_list(
+            merged,
+            source_filename=source_path.name,
+            source_sha256=source_sha256,
+            parser_diagnostics=diagnostics,
+        )
+        asset_statuses, asset_diagnostics = self._extract_assets(
+            result_zip,
+            content_member=content_member,
+            payload=payload,
+            output_dir=artifact_dir,
+        )
+        diagnostics.update(asset_diagnostics)
+        self._apply_asset_statuses(document, asset_statuses)
+        document["diagnostics"] = copy.deepcopy(diagnostics)
+
+        artifacts = {
+            "raw_content_list": artifact_dir / "raw_content_list.json",
+            "cleaned_content_list": artifact_dir / "cleaned_content_list.json",
+            "merged_content_list": artifact_dir / "merged_content_list.json",
+            "structured_document": artifact_dir / "structured_document.json",
+            "cleaning_summary": artifact_dir / "cleaning_summary.json",
+            "cleaning_log": artifact_dir / "cleaning_log.json",
+            "merge_log": artifact_dir / "merge_log.json",
+        }
+        # The raw content list is copied byte-for-byte from the MinerU ZIP.
+        _write_bytes_atomic(artifacts["raw_content_list"], raw_content_bytes)
+        _write_json_atomic(artifacts["cleaned_content_list"], cleaned)
+        _write_json_atomic(artifacts["merged_content_list"], merged)
+        _write_json_atomic(artifacts["structured_document"], document)
+        _write_json_atomic(artifacts["cleaning_log"], cleaning_log)
+        _write_json_atomic(artifacts["merge_log"], merge_log)
+
+        stats = {
+            "raw_item_count": len(raw_items),
+            "flattened_item_count": len(flattened),
+            "cleaned_item_count": len(cleaned),
+            "merged_item_count": len(merged),
+            "structured_block_count": document["stats"]["block_count"],
+            "section_count": document["stats"]["section_count"],
+            "table_count": document["stats"]["table_count"],
+            "image_count": document["stats"]["image_count"],
+            "page_count": document["stats"]["page_count"],
+            "cleaned_out_count": len(cleaning_log),
+            "cross_page_merge_count": len(merge_log),
+            "asset_ready_count": sum(
+                1
+                for status in asset_statuses.values()
+                if status == "ready"
+            ),
+        }
+        summary = {
+            "schema_version": DOCUMENT_SCHEMA_VERSION,
+            "source": {
+                "filename": source_path.name,
+                "path": str(source_path),
+                "sha256": source_sha256,
+                "size": source_path.stat().st_size,
+            },
+            "stats": stats,
+            "diagnostics": diagnostics,
+            "artifacts": {key: str(value) for key, value in artifacts.items()},
+        }
+        _write_json_atomic(artifacts["cleaning_summary"], summary)
+
+        return {
+            "status": "success",
+            "document_name": source_path.name,
+            "artifact_dir": str(artifact_dir),
+            "artifacts": {key: str(value) for key, value in artifacts.items()},
+            "stats": stats,
+            "diagnostics": diagnostics,
+        }
+
+    def _run_mineru_task(self, path: Path) -> tuple[bytes, str]:
+        if not (self.mineru_url or "").strip():
+            raise BidDocumentCleaningError("MinerU 服务未配置，请配置 MINERU_URL。")
+        if self.mineru_backend not in SUPPORTED_MINERU_BACKENDS:
+            raise BidDocumentCleaningError(
+                "MinerU backend 仅支持 hybrid-engine 或 hybrid-http-client。"
+            )
+        if self.mineru_backend == "hybrid-http-client" and not (
+            self.mineru_server_url or ""
+        ).strip():
+            raise BidDocumentCleaningError(
+                "hybrid-http-client 模式下必须配置 MinerU server_url。"
+            )
+        if self.timeout_seconds <= 0 or self.poll_interval_seconds < 0:
+            raise BidDocumentCleaningError("MinerU 超时或轮询间隔配置无效。")
+
+        base_url = str(self.mineru_url).strip().rstrip("/")
+        headers = (
+            {"Authorization": f"Bearer {self.mineru_api_key.strip()}"}
+            if self.mineru_api_key and self.mineru_api_key.strip()
+            else {}
+        )
+        form = {
+            "parse_method": "auto",
+            "effort": "medium",
+            "formula_enable": "true",
+            "table_enable": "true",
+            "image_analysis": "false",
+            "return_md": "false",
+            "return_middle_json": "false",
+            "return_model_output": "false",
+            "return_content_list": "true",
+            "return_images": "true",
+            "response_format_zip": "true",
+            "backend": self.mineru_backend,
+        }
+        if self.mineru_backend == "hybrid-http-client":
+            form["server_url"] = str(self.mineru_server_url).strip().rstrip("/")
+
+        owns_client = self._http_client is None
+        client = self._http_client or httpx.Client(
+            timeout=httpx.Timeout(
+                connect=30.0,
+                read=self.timeout_seconds,
+                write=self.timeout_seconds,
+                pool=30.0,
+            ),
+            trust_env=False,
+            follow_redirects=False,
+        )
+        try:
+            try:
+                with path.open("rb") as source:
+                    response = client.post(
+                        f"{base_url}/tasks",
+                        data=form,
+                        files={
+                            "files": (
+                                path.name,
+                                source,
+                                mimetypes.guess_type(path.name)[0]
+                                or "application/octet-stream",
+                            )
+                        },
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+            except (OSError, httpx.HTTPError) as exc:
+                raise BidDocumentCleaningError(
+                    f"MinerU 任务提交失败：{type(exc).__name__}。"
+                ) from exc
+            if response.status_code != 202:
+                raise BidDocumentCleaningError(
+                    f"MinerU 任务提交失败：HTTP {response.status_code}。"
+                )
+            submission = self._json_object(response, "任务提交")
+            task_id = submission.get("task_id")
+            status_url = self._trusted_task_url(
+                submission.get("status_url"), base_url
+            )
+            result_url = self._trusted_task_url(
+                submission.get("result_url"), base_url
+            )
+            if not isinstance(task_id, str) or not task_id:
+                raise BidDocumentCleaningError("MinerU 返回了无效任务响应。")
+
+            deadline = time.monotonic() + self.timeout_seconds
+            while time.monotonic() < deadline:
+                try:
+                    status_response = client.get(
+                        status_url,
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+                except httpx.HTTPError as exc:
+                    raise BidDocumentCleaningError(
+                        f"MinerU 任务状态查询失败：{type(exc).__name__}。"
+                    ) from exc
+                if status_response.status_code != 200:
+                    raise BidDocumentCleaningError(
+                        f"MinerU 任务状态查询失败：HTTP {status_response.status_code}。"
+                    )
+                status_payload = self._json_object(status_response, "任务状态")
+                status = status_payload.get("status")
+                if status == "completed":
+                    break
+                if status == "failed":
+                    raise BidDocumentCleaningError("MinerU 任务处理失败。")
+                if status not in {"pending", "processing"}:
+                    raise BidDocumentCleaningError(
+                        f"MinerU 返回未知任务状态：{status!r}。"
+                    )
+                if self.poll_interval_seconds:
+                    time.sleep(self.poll_interval_seconds)
+            else:
+                raise BidDocumentCleaningError("MinerU 任务等待超时。")
+
+            try:
+                result_response = client.get(
+                    result_url,
+                    headers=headers,
+                    follow_redirects=False,
+                )
+            except httpx.HTTPError as exc:
+                raise BidDocumentCleaningError(
+                    f"MinerU 结果下载失败：{type(exc).__name__}。"
+                ) from exc
+            if result_response.status_code != 200:
+                raise BidDocumentCleaningError(
+                    f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
+                )
+            return result_response.content, task_id
+        finally:
+            if owns_client:
+                client.close()
+
+    @staticmethod
+    def _json_object(response: httpx.Response, label: str) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BidDocumentCleaningError(
+                f"MinerU {label}响应不是有效 JSON。"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise BidDocumentCleaningError(f"MinerU {label}响应必须是 JSON 对象。")
+        return payload
+
+    @staticmethod
+    def _trusted_task_url(value: Any, base_url: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise BidDocumentCleaningError("MinerU 返回了无效任务 URL。")
+        base = urllib.parse.urlsplit(f"{base_url}/")
+        resolved = urllib.parse.urlsplit(
+            urllib.parse.urljoin(f"{base_url}/", value)
+        )
+        if (
+            resolved.scheme,
+            resolved.hostname,
+            resolved.port,
+        ) != (base.scheme, base.hostname, base.port) or resolved.fragment:
+            raise BidDocumentCleaningError("MinerU 返回了不可信任务 URL。")
+        return urllib.parse.urlunsplit(resolved)
+
+    @staticmethod
+    def _content_list_from_zip(
+        raw: bytes,
+    ) -> tuple[Any, bytes, str, dict[str, Any]]:
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                safe_members: list[zipfile.ZipInfo] = []
+                unsafe_members: list[str] = []
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    normalized = info.filename.replace("\\", "/")
+                    safe_path = PurePosixPath(normalized)
+                    if safe_path.is_absolute() or ".." in safe_path.parts:
+                        unsafe_members.append(info.filename)
+                        continue
+                    safe_members.append(info)
+
+                content_members = [
+                    info
+                    for info in safe_members
+                    if info.filename.replace("\\", "/").lower().endswith(
+                        (
+                            "content_list_v2.json",
+                            "_content_list_v2.json",
+                            "content_list.json",
+                            "_content_list.json",
+                        )
+                    )
+                ]
+                if not content_members:
+                    raise BidDocumentCleaningError(
+                        "MinerU 结果 ZIP 未返回 content list。"
+                    )
+                v2_members = [
+                    info
+                    for info in content_members
+                    if info.filename.replace("\\", "/").lower().endswith(
+                        ("content_list_v2.json", "_content_list_v2.json")
+                    )
+                ]
+                if len(v2_members) > 1:
+                    raise BidDocumentCleaningError(
+                        "MinerU 结果 ZIP 返回了多个 content_list_v2。"
+                    )
+                selected = v2_members[0] if v2_members else content_members[0]
+                raw_content_bytes = archive.read(selected)
+                payload = json.loads(raw_content_bytes)
+        except BidDocumentCleaningError:
+            raise
+        except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            raise BidDocumentCleaningError("无法读取 MinerU 结果 ZIP。") from exc
+        return payload, raw_content_bytes, selected.filename, {
+            "unsafe_zip_member_count": len(unsafe_members),
+            "unsafe_zip_members": unsafe_members[:20],
+        }
+
+    @staticmethod
+    def _extract_assets(
+        raw_zip: bytes,
+        *,
+        content_member: str,
+        payload: Any,
+        output_dir: Path,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        references: list[str] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"img_path", "image_path", "table_img_path"} and isinstance(
+                        child, str
+                    ):
+                        references.append(child)
+                    else:
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(payload)
+        statuses: dict[str, str] = {}
+        unsafe_references: list[str] = []
+        missing_references: list[str] = []
+        output_root = output_dir.resolve()
+        content_parent = PurePosixPath(content_member.replace("\\", "/")).parent
+
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(raw_zip))
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise BidDocumentCleaningError("无法读取 MinerU 结果 ZIP。") from exc
+        with archive:
+            members = {
+                info.filename.replace("\\", "/"): info
+                for info in archive.infolist()
+                if not info.is_dir()
+                and not PurePosixPath(info.filename.replace("\\", "/")).is_absolute()
+                and ".." not in PurePosixPath(info.filename.replace("\\", "/")).parts
+            }
+            for reference in dict.fromkeys(references):
+                normalized = reference.replace("\\", "/")
+                reference_path = PurePosixPath(normalized)
+                if reference_path.is_absolute() or ".." in reference_path.parts:
+                    statuses[reference] = "unsafe"
+                    unsafe_references.append(reference)
+                    continue
+                candidate_names = [
+                    str(content_parent / reference_path),
+                    str(reference_path),
+                ]
+                member_name = next(
+                    (name for name in candidate_names if name in members),
+                    None,
+                )
+                output_relative = reference_path
+                if not output_relative.parts or output_relative.parts[0] != "images":
+                    output_relative = PurePosixPath("images") / output_relative
+                destination = (output_root / Path(*output_relative.parts)).resolve()
+                if output_root not in destination.parents:
+                    statuses[reference] = "unsafe"
+                    unsafe_references.append(reference)
+                    continue
+                if member_name is None:
+                    statuses[reference] = "missing"
+                    missing_references.append(reference)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _write_bytes_atomic(destination, archive.read(members[member_name]))
+                statuses[reference] = "ready"
+
+        return statuses, {
+            "asset_reference_count": len(set(references)),
+            "asset_unsafe_reference_count": len(unsafe_references),
+            "asset_missing_reference_count": len(missing_references),
+            "asset_unsafe_references": unsafe_references[:20],
+            "asset_missing_references": missing_references[:20],
+        }
+
+    @staticmethod
+    def _apply_asset_statuses(
+        document: dict[str, Any], statuses: dict[str, str]
+    ) -> None:
+        for collection_name in ("images", "tables"):
+            for entry in document.get(collection_name, []):
+                reference = entry.get("img_path")
+                if not isinstance(reference, str) or not reference:
+                    if collection_name == "images":
+                        entry["asset_status"] = "unresolved"
+                    continue
+                status = statuses.get(reference, "missing")
+                entry["asset_status"] = status
+                block_id = entry.get("block_id")
+                for block in document.get("blocks", []):
+                    if block.get("block_id") == block_id:
+                        block.setdefault("metadata", {})["asset_status"] = status
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    _write_bytes_atomic(
+        path,
+        (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+
+
+def parse_bid_document(
+    bid_file: Any,
+    *,
+    parser: MinerUBidDocumentParser | None = None,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Workflow adapter for a bid ``FileMetadata`` object."""
+
+    source_path = Path(bid_file.storage_path)
+    if parser is None:
+        from app.config import load_settings
+
+        settings = load_settings()
+        parser = MinerUBidDocumentParser(
+            settings.mineru_url,
+            mineru_api_key=settings.mineru_api_key,
+            mineru_backend=settings.mineru_backend,
+            mineru_server_url=settings.mineru_server_url,
+            timeout_seconds=settings.mineru_timeout_seconds,
+            poll_interval_seconds=settings.mineru_poll_interval_seconds,
+        )
+    return parser.parse(
+        source_path,
+        output_dir=output_dir
+        or source_path.parent / "bid_document_cleaning",
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="清洗 MinerU 投标文件结果")
+    parser.add_argument("input_file", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args(argv)
+    result = parse_bid_document(
+        type("BidFile", (), {"storage_path": str(args.input_file)})(),
+        output_dir=args.output_dir,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
