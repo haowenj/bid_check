@@ -66,6 +66,22 @@ class CandidateWindow:
     order: int
 
 
+FunctionalRegionKind = Literal[
+    "templates", "project_requirements", "supplemental_materials"
+]
+
+
+@dataclass(frozen=True)
+class FunctionalRegion:
+    kind: FunctionalRegionKind
+    title: str
+    section: str
+    block_ids: list[str]
+    blocks: list[StructuredBlock]
+    text: str
+    order: int
+
+
 class ComplianceExtractionError(RuntimeError):
     """Raised when a tender cannot produce source-grounded requirements."""
 
@@ -396,6 +412,124 @@ class MinerUDocumentParser:
                 _elapsed_ms(started_at),
             )
             raise ComplianceExtractionError("MinerU 文档解析失败。") from exc
+
+
+_FUNCTIONAL_REGION_PATTERNS: tuple[tuple[FunctionalRegionKind, re.Pattern[str]], ...] = (
+    (
+        "templates",
+        re.compile(
+            r"投标文件(?:格式|组成|模板)|响应文件(?:格式|组成|模板)|"
+            r"资格审查文件格式|商务投标文件格式|技术投标文件格式|报价文件格式"
+        ),
+    ),
+    (
+        "project_requirements",
+        re.compile(
+            r"投标人须知前附表|投标须知前附表|项目专用条款|项目专用表|"
+            r"响应人须知前附表"
+        ),
+    ),
+    (
+        "supplemental_materials",
+        re.compile(
+            r"招标公告|资格条件|投标人资格要求|投标产品资格要求|制造商资格要求"
+        ),
+    ),
+)
+_EXCLUDED_REGION_TITLE_RE = re.compile(
+    r"评标办法|评审办法|评分标准|评标委员会|招标代理|中标候选人"
+)
+_MAJOR_SECTION_TITLE_RE = re.compile(
+    r"^第[一二三四五六七八九十百千万0-9]+[章节部分篇]\s*"
+)
+
+
+def _normalize_region_title(text: str) -> str:
+    return re.sub(r"[\s\u3000]+", "", text).strip()
+
+
+def _functional_region_kind(title: str) -> FunctionalRegionKind | None:
+    normalized = _normalize_region_title(title)
+    if _EXCLUDED_REGION_TITLE_RE.search(normalized):
+        return None
+    for kind, pattern in _FUNCTIONAL_REGION_PATTERNS:
+        if pattern.search(normalized):
+            return kind
+    return None
+
+
+def _is_region_title_block(block: StructuredBlock) -> bool:
+    return block.type == "heading" or block.text.strip() == block.section.strip()
+
+
+def identify_functional_regions(
+    blocks: Iterable[StructuredBlock],
+) -> list[FunctionalRegion]:
+    """Identify narrow tender-function areas without relying on chapter numbers."""
+
+    ordered_blocks = sorted(blocks, key=lambda item: item.order)
+    regions: list[FunctionalRegion] = []
+    current_kind: FunctionalRegionKind | None = None
+    current_title = ""
+    current_section = ""
+    current_blocks: list[StructuredBlock] = []
+
+    def flush() -> None:
+        nonlocal current_kind, current_title, current_section, current_blocks
+        if current_kind is None or not current_blocks:
+            current_kind = None
+            current_title = ""
+            current_section = ""
+            current_blocks = []
+            return
+        regions.append(
+            FunctionalRegion(
+                kind=current_kind,
+                title=current_title,
+                section=current_section,
+                block_ids=[block.block_id for block in current_blocks],
+                blocks=list(current_blocks),
+                text="\n".join(block.text for block in current_blocks),
+                order=current_blocks[0].order,
+            )
+        )
+        current_kind = None
+        current_title = ""
+        current_section = ""
+        current_blocks = []
+
+    for block in ordered_blocks:
+        title_kind = (
+            _functional_region_kind(block.text)
+            if _is_region_title_block(block)
+            else None
+        )
+        is_excluded_title = bool(
+            _is_region_title_block(block)
+            and _EXCLUDED_REGION_TITLE_RE.search(_normalize_region_title(block.text))
+        )
+        is_major_boundary = bool(
+            _is_region_title_block(block)
+            and _MAJOR_SECTION_TITLE_RE.search(block.text.strip())
+            and title_kind is None
+            and not is_excluded_title
+        )
+
+        if title_kind is not None:
+            flush()
+            current_kind = title_kind
+            current_title = block.text.strip()
+            current_section = block.section or block.text.strip()
+            current_blocks = [block]
+            continue
+        if is_excluded_title or is_major_boundary:
+            flush()
+            continue
+        if current_kind is not None:
+            current_blocks.append(block)
+
+    flush()
+    return regions
 
 
 _EXCLUDED_RE = re.compile(

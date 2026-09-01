@@ -13,10 +13,12 @@ from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.compliance_extraction import (
     CandidateWindow,
     ComplianceExtractionError,
+    FunctionalRegion,
     InMemoryRequirementCache,
     StructuredBlock,
     build_candidate_batches,
     extract_compliance_requirements_real,
+    identify_functional_regions,
     parse_docx_document,
     select_compliance_candidates,
 )
@@ -57,6 +59,91 @@ def test_tender_extraction_object_types_define_three_result_collections():
         "name",
         "material",
         "source",
+    }
+
+
+def test_functional_regions_use_semantic_titles_without_fixed_chapter_numbers():
+    blocks = [
+        StructuredBlock(
+            "b0001",
+            "heading",
+            "第一部分 投标人须知前附表",
+            "第一部分 投标人须知前附表",
+            1,
+        ),
+        StructuredBlock(
+            "b0002",
+            "table",
+            "投标文件组成 | 商务文件、技术文件、报价文件",
+            "第一部分 投标人须知前附表",
+            2,
+        ),
+        StructuredBlock(
+            "b0003",
+            "heading",
+            "第三章 评标办法",
+            "第三章 评标办法",
+            3,
+        ),
+        StructuredBlock(
+            "b0004",
+            "paragraph",
+            "商务评分满分 20 分。",
+            "第三章 评标办法",
+            4,
+        ),
+        StructuredBlock(
+            "b0005",
+            "heading",
+            "附件 响应文件格式",
+            "附件 响应文件格式",
+            5,
+        ),
+        StructuredBlock(
+            "b0006",
+            "paragraph",
+            "商务投标文件封面",
+            "附件 响应文件格式",
+            6,
+        ),
+        StructuredBlock(
+            "b0007",
+            "heading",
+            "投标产品资格要求",
+            "投标产品资格要求",
+            7,
+        ),
+        StructuredBlock(
+            "b0008",
+            "paragraph",
+            "须随投标文件提供制造商登记证明。",
+            "投标产品资格要求",
+            8,
+        ),
+    ]
+
+    regions = identify_functional_regions(blocks)
+
+    assert [(region.kind, region.title) for region in regions] == [
+        ("project_requirements", "第一部分 投标人须知前附表"),
+        ("templates", "附件 响应文件格式"),
+        ("supplemental_materials", "投标产品资格要求"),
+    ]
+    assert regions[0].block_ids == ["b0001", "b0002"]
+    assert regions[1].block_ids == ["b0005", "b0006"]
+    assert regions[2].block_ids == ["b0007", "b0008"]
+    assert all(region.kind != "templates" or "评分" not in region.text for region in regions)
+
+
+def test_functional_region_type_keeps_source_order_and_blocks():
+    assert set(get_type_hints(FunctionalRegion)) >= {
+        "kind",
+        "title",
+        "section",
+        "block_ids",
+        "blocks",
+        "text",
+        "order",
     }
 
 
