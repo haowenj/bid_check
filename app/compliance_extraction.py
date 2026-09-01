@@ -13,12 +13,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
+from xml.etree import ElementTree
 import httpx
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
@@ -32,11 +36,11 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
-# Bump the object-result cache when deterministic segmentation or source
-# reconciliation changes.  The parsed MinerU document cache intentionally has
-# its own stable version and remains reusable.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v14:{REQUIREMENT_PROMPT_VERSION}"
-PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v2"
+# Keep object-result and parsed-document caches independently versioned.  A
+# change to the MinerU adapter must invalidate parsed blocks as well as the
+# downstream deterministic result.
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v16:{REQUIREMENT_PROMPT_VERSION}"
+PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v4"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
 DEFAULT_MINERU_BACKEND = "hybrid-engine"
@@ -64,14 +68,9 @@ def _block_structure_stats(blocks: Sequence[StructuredBlock]) -> dict[str, Any]:
             blocks_with_metadata += 1
             metadata_keys.update(str(key) for key in block.metadata)
         if block.type == "heading":
-            for key in ("text_level", "heading_level", "level"):
-                value = block.metadata.get(key)
-                try:
-                    if int(value) > 0:
-                        heading_levels.add(int(value))
-                        break
-                except (TypeError, ValueError):
-                    continue
+            level = _block_heading_level(block)
+            if level is not None:
+                heading_levels.add(level)
     return {
         "parsed_block_counts": type_counts,
         "parsed_heading_levels": sorted(heading_levels),
@@ -94,6 +93,7 @@ class StructuredBlock:
     section: str
     order: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    heading_level: int | None = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +243,11 @@ def _deserialize_blocks(value: Any) -> list[StructuredBlock] | None:
                     section=str(raw.get("section", "")),
                     order=int(raw["order"]),
                     metadata=dict(raw.get("metadata", {})),
+                    heading_level=(
+                        int(raw["heading_level"])
+                        if raw.get("heading_level") is not None
+                        else None
+                    ),
                 )
             )
     except (KeyError, TypeError, ValueError):
@@ -250,8 +255,18 @@ def _deserialize_blocks(value: Any) -> list[StructuredBlock] | None:
     return blocks
 
 
-def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
-    """Convert MinerU content-list objects without compiling them into rules."""
+def _mineru_inline_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_mineru_inline_text(item) for item in value)
+    if isinstance(value, dict):
+        return _mineru_inline_text(value.get("content", ""))
+    return ""
+
+
+def _flatten_mineru_content_list(payload: Any) -> list[dict[str, Any]]:
+    """Normalize MinerU v1 and nested v2 content items to one ordered stream."""
     if isinstance(payload, dict):
         payload = payload.get(
             "blocks",
@@ -262,6 +277,100 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
         )
     if not isinstance(payload, list):
         raise ComplianceExtractionError("MinerU 返回结果不是结构化内容列表。")
+
+    # content_list_v2 wraps the document stream in a small top-level envelope.
+    if (
+        len(payload) == 2
+        and isinstance(payload[1], list)
+        and all(isinstance(item, dict) for item in payload[1])
+    ):
+        payload = payload[1]
+
+    flattened: list[dict[str, Any]] = []
+    for source_index, raw in enumerate(payload):
+        if not isinstance(raw, dict):
+            continue
+        raw_type = str(
+            raw.get("type", raw.get("block_type", "paragraph"))
+        ).lower()
+        content = raw.get("content")
+        if raw_type == "index":
+            # The index is a document navigation object, not tender content.
+            continue
+        if raw_type == "list" and isinstance(content, dict):
+            for item in content.get("list_items", []):
+                if not isinstance(item, dict):
+                    continue
+                text = _mineru_inline_text(item.get("item_content", []))
+                prefix = str(item.get("prefix", "")).strip()
+                text = f"{prefix} {text}".strip()
+                if not text:
+                    continue
+                flattened.append(
+                    {
+                        **{
+                            key: value
+                            for key, value in raw.items()
+                            if key != "content"
+                        },
+                        "type": "text",
+                        "text": text,
+                        "mineru_parent_source_index": source_index,
+                        "mineru_parent_type": raw_type,
+                        "mineru_nested_content": item,
+                    }
+                )
+            continue
+        if isinstance(content, dict):
+            normalized = {
+                key: value for key, value in raw.items() if key != "content"
+            }
+            normalized["mineru_nested_content"] = content
+            normalized["mineru_parent_source_index"] = source_index
+            normalized["mineru_parent_type"] = raw_type
+            if raw_type == "title":
+                normalized["type"] = "title"
+                normalized["text"] = _mineru_inline_text(
+                    content.get("title_content", [])
+                ).strip()
+                normalized["text_level"] = content.get(
+                    "level", raw.get("text_level", raw.get("heading_level"))
+                )
+            elif raw_type == "paragraph":
+                normalized["type"] = "paragraph"
+                normalized["text"] = _mineru_inline_text(
+                    content.get("paragraph_content", [])
+                ).strip()
+            elif raw_type == "table":
+                normalized["type"] = "table"
+                normalized["table_body"] = content.get(
+                    "html", content.get("table_body", "")
+                )
+                normalized.update(
+                    {
+                        key: value
+                        for key, value in content.items()
+                        if key not in {"html", "table_body"}
+                    }
+                )
+            elif raw_type in {"image", "figure"}:
+                normalized["type"] = raw_type
+                normalized["text"] = _mineru_inline_text(
+                    content.get("image_caption", content.get("caption", ""))
+                ).strip()
+                if content.get("img_path"):
+                    normalized["img_path"] = content["img_path"]
+            else:
+                normalized["text"] = _mineru_inline_text(content).strip()
+            flattened.append(normalized)
+            continue
+        flattened.append(dict(raw))
+    return flattened
+
+
+def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
+    """Convert MinerU content-list objects without compiling them into rules."""
+    payload = _flatten_mineru_content_list(payload)
 
     blocks: list[StructuredBlock] = []
     section = ""
@@ -286,15 +395,12 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
             kind = "paragraph"
 
         text = ""
-        for text_key in (
-            "text",
-            "content",
-            "table_body",
-            "html",
-            "caption",
-            "alt",
-            "img_path",
-        ):
+        text_keys = (
+            ("table_body", "text", "content", "html", "caption", "alt", "img_path")
+            if kind == "table"
+            else ("text", "content", "table_body", "html", "caption", "alt", "img_path")
+        )
+        for text_key in text_keys:
             value = raw.get(text_key)
             if isinstance(value, str) and value.strip():
                 text = value.strip()
@@ -316,6 +422,25 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
             order = int(raw.get("order", index))
         except (TypeError, ValueError):
             order = index
+        metadata = {
+            "mineru_raw_type": raw_type,
+            "mineru_source_index": index - 1,
+            **{
+                key: value
+                for key, value in raw.items()
+                if key
+                not in {
+                    "block_id",
+                    "id",
+                    "type",
+                    "block_type",
+                    "text",
+                    "content",
+                    "section",
+                    "order",
+                }
+            },
+        }
         blocks.append(
             StructuredBlock(
                 block_id=block_id,
@@ -323,24 +448,233 @@ def _blocks_from_mineru_payload(payload: Any) -> list[StructuredBlock]:
                 text=text,
                 section=str(raw.get("section", section)),
                 order=order,
-                metadata={
-                    key: value
-                    for key, value in raw.items()
-                    if key
-                    not in {
-                        "block_id",
-                        "id",
-                        "type",
-                        "block_type",
-                        "text",
-                        "content",
-                        "section",
-                        "order",
-                    }
-                },
+                metadata=metadata,
+                heading_level=int(level) if has_heading_level else None,
             )
         )
     return blocks
+
+
+_DOCX_WML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_DOCX_WML = f"{{{_DOCX_WML_NS}}}"
+
+
+def _docx_element_text(element: ElementTree.Element) -> str:
+    return "".join(
+        node.text or ""
+        for node in element.iter(f"{_DOCX_WML}t")
+    ).strip()
+
+
+def _docx_table_rows(table: ElementTree.Element) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in table.findall(f"{_DOCX_WML}tr"):
+        cells: list[str] = []
+        for cell in row.findall(f"{_DOCX_WML}tc"):
+            paragraphs = [
+                _docx_element_text(paragraph)
+                for paragraph in cell.findall(f"{_DOCX_WML}p")
+            ]
+            value = " ".join(text for text in paragraphs if text)
+            if not paragraphs:
+                value = _docx_element_text(cell)
+            cells.append(re.sub(r"\s+", " ", value).strip())
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _docx_table_html(rows: Sequence[Sequence[str]]) -> str:
+    return "<table><tbody>" + "".join(
+        "<tr>"
+        + "".join(
+            f"<td>{escape(cell).replace(chr(10), '<br/>')}</td>"
+            for cell in row
+        )
+        + "</tr>"
+        for row in rows
+    ) + "</tbody></table>"
+
+
+def _docx_front_table(path: Path) -> tuple[str, int] | None:
+    """Recover the semantic front-table block omitted by MinerU Office output.
+
+    The recovery is deliberately limited to a DOCX table whose own header is
+    ``条款号 / 条款名称 / 编列内容`` and which follows the actual front-table
+    heading.  It is not a general DOCX parser or a second document parser.
+    """
+
+    if path.suffix.lower() != ".docx":
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            document_xml = archive.read("word/document.xml")
+        root = ElementTree.fromstring(document_xml)
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+        return None
+
+    body = root.find(f"{_DOCX_WML}body")
+    if body is None:
+        return None
+    children = list(body)
+    for index, child in enumerate(children):
+        if child.tag != f"{_DOCX_WML}p":
+            continue
+        if re.sub(r"\s+", "", _docx_element_text(child)) != "投标人须知前附表":
+            continue
+        for candidate in children[index + 1 : index + 9]:
+            if candidate.tag != f"{_DOCX_WML}tbl":
+                continue
+            rows = _docx_table_rows(candidate)
+            if not rows:
+                continue
+            header = "|".join(rows[0])
+            if not all(label in header for label in ("条款号", "条款名称", "编列内容")):
+                continue
+            return _docx_table_html(rows), index
+    return None
+
+
+def _recover_project_front_table(
+    path: Path,
+    blocks: Sequence[StructuredBlock],
+) -> tuple[list[StructuredBlock], bool]:
+    """Add one source-grounded front-table block when MinerU omitted it."""
+
+    front_index = next(
+        (
+            index
+            for index, block in enumerate(blocks)
+            if block.type == "heading"
+            and _normalize_region_title(block.text) == "投标人须知前附表"
+        ),
+        None,
+    )
+    if front_index is None:
+        return list(blocks), False
+
+    front_level = _block_heading_level(blocks[front_index])
+    boundary = len(blocks)
+    for index in range(front_index + 1, len(blocks)):
+        block_level = _block_heading_level(blocks[index])
+        if (
+            blocks[index].type == "heading"
+            and front_level is not None
+            and block_level is not None
+            and block_level <= front_level
+        ):
+            boundary = index
+            break
+    if any(block.type == "table" for block in blocks[front_index + 1 : boundary]):
+        return list(blocks), False
+
+    recovered = _docx_front_table(path)
+    if recovered is None:
+        return list(blocks), False
+    table_body, docx_body_index = recovered
+    anchor = blocks[front_index]
+    table = StructuredBlock(
+        block_id=f"{anchor.block_id}_docx_front_table",
+        type="table",
+        text=table_body,
+        section=anchor.section or anchor.text,
+        order=blocks[boundary - 1].order if boundary > front_index + 1 else anchor.order,
+        metadata={
+            "source_recovery": "docx_front_table",
+            "docx_body_index": docx_body_index,
+            "table_body": table_body,
+        },
+    )
+    result = list(blocks)
+    result.insert(boundary, table)
+    return result, True
+
+
+def _mineru_raw_value(raw: dict[str, Any]) -> str:
+    for key in ("text", "table_body", "html", "caption", "alt", "img_path"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _mineru_payload_diagnostics(payload: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    type_counts: Counter[str] = Counter()
+    table_previews: list[str] = []
+    front_table_context: list[dict[str, Any]] = []
+    front_table_title_indexes: list[int] = []
+    for index, raw in enumerate(payload):
+        raw_type = str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
+        type_counts[raw_type] += 1
+        raw_value = _mineru_raw_value(raw)
+        is_table = raw_type == "table" or isinstance(raw.get("table_body"), str)
+        if is_table and raw_value and len(table_previews) < 8:
+            table_previews.append(raw_value[:240])
+        normalized_value = _normalize_region_title(raw_value)
+        if normalized_value == "投标人须知前附表" and (
+            raw_type in {"title", "heading"}
+            or raw.get("text_level")
+            or raw.get("heading_level")
+            or raw.get("level")
+        ):
+            front_table_title_indexes.append(index)
+
+    def raw_level(raw: dict[str, Any]) -> int | None:
+        for key in ("text_level", "heading_level", "level"):
+            try:
+                value = int(raw.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return None
+
+    for title_index in front_table_title_indexes:
+        context_indexes = list(range(max(0, title_index - 2), title_index + 1))
+        title_level = raw_level(payload[title_index])
+        for index in range(title_index + 1, min(len(payload), title_index + 16)):
+            raw = payload[index]
+            raw_type = str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
+            level = raw_level(raw)
+            if (
+                index > title_index
+                and raw_type in {"title", "heading", "header"}
+                and title_level is not None
+                and level is not None
+                and level <= title_level
+            ):
+                break
+            context_indexes.append(index)
+        for index in context_indexes:
+            raw = payload[index]
+            raw_type = str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
+            raw_value = _mineru_raw_value(raw)
+            front_table_context.append(
+                {
+                    "source_index": index,
+                    "type": raw_type,
+                    "text_preview": raw_value[:240],
+                    "is_table": raw_type == "table"
+                    or isinstance(raw.get("table_body"), str),
+                }
+            )
+
+    return {
+        "mineru_raw_item_count": len(payload),
+        "mineru_raw_type_counts": dict(sorted(type_counts.items())),
+        "mineru_raw_table_count": sum(
+            1
+            for raw in payload
+            if str(raw.get("type", raw.get("block_type", "paragraph"))).lower()
+            == "table"
+            or isinstance(raw.get("table_body"), str)
+        ),
+        "mineru_raw_table_previews": table_previews,
+        "mineru_front_table_raw_context": front_table_context,
+        "mineru_front_table_present": any(
+            item["is_table"] for item in front_table_context
+        ),
+    }
 
 
 class MinerUDocumentParser:
@@ -369,6 +703,7 @@ class MinerUDocumentParser:
             "mineru_called": False,
             "service_protocol": None,
             "elapsed_ms": None,
+            "project_front_table_recovered": False,
         }
 
     @property
@@ -559,8 +894,10 @@ class MinerUDocumentParser:
                 raise ComplianceExtractionError(
                     f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
                 )
-            blocks = _blocks_from_mineru_payload(
-                self._content_list_from_zip(result_response.content)
+            content_list = self._content_list_from_zip(result_response.content)
+            blocks = _blocks_from_mineru_payload(content_list)
+            blocks, project_front_table_recovered = _recover_project_front_table(
+                path, blocks
             )
             self.parse_diagnostics.update(
                 {
@@ -568,6 +905,8 @@ class MinerUDocumentParser:
                     "mineru_called": True,
                     "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
                     "task_id": task_id,
+                    "project_front_table_recovered": project_front_table_recovered,
+                    **_mineru_payload_diagnostics(content_list),
                 }
             )
             return blocks
@@ -614,20 +953,32 @@ class MinerUDocumentParser:
                         raise ComplianceExtractionError(
                             "MinerU 结果 ZIP 包含不安全路径。"
                         )
-                    if normalized.lower().endswith(("_content_list.json", "content_list.json")):
+                    if normalized.lower().endswith(
+                        ("_content_list.json", "_content_list_v2.json", "content_list.json")
+                    ):
                         members.append(info)
-                if len(members) != 1:
+                if not members:
                     raise ComplianceExtractionError(
-                        "MinerU 结果 ZIP 未返回唯一 content list。"
+                        "MinerU 结果 ZIP 未返回 content list。"
                     )
-                payload = json.loads(archive.read(members[0]))
+                v2_members = [
+                    info
+                    for info in members
+                    if info.filename.replace("\\", "/").lower().endswith(
+                        "_content_list_v2.json"
+                    )
+                ]
+                if len(v2_members) > 1:
+                    raise ComplianceExtractionError(
+                        "MinerU 结果 ZIP 返回了多个 content_list_v2。"
+                    )
+                selected = v2_members[0] if v2_members else members[0]
+                payload = json.loads(archive.read(selected))
         except ComplianceExtractionError:
             raise
         except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
             raise ComplianceExtractionError("无法读取 MinerU 结果 ZIP。") from exc
-        if not isinstance(payload, list):
-            raise ComplianceExtractionError("MinerU content list 必须是 JSON 数组。")
-        return [item for item in payload if isinstance(item, dict)]
+        return _flatten_mineru_content_list(payload)
 
 
 _FUNCTIONAL_REGION_PATTERNS: tuple[tuple[FunctionalRegionKind, re.Pattern[str]], ...] = (
@@ -660,8 +1011,34 @@ _MAJOR_SECTION_TITLE_RE = re.compile(
 )
 
 
+def _strip_markup(text: str) -> str:
+    """Remove presentation markup while retaining the source wording."""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("**", "")
+    return unescape(text)
+
+
+def _block_heading_level(block: StructuredBlock) -> int | None:
+    if block.heading_level is not None and block.heading_level > 0:
+        return block.heading_level
+    for key in ("text_level", "heading_level", "level"):
+        value = block.metadata.get(key)
+        try:
+            level = int(value)
+        except (TypeError, ValueError):
+            continue
+        if level > 0:
+            return level
+    return None
+
+
+def _has_structural_heading_levels(blocks: Sequence[StructuredBlock]) -> bool:
+    return any(_block_heading_level(block) is not None for block in blocks)
+
+
 def _normalize_region_title(text: str) -> str:
-    return re.sub(r"[\s\u3000]+", "", text).strip()
+    return re.sub(r"[\s\u3000]+", "", _strip_markup(text)).strip()
 
 
 def _functional_region_kind(title: str) -> FunctionalRegionKind | None:
@@ -674,8 +1051,18 @@ def _functional_region_kind(title: str) -> FunctionalRegionKind | None:
     return None
 
 
-def _is_region_title_block(block: StructuredBlock) -> bool:
-    if block.type == "heading" or block.text.strip() == block.section.strip():
+def _is_region_title_block(
+    block: StructuredBlock,
+    *,
+    has_structural_heading_levels: bool = False,
+) -> bool:
+    if block.type == "heading":
+        return True
+    if block.text.strip() == block.section.strip():
+        if has_structural_heading_levels and (
+            _functional_region_kind(block.text) == "templates"
+        ):
+            return False
         return True
     if block.type != "paragraph":
         return False
@@ -687,7 +1074,28 @@ def _is_region_title_block(block: StructuredBlock) -> bool:
         return False
     if re.search(r"[。；;，,：:]", text):
         return False
+    # Once MinerU has supplied heading levels, a flattened paragraph that
+    # merely repeats a chapter title is not allowed to start a template
+    # region.  Project and qualification titles are still accepted here
+    # because some MinerU exports keep those standalone labels as paragraphs.
+    if has_structural_heading_levels and (
+        _functional_region_kind(text) == "templates"
+    ):
+        return False
     return len(text) <= 80 and _functional_region_kind(text) is not None
+
+
+def _heading_closes_region(
+    block: StructuredBlock,
+    current_blocks: Sequence[StructuredBlock],
+) -> bool:
+    if not current_blocks:
+        return True
+    current_level = _block_heading_level(current_blocks[0])
+    block_level = _block_heading_level(block)
+    if current_level is None or block_level is None:
+        return True
+    return block_level <= current_level
 
 
 def identify_functional_regions(
@@ -696,6 +1104,7 @@ def identify_functional_regions(
     """Identify narrow tender-function areas without relying on chapter numbers."""
 
     ordered_blocks = sorted(blocks, key=lambda item: item.order)
+    has_structural_heading_levels = _has_structural_heading_levels(ordered_blocks)
     regions: list[FunctionalRegion] = []
     current_kind: FunctionalRegionKind | None = None
     current_title = ""
@@ -746,21 +1155,38 @@ def identify_functional_regions(
         current_blocks = []
 
     for block in ordered_blocks:
+        is_title_block = _is_region_title_block(
+            block,
+            has_structural_heading_levels=has_structural_heading_levels,
+        )
         title_kind = (
             _functional_region_kind(block.text)
-            if _is_region_title_block(block)
+            if is_title_block
             else None
         )
         is_excluded_title = bool(
-            _is_region_title_block(block)
+            is_title_block
             and _EXCLUDED_REGION_TITLE_RE.search(_normalize_region_title(block.text))
+            and (
+                current_kind is None
+                or _heading_closes_region(block, current_blocks)
+            )
         )
         is_major_boundary = bool(
-            _is_region_title_block(block)
+            is_title_block
             and _MAJOR_SECTION_TITLE_RE.search(block.text.strip())
             and title_kind is None
             and not is_excluded_title
         )
+        if (
+            has_structural_heading_levels
+            and is_title_block
+            and block.type == "heading"
+            and _block_heading_level(block) == 1
+            and title_kind is None
+            and not is_excluded_title
+        ):
+            is_major_boundary = True
 
         if title_kind is not None:
             flush()
@@ -811,7 +1237,7 @@ _ATTACHMENT_RE = re.compile(
 
 
 def _template_name(value: str) -> str:
-    name = re.sub(r"^\s*\d+(?:\.\d+)+\s*", "", value.strip())
+    name = re.sub(r"^\s*\d+(?:\.\d+)+\s*", "", _strip_markup(value).strip())
     name = _TEMPLATE_NUMBER_PREFIX_RE.sub("", name)
     name = _TEMPLATE_FORMAT_SUFFIX_RE.sub("", name).strip()
     name = re.sub(r"[★☆*]\s*", "", name, count=1)
@@ -868,6 +1294,20 @@ _TEMPLATE_MATERIAL_ONLY_RE = re.compile(
 def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) -> bool:
     if block.block_id == region.block_ids[0] or block.text.strip() == region.title.strip():
         return False
+    if _has_structural_heading_levels(region.blocks):
+        root_level = _block_heading_level(region.blocks[0])
+        level = _block_heading_level(block)
+        # A structured template chapter may contain level-2 grouping headings
+        # (目录、商务部分等).  Its actual form entries are the next structural
+        # level, so use hierarchy rather than the form-name keyword list.
+        if (
+            block.type != "heading"
+            or root_level is None
+            or level is None
+            or level < root_level + 2
+        ):
+            return False
+        return True
     if block.type == "paragraph":
         text = block.text.strip()
         if len(text) > 80 or re.search(r"[。；;，,：:]", text):
@@ -956,55 +1396,61 @@ def extract_templates_from_regions(
             if block.block_id not in index_block_ids
             and _is_template_item_title(block, region)
         ]
-        item_indexes: list[int] = []
-        for candidate_index in candidate_indexes:
-            candidate = region.blocks[candidate_index]
-            candidate_key = _compact_source_text(_template_name(candidate.text))
-            if item_indexes:
-                previous = region.blocks[item_indexes[-1]]
-                previous_key = _compact_source_text(_template_name(previous.text))
-                if (
-                    candidate_key == previous_key
-                    and candidate_index - item_indexes[-1] <= 2
-                ):
-                    continue
-                if (
-                    "如有" in previous.text
-                    and candidate_index - item_indexes[-1] <= 2
-                    and (
-                        previous_key[:10] in candidate_key
-                        or candidate_key[:10] in previous_key
-                    )
-                ):
-                    continue
-                if (
-                    previous_key
-                    and previous_key in candidate_key
-                    and candidate_index - item_indexes[-1] <= 2
-                    and candidate.text.strip().startswith("近")
-                ):
-                    continue
-            has_structural_prefix = bool(
-                _TEMPLATE_NUMBER_PREFIX_RE.match(candidate.text.strip())
-                or re.match(r"^\s*\d+(?:\.\d+)+", candidate.text.strip())
-            )
-            if has_structural_prefix:
-                next_candidate = next(
-                    (
-                        next_index
-                        for next_index in candidate_indexes
-                        if next_index > candidate_index
-                        and next_index - candidate_index <= 2
-                        and _compact_source_text(
-                            _template_name(region.blocks[next_index].text)
+        if _has_structural_heading_levels(region.blocks):
+            # MinerU has already distinguished chapter/group/form levels.  Do
+            # not re-discover form boundaries from bold text inside a form;
+            # those unlevelled labels are part of the parent form body.
+            item_indexes = candidate_indexes
+        else:
+            item_indexes = []
+            for candidate_index in candidate_indexes:
+                candidate = region.blocks[candidate_index]
+                candidate_key = _compact_source_text(_template_name(candidate.text))
+                if item_indexes:
+                    previous = region.blocks[item_indexes[-1]]
+                    previous_key = _compact_source_text(_template_name(previous.text))
+                    if (
+                        candidate_key == previous_key
+                        and candidate_index - item_indexes[-1] <= 2
+                    ):
+                        continue
+                    if (
+                        "如有" in previous.text
+                        and candidate_index - item_indexes[-1] <= 2
+                        and (
+                            previous_key[:10] in candidate_key
+                            or candidate_key[:10] in previous_key
                         )
-                        == candidate_key
-                    ),
-                    None,
+                    ):
+                        continue
+                    if (
+                        previous_key
+                        and previous_key in candidate_key
+                        and candidate_index - item_indexes[-1] <= 2
+                        and candidate.text.strip().startswith("近")
+                    ):
+                        continue
+                has_structural_prefix = bool(
+                    _TEMPLATE_NUMBER_PREFIX_RE.match(candidate.text.strip())
+                    or re.match(r"^\s*\d+(?:\.\d+)+", candidate.text.strip())
                 )
-                if next_candidate is not None:
-                    continue
-            item_indexes.append(candidate_index)
+                if has_structural_prefix:
+                    next_candidate = next(
+                        (
+                            next_index
+                            for next_index in candidate_indexes
+                            if next_index > candidate_index
+                            and next_index - candidate_index <= 2
+                            and _compact_source_text(
+                                _template_name(region.blocks[next_index].text)
+                            )
+                            == candidate_key
+                        ),
+                        None,
+                    )
+                    if next_candidate is not None:
+                        continue
+                item_indexes.append(candidate_index)
         if len(region.blocks) == 1:
             continue
         if not item_indexes:
@@ -1020,6 +1466,25 @@ def extract_templates_from_regions(
             continue
         for item_number, start in enumerate(item_indexes):
             end = item_indexes[item_number + 1] if item_number + 1 < len(item_indexes) else len(region.blocks)
+            if _has_structural_heading_levels(region.blocks):
+                item_level = _block_heading_level(region.blocks[start])
+                parent_boundary = next(
+                    (
+                        boundary_index
+                        for boundary_index in range(start + 1, end)
+                        if region.blocks[boundary_index].type == "heading"
+                        and item_level is not None
+                        and (
+                            boundary_level := _block_heading_level(
+                                region.blocks[boundary_index]
+                            )
+                        ) is not None
+                        and boundary_level <= item_level
+                    ),
+                    None,
+                )
+                if parent_boundary is not None:
+                    end = parent_boundary
             template_blocks = region.blocks[start:end]
             templates.append(
                 _template_from_blocks(
@@ -1064,31 +1529,115 @@ _PROJECT_VALUE_RE = re.compile(
 )
 
 
+class _MinerUTableParser(HTMLParser):
+    """Extract logical rows from MinerU's HTML table representation."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        tag = tag.lower()
+        if tag == "tr":
+            if self._row is not None:
+                self._finish_row()
+            self._row = []
+        elif tag in {"td", "th"}:
+            if self._row is None:
+                self._row = []
+            if self._cell is not None:
+                self._finish_cell()
+            self._cell = []
+        elif tag in {"br", "p", "div", "li"} and self._cell:
+            self._cell.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"td", "th"}:
+            self._finish_cell()
+        elif tag == "tr":
+            self._finish_row()
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def _finish_cell(self) -> None:
+        if self._cell is None:
+            return
+        if self._row is None:
+            self._row = []
+        value = re.sub(r"\s+", " ", unescape("".join(self._cell))).strip()
+        self._row.append(value)
+        self._cell = None
+
+    def _finish_row(self) -> None:
+        self._finish_cell()
+        if self._row is not None:
+            if any(cell for cell in self._row):
+                self.rows.append(self._row)
+            self._row = None
+
+    def finish(self) -> list[list[str]]:
+        self._finish_row()
+        return self.rows
+
+
+def _mineru_html_table_rows(text: str) -> list[list[str]]:
+    if "<tr" not in text.lower():
+        return []
+    parser = _MinerUTableParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except (TypeError, ValueError):
+        return []
+    return parser.finish()
+
+
 def _project_rows(region: FunctionalRegion) -> Iterable[tuple[StructuredBlock, str]]:
     for block in region.blocks[1:]:
-        lines = block.text.splitlines() if block.type == "table" else [block.text]
+        if block.type == "table":
+            table_text = block.metadata.get("table_body")
+            if not isinstance(table_text, str) or not table_text.strip():
+                table_text = block.text
+            html_rows = _mineru_html_table_rows(table_text)
+            lines = (
+                [" | ".join(cell for cell in row if cell) for row in html_rows]
+                if html_rows
+                else block.text.splitlines()
+            )
+        else:
+            lines = [block.text]
         for line in lines:
-            text = line.strip()
+            text = _strip_markup(line).strip()
             if text:
                 yield block, text
 
 
 def _project_row_label(row: str) -> str:
-    columns = [column.strip() for column in row.split("|")]
+    columns = [column.strip() for column in _strip_markup(row).split("|")]
     if len(columns) >= 2:
         return " | ".join(columns[:2])
     return row
 
 
 def _project_value(row: str) -> str | None:
-    value_part = re.split(r"\||[：:]", row, maxsplit=1)
-    candidate = value_part[1].strip() if len(value_part) == 2 else row
+    columns = [column.strip() for column in _strip_markup(row).split("|")]
+    if len(columns) >= 3:
+        candidate = " | ".join(column for column in columns[2:] if column).strip()
+    else:
+        value_part = re.split(r"\||[：:]", row, maxsplit=1)
+        candidate = value_part[1].strip() if len(value_part) == 2 else row
     match = _PROJECT_VALUE_RE.search(candidate)
     if match:
         return match.group(0)
     if re.search(r"无需|不允许|允许|只需|仅需|不得|不超过|应当|必须", candidate):
         return candidate
-    return candidate if len(value_part) == 2 and candidate else None
+    return candidate if candidate and (len(columns) >= 2 or "|" in row or re.search(r"[：:]", row)) else None
 
 
 def extract_project_requirements_from_regions(
@@ -1165,6 +1714,39 @@ def _supplemental_material_names(text: str) -> list[str]:
     return names
 
 
+_PARENTHETICAL_PAIRS = {
+    "（": "）",
+    "(": ")",
+    "【": "】",
+    "[": "]",
+}
+
+
+def _complete_parenthetical_evidence(text: str, keyword: str) -> str:
+    closing_to_opening = {
+        closing: opening
+        for opening, closing in _PARENTHETICAL_PAIRS.items()
+    }
+    stack: list[tuple[str, int]] = []
+    spans: list[tuple[int, int]] = []
+    for index, character in enumerate(text):
+        if character in _PARENTHETICAL_PAIRS:
+            stack.append((character, index))
+            continue
+        opening = closing_to_opening.get(character)
+        if opening is None or not stack or stack[-1][0] != opening:
+            continue
+        _, start = stack.pop()
+        spans.append((start, index + 1))
+
+    candidates = [
+        text[start:end].strip()
+        for start, end in spans
+        if keyword in text[start:end]
+    ]
+    return min(candidates, key=len, default="")
+
+
 def _supplemental_evidence_snippet(text: str, name: str) -> str:
     keyword = {
         "营业执照": "营业执照",
@@ -1175,17 +1757,19 @@ def _supplemental_evidence_snippet(text: str, name: str) -> str:
         "资格证书": "资格证书",
         "检测报告": "检测报告",
     }.get(name, name)
-    boundaries = "。；;，,\n"
-    snippets: list[str] = []
-    for match in re.finditer(re.escape(keyword), text):
-        start = max(
-            (text.rfind(mark, 0, match.start()) for mark in boundaries),
-            default=-1,
-        )
-        end_candidates = [text.find(mark, match.end()) for mark in boundaries]
-        end_candidates = [index for index in end_candidates if index >= 0]
-        end = min(end_candidates, default=len(text))
-        snippets.append(text[start + 1 : end].strip())
+    parenthetical = _complete_parenthetical_evidence(text, keyword)
+    if (
+        parenthetical
+        and _SUPPLEMENTAL_SUBMISSION_RE.search(parenthetical)
+        and not _SUPPLEMENTAL_EXCLUDED_RE.search(parenthetical)
+    ):
+        return parenthetical
+    clauses = [
+        clause.strip().strip("。；;，,")
+        for clause in re.split(r"(?<=[。；;，,：:])|\n+", text)
+        if clause.strip()
+    ]
+    snippets = [clause for clause in clauses if keyword in clause]
     valid_snippets = [
         snippet
         for snippet in snippets
@@ -1210,7 +1794,10 @@ def extract_supplemental_materials_from_regions(
         if region.kind != "supplemental_materials":
             continue
         for block in region.blocks[1:]:
-            text = re.sub(r"\s+", " ", block.text).strip()
+            # Keep MinerU line boundaries: one block may contain several
+            # numbered qualification clauses, and collapsing them first makes
+            # the evidence source span the whole block.
+            text = re.sub(r"[ \t\f\v]+", " ", block.text).strip()
             if not text:
                 continue
             for name in _supplemental_material_names(text):
@@ -1233,7 +1820,7 @@ def extract_supplemental_materials_from_regions(
                         "source": {
                             "section": region.section,
                             "block_ids": [block.block_id],
-                            "source_text": block.text,
+                            "source_text": material,
                         },
                     }
                 )
@@ -1318,10 +1905,18 @@ def _normalize_source(
         (block_map[block_id] for block_id in source_ids),
         key=lambda block: block.order,
     )
+    full_source_text = "\n".join(block.text for block in source_blocks)
+    requested_source_text = source.get("source_text")
+    source_text = full_source_text
+    if isinstance(requested_source_text, str) and requested_source_text.strip():
+        requested_key = _compact_source_text(_strip_markup(requested_source_text))
+        full_source_key = _compact_source_text(_strip_markup(full_source_text))
+        if requested_key and requested_key in full_source_key:
+            source_text = requested_source_text.strip()
     return {
         "section": source_blocks[0].section,
         "block_ids": [block.block_id for block in source_blocks],
-        "source_text": "\n".join(block.text for block in source_blocks),
+        "source_text": source_text,
     }
 
 
@@ -2294,6 +2889,13 @@ def extract_tender_compliance_objects(
         "parsed_heading_levels": [],
         "parsed_blocks_with_metadata": 0,
         "parsed_metadata_keys": [],
+        "mineru_raw_item_count": None,
+        "mineru_raw_type_counts": {},
+        "mineru_raw_table_count": None,
+        "mineru_raw_table_previews": [],
+        "mineru_front_table_raw_context": [],
+        "mineru_front_table_present": None,
+        "project_front_table_recovered": False,
         "functional_regions": 0,
         "template_count": 0,
         "project_requirement_count": 0,
@@ -2420,6 +3022,10 @@ def extract_tender_compliance_objects(
             blocks = parsed_cache_blocks
             stats["parser_cache_hit"] = True
             stats["parser_execution_source"] = "parser_cache"
+            stats["project_front_table_recovered"] = any(
+                block.metadata.get("source_recovery") == "docx_front_table"
+                for block in blocks
+            )
             descriptor = getattr(active_parser, "cache_descriptor", None)
             if callable(descriptor):
                 descriptor = descriptor()
@@ -2442,6 +3048,17 @@ def extract_tender_compliance_objects(
                 stats["mineru_call_elapsed_ms"] = diagnostics.get(
                     "elapsed_ms", stats["parser_elapsed_ms"]
                 )
+                for key in (
+                    "mineru_raw_item_count",
+                    "mineru_raw_type_counts",
+                    "mineru_raw_table_count",
+                    "mineru_raw_table_previews",
+                    "mineru_front_table_raw_context",
+                    "mineru_front_table_present",
+                    "project_front_table_recovered",
+                ):
+                    if key in diagnostics:
+                        stats[key] = diagnostics[key]
             stats["parser_execution_source"] = "parse"
             if parser_cache is not None:
                 parser_cache.set(

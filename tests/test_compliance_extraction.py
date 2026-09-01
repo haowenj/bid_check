@@ -283,6 +283,102 @@ def test_supplemental_materials_can_extract_evidence_from_mixed_qualification_bl
     assert "商业信誉" not in materials[0]["material"]
 
 
+def test_supplemental_material_keeps_complete_parenthetical_contract_evidence():
+    region = FunctionalRegion(
+        kind="supplemental_materials",
+        title="投标产品资格要求",
+        section="投标产品资格要求",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标产品资格要求", "投标产品资格要求", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人须提供业绩证明。（需提供合同关键页扫描件，如为单项合同，应包括项目名称、金额页；"
+                "如为框架合同，还需提供相应的采购订单或结算单据）。\n"
+                "2.4 投标产品制造商资格要求。",
+                "投标产品资格要求",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    materials = extract_supplemental_materials_from_regions([region])
+
+    contract_pages = next(
+        item for item in materials if item["name"] == "合同关键页"
+    )
+    assert contract_pages["material"] == (
+        "（需提供合同关键页扫描件，如为单项合同，应包括项目名称、金额页；"
+        "如为框架合同，还需提供相应的采购订单或结算单据）"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_text", "expected", "forbidden"),
+    [
+        (
+            "须提供合同关键页扫描件。（需提供合同关键页扫描件，如为单项合同，应包括项目名称。）后续章节内容。",
+            "（需提供合同关键页扫描件，如为单项合同，应包括项目名称。）",
+            "后续章节内容",
+        ),
+        (
+            "须提供合同关键页扫描件。(需提供合同关键页扫描件,如为单项合同,应包括项目名称;合同签订日期页.)后续章节内容。",
+            "(需提供合同关键页扫描件,如为单项合同,应包括项目名称;合同签订日期页.)",
+            "后续章节内容",
+        ),
+        (
+            "须提供合同关键页扫描件。（需提供合同关键页扫描件，如为单项合同，应包括项目名称、金额页；"
+            "如为框架合同，应包括签字盖章页等，还需提供采购订单、结算单据或发票。）后续章节内容。",
+            "（需提供合同关键页扫描件，如为单项合同，应包括项目名称、金额页；"
+            "如为框架合同，应包括签字盖章页等，还需提供采购订单、结算单据或发票。）",
+            "后续章节内容",
+        ),
+        (
+            "须提供合同关键页扫描件，（需提供合同关键页扫描件，如为单项合同，应包括项目名称；"
+            "后续章节开始，其他材料要求。",
+            None,
+            "后续章节开始，其他材料要求",
+        ),
+    ],
+    ids=[
+        "chinese_parentheses",
+        "english_parentheses",
+        "multiple_internal_punctuation",
+        "incomplete_parentheses",
+    ],
+)
+def test_supplemental_material_parenthesis_boundaries(
+    case_text: str,
+    expected: str | None,
+    forbidden: str,
+):
+    region = FunctionalRegion(
+        kind="supplemental_materials",
+        title="投标产品资格要求",
+        section="投标产品资格要求",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标产品资格要求", "投标产品资格要求", 1),
+            block("b2", "paragraph", case_text, "投标产品资格要求", 2),
+        ],
+        text="",
+        order=1,
+    )
+
+    contract_pages = next(
+        item
+        for item in extract_supplemental_materials_from_regions([region])
+        if item["name"] == "合同关键页"
+    )
+
+    if expected is not None:
+        assert contract_pages["material"] == expected
+    assert forbidden not in contract_pages["material"]
+
+
 def _template(name: str, block_id: str) -> dict:
     return {
         "id": f"t-{block_id}",
@@ -727,11 +823,367 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
     assert blocks[0].metadata["text_level"] == 1
     assert blocks[3].text.startswith("<table>")
     assert blocks[4].metadata["img_path"] == "images/001.jpg"
+    assert blocks[0].heading_level == 1
+    assert blocks[0].metadata["mineru_raw_type"] == "text"
+    assert blocks[0].metadata["mineru_source_index"] == 0
+    assert parser.parse_diagnostics["mineru_raw_table_count"] == 1
     assert parser.parser_name == "mineru"
     assert parser.parse_diagnostics["mineru_called"] is True
     assert parser.parse_diagnostics["service_protocol"] == "mineru_tasks"
     assert "command" not in parser.cache_descriptor
     client.close()
+
+
+def test_mineru_parser_recovers_docx_front_table_when_mineru_omits_it(tmp_path):
+    path = tmp_path / "tender.docx"
+    document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>投标人须知前附表</w:t></w:r></w:p>
+    <w:p><w:r><w:t>说明</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr><w:tc><w:p><w:r><w:t>条款号</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>条款名称</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>编列内容</w:t></w:r></w:p></w:tc></w:tr>
+      <w:tr><w:tc><w:p><w:r><w:t>3.1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>投标文件组成</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>商务、技术、报价文件</w:t></w:r></w:p></w:tc></w:tr>
+      <w:tr><w:tc><w:p><w:r><w:t>3.4.1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>投标有效期</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>90天</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>总则</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_xml)
+
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "result_content_list.json",
+            json.dumps(
+                [
+                    {"type": "text", "text": "投标人须知前附表", "text_level": 2},
+                    {"type": "text", "text": "说明"},
+                    {"type": "text", "text": "总则", "text_level": 1},
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/tasks":
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": "task-front-table-recovery",
+                    "status_url": "https://mineru.example/tasks/task-front-table-recovery",
+                    "result_url": "https://mineru.example/tasks/task-front-table-recovery/result",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/result"):
+            return httpx.Response(200, content=archive_bytes.getvalue())
+        if request.method == "GET" and request.url.path.endswith("task-front-table-recovery"):
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    parser = extraction_module.MinerUDocumentParser(
+        mineru_url="https://mineru.example",
+        mineru_backend="hybrid-engine",
+        http_client=client,
+        poll_interval_seconds=0,
+    )
+
+    blocks = parser.parse(path)
+    front_table = next(block for block in blocks if block.type == "table")
+    regions = identify_functional_regions(blocks)
+    requirements = extract_project_requirements_from_regions(regions)
+
+    assert front_table.metadata["source_recovery"] == "docx_front_table"
+    assert front_table.metadata["table_body"].startswith("<table>")
+    assert [item["value"] for item in requirements] == ["商务、技术、报价文件", "90天"]
+    assert parser.parse_diagnostics["mineru_front_table_present"] is False
+    assert parser.parse_diagnostics["project_front_table_recovered"] is True
+    client.close()
+
+
+def test_mineru_structure_drives_front_table_and_template_segmentation():
+    payload = [
+        {"type": "text", "text": "第二章 投标人须知", "text_level": 1},
+        {"type": "text", "text": "投标人须知前附表", "text_level": 2},
+        {
+            "type": "table",
+            "table_body": (
+                "<table><tbody>"
+                "<tr><th>项目</th><th>要求</th></tr>"
+                "<tr><td>单个组成部分大小</td><td>不超过50MB</td></tr>"
+                "<tr><td>投标有效期</td><td>90天</td></tr>"
+                "</tbody></table>"
+            ),
+        },
+        {"type": "text", "text": "3.5投标保证金", "text_level": 1},
+        {"type": "text", "text": "无需递交投标保证金。"},
+        {"type": "text", "text": "3.7投标文件的式样、密封和标记", "text_level": 1},
+        {"type": "text", "text": "纸质文件规则仅适用特定情形。"},
+        {"type": "text", "text": "第六章 投标文件格式", "text_level": 1},
+        {"type": "text", "text": "18.1.8 法定代表人授权委托书", "text_level": 3},
+        {"type": "text", "text": "委托事项：____"},
+        {"type": "text", "text": "18.1.9 廉洁投标承诺书", "text_level": 3},
+        {"type": "text", "text": "承诺内容：____"},
+        {"type": "text", "text": "18.1.10 特定关系信息收集表", "text_level": 3},
+        {"type": "text", "text": "关系信息：____"},
+        {"type": "text", "text": "18.1.11 诉讼及仲裁情况", "text_level": 3},
+        {"type": "text", "text": "近年情况：____"},
+        {
+            "type": "text",
+            "text": "18.1.12 招标代理服务费支付承诺函",
+            "text_level": 3,
+        },
+        {"type": "text", "text": "服务费承诺：____"},
+        {"type": "text", "text": "18.1.13 资格审查资料", "text_level": 3},
+        {"type": "text", "text": "资格资料：____"},
+        {"type": "text", "text": "第七章 其他", "text_level": 1},
+    ]
+
+    blocks = extraction_module._blocks_from_mineru_payload(payload)
+    regions = identify_functional_regions(blocks)
+    requirements = extract_project_requirements_from_regions(regions)
+    templates = extract_templates_from_regions(regions)
+
+    assert len(requirements) == 2
+    assert any("50MB" in item["requirement"] for item in requirements)
+    assert any("90天" in item["requirement"] for item in requirements)
+    names = [item["name"] for item in templates]
+    assert names == [
+        "法定代表人授权委托书",
+        "廉洁投标承诺书",
+        "特定关系信息收集表",
+        "诉讼及仲裁情况",
+        "招标代理服务费支付承诺函",
+        "资格审查资料",
+    ]
+    assert all("3.5" not in name and "3.7" not in name for name in names)
+    assert all(item["body"].strip() != item["name"] for item in templates)
+    proxy_index = names.index("招标代理服务费支付承诺函")
+    assert "服务费承诺" in templates[proxy_index]["body"]
+    assert "资格资料" not in templates[proxy_index]["body"]
+
+
+def test_structural_parent_heading_closes_previous_template_without_parent_template():
+    blocks = [
+        StructuredBlock(
+            "b1",
+            "heading",
+            "第六章 投标文件格式",
+            "第六章 投标文件格式",
+            1,
+            heading_level=1,
+        ),
+        StructuredBlock(
+            "b2",
+            "heading",
+            "18.1.22 ★知识产权不侵权承诺函",
+            "第六章 投标文件格式",
+            2,
+            heading_level=3,
+        ),
+        block(
+            "b3",
+            "paragraph",
+            "我方承诺不存在知识产权侵权行为。",
+            "第六章 投标文件格式",
+            3,
+        ),
+        StructuredBlock(
+            "b4",
+            "heading",
+            "二、特定关系信息收集表",
+            "第六章 投标文件格式",
+            4,
+            heading_level=2,
+        ),
+        block(
+            "b5",
+            "paragraph",
+            "特定关系信息表内容。",
+            "第六章 投标文件格式",
+            5,
+        ),
+        StructuredBlock(
+            "b6",
+            "heading",
+            "18.1.23 技术投标文件封面",
+            "第六章 投标文件格式",
+            6,
+            heading_level=3,
+        ),
+        block(
+            "b7",
+            "paragraph",
+            "技术投标文件封面内容。",
+            "第六章 投标文件格式",
+            7,
+        ),
+    ]
+    region = FunctionalRegion(
+        kind="templates",
+        title="第六章 投标文件格式",
+        section="第六章 投标文件格式",
+        block_ids=[block.block_id for block in blocks],
+        blocks=blocks,
+        text="\n".join(block.text for block in blocks),
+        order=1,
+    )
+
+    templates = extract_templates_from_regions([region])
+
+    intellectual_property = next(
+        template
+        for template in templates
+        if template["name"] == "知识产权不侵权承诺函"
+    )
+    assert intellectual_property["block_ids"] == ["b2", "b3"]
+    assert "特定关系信息收集表" not in intellectual_property["body"]
+    assert all(
+        template["name"] != "二、特定关系信息收集表"
+        for template in templates
+    )
+    assert next(
+        template
+        for template in templates
+        if template["name"] == "技术投标文件封面"
+    )["block_ids"] == ["b6", "b7"]
+
+
+def test_project_requirements_parse_mineru_html_table_rows():
+    blocks = extraction_module._blocks_from_mineru_payload(
+        [
+            {"type": "text", "text": "投标人须知前附表", "text_level": 2},
+            {
+                "type": "table",
+                "table_body": (
+                    "<table><tr><td>投标文件组成</td><td>商务、技术文件</td></tr>"
+                    "<tr><td>总容量</td><td>不超过500MB</td></tr></table>"
+                ),
+            },
+        ]
+    )
+    region = identify_functional_regions(blocks)[0]
+
+    requirements = extract_project_requirements_from_regions([region])
+
+    assert [item["requirement"] for item in requirements] == [
+        "投标文件组成 | 商务、技术文件",
+        "总容量 | 不超过500MB",
+    ]
+
+
+def test_mineru_v2_nested_title_and_table_are_flattened_without_losing_structure():
+    blocks = extraction_module._blocks_from_mineru_payload(
+        [
+            {
+                "type": "title",
+                "anchor": "_Toc1",
+                "content": {
+                    "title_content": [
+                        {"type": "text", "content": "投标人须知前附表", "style": ["bold"]}
+                    ],
+                    "level": 2,
+                },
+            },
+            {
+                "type": "table",
+                "content": {
+                    "table_caption": [],
+                    "html": (
+                        "<table><tr><td>总容量</td><td>不超过500MB</td></tr></table>"
+                    ),
+                    "table_type": "simple_table",
+                },
+            },
+        ]
+    )
+
+    assert [block.type for block in blocks] == ["heading", "table"]
+    assert blocks[0].text == "投标人须知前附表"
+    assert blocks[0].heading_level == 2
+    assert blocks[0].metadata["anchor"] == "_Toc1"
+    assert blocks[1].text.startswith("<table>")
+    assert blocks[1].metadata["table_type"] == "simple_table"
+
+
+def test_mineru_zip_prefers_structured_content_list_v2():
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "tender_content_list.json",
+            json.dumps([{"type": "text", "text": "legacy"}], ensure_ascii=False),
+        )
+        archive.writestr(
+            "tender_content_list_v2.json",
+            json.dumps([{"type": "title", "content": {"title_content": [], "level": 1}}], ensure_ascii=False),
+        )
+
+    payload = extraction_module.MinerUDocumentParser._content_list_from_zip(
+        archive_bytes.getvalue()
+    )
+
+    assert payload[0]["type"] == "title"
+
+
+def test_supplemental_material_source_text_is_evidence_snippet_not_whole_block():
+    region = FunctionalRegion(
+        kind="supplemental_materials",
+        title="招标公告",
+        section="招标公告",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "招标公告", "招标公告", 1),
+            block(
+                "b2",
+                "paragraph",
+                "投标人应具有良好的商业信誉；如非事业单位，须提供有效的营业执照正本或副本扫描件；"
+                "能够提供售后服务。",
+                "招标公告",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    material = extract_supplemental_materials_from_regions([region])[0]
+
+    assert material["source"]["block_ids"] == ["b2"]
+    assert material["source"]["source_text"] == material["material"]
+    assert "商业信誉" not in material["source"]["source_text"]
+
+
+def test_supplemental_evidence_uses_smallest_structural_clause_in_mixed_mineru_block():
+    region = FunctionalRegion(
+        kind="supplemental_materials",
+        title="投标产品资格要求",
+        section="投标产品资格要求",
+        block_ids=["b1", "b2"],
+        blocks=[
+            block("b1", "heading", "投标产品资格要求", "投标产品资格要求", 1),
+            block(
+                "b2",
+                "paragraph",
+                "2.3.6 投标产品应满足以下关键技术指标：\n"
+                "2.3.3 业绩要求：投标人须提供同类型业绩证明材料。\n"
+                "2.4.1 制造商应提供合法有效的登记（或注册）证明文件。",
+                "投标产品资格要求",
+                2,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    materials = extract_supplemental_materials_from_regions([region])
+
+    by_name = {item["name"]: item for item in materials}
+    assert by_name["业绩证明"]["material"] == "投标人须提供同类型业绩证明材料"
+    assert by_name["制造商登记证明"]["material"] == (
+        "2.4.1 制造商应提供合法有效的登记（或注册）证明文件"
+    )
 
 
 def test_parse_cache_key_distinguishes_mineru_service_configurations(tmp_path):
