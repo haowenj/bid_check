@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -147,10 +148,235 @@ def test_conditional_attachment_requirement_is_a_candidate_without_local_fail_ru
     assert template_has_attachment_requirement(template) is True
 
 
+def test_attachment_candidate_accepts_explicit_scanned_material_without_action_verb():
+    template = _template(
+        "资格审查资料",
+        "营业执照正本或副本、事业单位法人证书或扫描件。",
+    )
+
+    assert template_has_attachment_requirement(template) is True
+
+
 def test_21_and_21_x_are_excluded_from_attachment_jobs():
     assert is_complex_attachment_scope({}, {"title": "21 业绩情况表"}) is True
     assert is_complex_attachment_scope({}, {"title": "21.3 合同关键页"}) is True
     assert is_complex_attachment_scope({}, {"title": "20 基本开户银行情况"}) is False
+
+
+def _all_ordinary_attachment_document() -> dict[str, Any]:
+    module_names = [
+        ("s-license", "b-license", "4 营业执照材料", "营业执照模块内容。"),
+        ("s-software", "b-software", "5 软件使用权说明", "软件使用情况说明。"),
+        ("s-bank-proof", "b-bank-proof", "6 开户证明材料", "开户证明模块内容。"),
+        ("s-bid-letter", "b-bid-letter", "7 投标函", "投标函正文。"),
+        ("s-performance", "b-performance", "21 业绩情况表", "业绩表正文。"),
+        ("s-contract", "b-contract", "21.3 合同关键页", "合同关键页正文。"),
+    ]
+    return {
+        "sections": [
+            {
+                "section_id": section_id,
+                "parent_section_id": None,
+                "title": title,
+                "path": [title],
+                "direct_block_ids": [block_id],
+            }
+            for section_id, block_id, title, _text in module_names
+        ],
+        "blocks": [
+            {
+                "block_id": block_id,
+                "type": "paragraph",
+                "text": text,
+                "order": index + 1,
+            }
+            for index, (_section_id, block_id, _title, text) in enumerate(module_names)
+        ],
+        "tables": [],
+        "images": [],
+    }
+
+
+def _all_ordinary_attachment_templates() -> list[dict[str, Any]]:
+    return [
+        _template("营业执照材料", "应提供营业执照复印件。"),
+        _template(
+            "软件使用权说明",
+            "如采用第三方软件，应提供合法使用权证明；不涉及则无需提供。",
+        ),
+        _template("开户证明材料", "应提供基本账户开户证明。"),
+        _template("投标函", "本页填写投标函正文。"),
+        _template("业绩情况表", "应提供业绩合同复印件。"),
+        _template("合同关键页", "应提供合同关键页复印件。"),
+    ]
+
+
+class FailOneAttachmentLLM(RecordingAttachmentLLM):
+    def __init__(self, failing_template_name: str) -> None:
+        super().__init__()
+        self.failing_template_name = failing_template_name
+
+    def review_attachment(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        images: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.failing_template_name in user_prompt:
+            raise RuntimeError("simulated attachment failure")
+        return super().review_attachment(system_prompt, user_prompt, images)
+
+
+def test_runner_checks_all_matched_ordinary_templates_in_template_order(tmp_path: Path):
+    templates = _all_ordinary_attachment_templates()
+    llm = RecordingAttachmentLLM()
+
+    result = run_attachment_review(
+        {"templates": templates},
+        {
+            "structured_document": _all_ordinary_attachment_document(),
+            "artifact_dir": str(tmp_path),
+        },
+        llm=llm,
+    )
+
+    assert [item["template_name"] for item in result["attachment_reviews"]] == [
+        "营业执照材料",
+        "软件使用权说明",
+        "开户证明材料",
+    ]
+    assert result["stats"]["selected_template_count"] == 3
+    assert len(llm.calls) == 3
+    conditional_call = next(
+        call for call in llm.calls if "软件使用权说明" in call[1]
+    )
+    assert "不涉及则无需提供" in conditional_call[1]
+    assert conditional_call[2] == []
+
+
+def test_runner_keeps_one_model_failure_isolated_from_other_attachment_jobs(tmp_path: Path):
+    result = run_attachment_review(
+        {"templates": _all_ordinary_attachment_templates()},
+        {
+            "structured_document": _all_ordinary_attachment_document(),
+            "artifact_dir": str(tmp_path),
+        },
+        llm=FailOneAttachmentLLM("营业执照材料"),
+    )
+
+    assert len(result["attachment_reviews"]) == 3
+    failed = next(
+        item
+        for item in result["attachment_reviews"]
+        if item["template_name"] == "营业执照材料"
+    )
+    assert failed["execution_status"] == "failed"
+    assert result["stats"]["llm_failed_count"] == 1
+    assert result["stats"]["llm_completed_calls"] == 2
+
+
+class MissingIdentitySideLLM(RecordingAttachmentLLM):
+    def review_attachment(self, system_prompt, user_prompt, images):
+        image_ids = [str(image["image_id"]) for image in images]
+        if len(image_ids) == 1:
+            return {
+                "status": "fail",
+                "summary": "身份证必要组成部分缺失。",
+                "materials": [],
+                "requirements": [
+                    {
+                        "requirement": "应同时提供身份证国徽面及人像面。",
+                        "status": "fail",
+                        "evidence_image_ids": image_ids,
+                        "reason": "当前仅识别到身份证一面。",
+                    }
+                ],
+            }
+        return super().review_attachment(system_prompt, user_prompt, images)
+
+
+def test_missing_identity_side_is_detected_using_temporary_image_set(tmp_path: Path):
+    source_document = _document()
+    document = copy.deepcopy(source_document)
+    document["sections"][0]["title"] = "1 法定代表人身份证明"
+    original_image_count = len(document["images"])
+    document["images"] = [
+        image for image in document["images"] if image["image_id"] != "image-authority"
+    ]
+
+    result = run_attachment_review(
+        {"templates": [_template("法定代表人身份证明", "应提供身份证明。" )]},
+        {"structured_document": document, "artifact_dir": str(tmp_path)},
+        llm=MissingIdentitySideLLM(),
+    )
+
+    review = result["attachment_reviews"][0]
+    assert review["status"] == "fail"
+    assert review["image_ids"] == ["image-id"]
+    assert "必要组成部分缺失" in review["summary"]
+    assert len(source_document["images"]) == original_image_count
+
+
+class MissingBankProofLLM(RecordingAttachmentLLM):
+    def review_attachment(self, system_prompt, user_prompt, images):
+        if not images:
+            return {
+                "status": "fail",
+                "summary": "强制要求的开户证明未提供。",
+                "materials": [],
+                "requirements": [
+                    {
+                        "requirement": "应提供基本账户开户证明。",
+                        "status": "fail",
+                        "evidence_image_ids": [],
+                        "reason": "当前模块没有关联的开户证明图片。",
+                    }
+                ],
+            }
+        return super().review_attachment(system_prompt, user_prompt, images)
+
+
+def test_missing_bank_proof_is_detected_using_temporary_image_set(tmp_path: Path):
+    document = _document()
+    document["sections"] = [document["sections"][2]]
+    document["sections"][0]["title"] = "3 基本开户银行情况"
+    document["blocks"] = [
+        block for block in document["blocks"] if block["block_id"] == "b-bank-table"
+    ]
+    document["tables"] = [
+        {
+            "block_id": "b-bank-table",
+            "rows": [["银行名称", "账户名称", "账号"]],
+            "image_ids": ["image-bank-proof"],
+        }
+    ]
+    document["images"] = [
+        {
+            "image_id": "image-bank-proof",
+            "block_id": "b-bank-table",
+            "section_id": "s-bank",
+            "section_path": ["3 基本开户银行情况"],
+            "img_path": "images/bank-proof.png",
+            "asset_status": "ready",
+            "source_type": "table_embedded",
+            "source_table_id": "t0001",
+        }
+    ]
+    temporary_document = copy.deepcopy(document)
+    temporary_document["tables"][0]["image_ids"] = []
+    temporary_document["images"] = []
+
+    result = run_attachment_review(
+        {"templates": [_template("基本开户银行情况", "应提供基本账户开户证明。" )]},
+        {"structured_document": temporary_document, "artifact_dir": str(tmp_path)},
+        llm=MissingBankProofLLM(),
+    )
+
+    review = result["attachment_reviews"][0]
+    assert review["status"] == "fail"
+    assert review["image_ids"] == []
+    assert "开户证明未提供" in review["summary"]
+    assert document["tables"][0]["image_ids"] == ["image-bank-proof"]
 
 
 def test_attachment_review_selects_only_three_matched_cases_and_preserves_visual_evidence(

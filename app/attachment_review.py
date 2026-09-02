@@ -156,12 +156,13 @@ _ATTACHMENT_CASE_ALIASES = {
 
 _ATTACHMENT_REQUIREMENT_RE = re.compile(
     r"(?:应|须|需|必须|请)?\s*"
-    r"(?:附|提供|提交|随附|一并提供)"
+    r"(?:附|提供|提交|递交|随附|一并提供)"
     r".{0,100}?"
     r"(?:复印件|扫描件|证明(?:文件|材料)?|相关资料|资料及证明|"
     r"证书|证照|使用权|身份证明|开户证明)",
     re.IGNORECASE,
 )
+_ATTACHMENT_FORMAT_RE = re.compile(r"(?:复印件|扫描件)(?:[。；;，,、\s]|$)")
 _LEGACY_ATTACHMENT_TEXT_RE = re.compile(r"(?:身份证明|证明材料|开户|授权)")
 _COMPLEX_ATTACHMENT_SECTION_RE = re.compile(
     r"^\s*(?:第\s*)?21(?:\.\d+)*(?:\s|$|[、.．:：\-—])"
@@ -186,7 +187,7 @@ def template_has_attachment_requirement(template: dict[str, Any]) -> bool:
     """Return whether the complete template explicitly requires material evidence."""
 
     text = _template_requirement_text(template)
-    if _ATTACHMENT_REQUIREMENT_RE.search(text):
+    if _ATTACHMENT_REQUIREMENT_RE.search(text) or _ATTACHMENT_FORMAT_RE.search(text):
         return True
     # Keep the already-verified three cases compatible with older extracted
     # template bodies that retained the material words but lost the leading verb.
@@ -1024,7 +1025,12 @@ def run_attachment_review(
             continue
         case_type = attachment_case_kind(template.get("name"))
         bid_section = comparison.get("bid")
-        if not case_type or not isinstance(bid_section, dict):
+        if (
+            not case_type
+            or not isinstance(bid_section, dict)
+            or not template_has_attachment_requirement(template)
+            or is_complex_attachment_scope(template, bid_section)
+        ):
             continue
         materialized = sections_by_id.get(str(bid_section.get("section_id")))
         if materialized is None:
