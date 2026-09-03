@@ -546,6 +546,55 @@ def _table_rows(table_body: Any) -> list[list[str]]:
     return parser.rows
 
 
+class _TableImageReferenceParser(HTMLParser):
+    """Collect image references embedded in a table's HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: list[str] = []
+
+    def _collect(self, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            if name.lower() == "src" and isinstance(value, str) and value.strip():
+                self.references.append(value.strip())
+                break
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "img":
+            self._collect(attrs)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag.lower() == "img":
+            self._collect(attrs)
+
+
+def _canonical_image_reference(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().replace("\\", "/")
+
+
+def _table_image_references(table_body: Any) -> list[str]:
+    if not isinstance(table_body, str) or not table_body.strip():
+        return []
+    parser = _TableImageReferenceParser()
+    try:
+        parser.feed(table_body)
+        parser.close()
+    except (TypeError, ValueError):
+        return []
+    references = [
+        reference
+        for reference in (
+            _canonical_image_reference(item) for item in parser.references
+        )
+        if reference is not None
+    ]
+    return list(dict.fromkeys(references))
+
+
 def _structure_source(item: dict[str, Any], position: int) -> dict[str, Any]:
     source = item.get(_SOURCE_KEY)
     source_ref = copy.deepcopy(source) if isinstance(source, dict) else {}
@@ -650,6 +699,129 @@ def structure_content_list(
     unsupported_items: list[dict[str, Any]] = []
     section_stack: list[dict[str, Any]] = []
     used_block_ids: set[str] = set()
+    images_by_reference: dict[str, dict[str, Any]] = {}
+    table_embedded_references: set[str] = set()
+    table_embedded_reference_count = 0
+    table_embedded_reused_asset_count = 0
+    deduplicated_image_reference_count = 0
+
+    def register_image(
+        reference: Any,
+        *,
+        common: dict[str, Any],
+        caption: Any,
+        source_type: str,
+        table_id: str | None = None,
+    ) -> str | None:
+        nonlocal deduplicated_image_reference_count
+        canonical_reference = _canonical_image_reference(reference)
+        if canonical_reference is None:
+            return None
+
+        source_reference = {
+            "kind": source_type,
+            "reference": canonical_reference,
+            "block_id": common["block_id"],
+            "section_id": common["section_id"],
+            "section_path": copy.deepcopy(common["section_path"]),
+            "order": common["order"],
+            "source": copy.deepcopy(common["source"]),
+        }
+        if table_id is not None:
+            source_reference.update(
+                {
+                    "table_id": table_id,
+                    "table_block_id": common["block_id"],
+                }
+            )
+        existing = images_by_reference.get(canonical_reference)
+        if existing is not None:
+            deduplicated_image_reference_count += 1
+            source_key = (
+                source_reference["kind"],
+                source_reference["block_id"],
+                source_reference.get("table_id"),
+                source_reference["reference"],
+            )
+            source_keys = {
+                (
+                    item.get("kind"),
+                    item.get("block_id"),
+                    item.get("table_id"),
+                    item.get("reference"),
+                )
+                for item in existing.get("source_references", [])
+                if isinstance(item, dict)
+            }
+            if source_key not in source_keys:
+                existing.setdefault("source_references", []).append(source_reference)
+            if table_id is not None:
+                existing.setdefault("source_table_id", table_id)
+                existing.setdefault("source_table_block_id", common["block_id"])
+                existing.setdefault("source_table_ids", [])
+                if table_id not in existing["source_table_ids"]:
+                    existing["source_table_ids"].append(table_id)
+                existing.setdefault("source_table_block_ids", [])
+                if common["block_id"] not in existing["source_table_block_ids"]:
+                    existing["source_table_block_ids"].append(common["block_id"])
+            if common["block_id"] not in existing.setdefault("source_block_ids", []):
+                existing["source_block_ids"].append(common["block_id"])
+            if common["section_id"] is not None:
+                existing.setdefault("section_ids", [])
+                if common["section_id"] not in existing["section_ids"]:
+                    existing["section_ids"].append(common["section_id"])
+            existing.setdefault("section_paths", [])
+            if common["section_path"] not in existing["section_paths"]:
+                existing["section_paths"].append(copy.deepcopy(common["section_path"]))
+            existing["source_reference_count"] = len(existing.get("source_references", []))
+            return str(existing["image_id"])
+
+        image = {
+            "image_id": f"i{len(images) + 1:04d}",
+            **copy.deepcopy(common),
+            "img_path": canonical_reference,
+            "caption": caption if isinstance(caption, str) else "",
+            "source_type": source_type,
+            "source_references": [source_reference],
+            "source_block_ids": [common["block_id"]],
+            "section_ids": (
+                [common["section_id"]] if common["section_id"] is not None else []
+            ),
+            "section_paths": [copy.deepcopy(common["section_path"])],
+            "source_reference_count": 1,
+        }
+        if table_id is not None:
+            image.update(
+                {
+                    "source_table_id": table_id,
+                    "source_table_block_id": common["block_id"],
+                    "source_table_ids": [table_id],
+                    "source_table_block_ids": [common["block_id"]],
+                }
+            )
+        images.append(image)
+        images_by_reference[canonical_reference] = image
+        return str(image["image_id"])
+
+    def append_unresolved_image(*, common: dict[str, Any], caption: str) -> None:
+        images.append(
+            {
+                "image_id": f"i{len(images) + 1:04d}",
+                **common,
+                "img_path": None,
+                "caption": caption,
+                "source_type": "image",
+                "source_references": [],
+                "source_block_ids": [common["block_id"]],
+                "section_ids": (
+                    [common["section_id"]]
+                    if common["section_id"] is not None
+                    else []
+                ),
+                "section_paths": [copy.deepcopy(common["section_path"])],
+                "source_reference_count": 0,
+            }
+        )
 
     for position, raw in enumerate(items):
         if not isinstance(raw, dict):
@@ -746,25 +918,58 @@ def structure_content_list(
         }
         if kind == "table":
             table_body = raw.get("table_body", raw.get("html", text))
+            table_id = f"t{len(tables) + 1:04d}"
+            table_image_ids: list[str] = []
+            table_asset_reference = _canonical_image_reference(raw.get("img_path"))
+            if table_asset_reference is not None:
+                image_id = register_image(
+                    table_asset_reference,
+                    common=common,
+                    caption=raw.get("table_caption", raw.get("caption")),
+                    source_type="table_asset",
+                    table_id=table_id,
+                )
+                if image_id is not None:
+                    table_image_ids.append(image_id)
+            embedded_references = _table_image_references(table_body)
+            table_embedded_reference_count += len(embedded_references)
+            for reference in embedded_references:
+                canonical_reference = _canonical_image_reference(reference)
+                if canonical_reference is None:
+                    continue
+                table_embedded_references.add(canonical_reference)
+                if canonical_reference in images_by_reference:
+                    table_embedded_reused_asset_count += 1
+                image_id = register_image(
+                    canonical_reference,
+                    common=common,
+                    caption=raw.get("table_caption", raw.get("caption")),
+                    source_type="table_embedded",
+                    table_id=table_id,
+                )
+                if image_id is not None and image_id not in table_image_ids:
+                    table_image_ids.append(image_id)
             tables.append(
                 {
-                    "table_id": f"t{len(tables) + 1:04d}",
+                    "table_id": table_id,
                     **common,
                     "table_body": table_body if isinstance(table_body, str) else "",
                     "rows": _table_rows(table_body),
                     "caption": raw.get("table_caption", raw.get("caption")),
-                    "img_path": raw.get("img_path"),
+                    "img_path": table_asset_reference,
+                    "image_ids": table_image_ids,
                 }
             )
+            metadata["image_ids"] = table_image_ids
         elif kind == "image":
-            images.append(
-                {
-                    "image_id": f"i{len(images) + 1:04d}",
-                    **common,
-                    "img_path": raw.get("img_path"),
-                    "caption": text if not text.startswith("[MinerU ") else "",
-                }
-            )
+            caption = text if not text.startswith("[MinerU ") else ""
+            if register_image(
+                raw.get("img_path"),
+                common=common,
+                caption=caption,
+                source_type="image",
+            ) is None:
+                append_unresolved_image(common=common, caption=caption)
 
     block_dicts = [asdict(block) for block in blocks]
     page_indices = {
@@ -783,7 +988,23 @@ def structure_content_list(
             "filename": str(source_filename),
             "sha256": source_sha256,
         },
-        "diagnostics": copy.deepcopy(parser_diagnostics or {}),
+        "diagnostics": {
+            **copy.deepcopy(parser_diagnostics or {}),
+            "table_embedded_image_reference_count": table_embedded_reference_count,
+            "table_embedded_image_unique_reference_count": len(
+                table_embedded_references
+            ),
+            "table_embedded_image_asset_count": sum(
+                any(
+                    isinstance(reference, dict)
+                    and reference.get("kind") == "table_embedded"
+                    for reference in image.get("source_references", [])
+                )
+                for image in images
+            ),
+            "table_embedded_image_reused_asset_count": table_embedded_reused_asset_count,
+            "deduplicated_image_reference_count": deduplicated_image_reference_count,
+        },
         "blocks": block_dicts,
         "sections": sections,
         "tables": tables,
@@ -859,6 +1080,7 @@ class MinerUBidDocumentParser:
             source_sha256=source_sha256,
             parser_diagnostics=diagnostics,
         )
+        diagnostics.update(document.get("diagnostics", {}))
         asset_statuses, asset_diagnostics = self._extract_assets(
             result_zip,
             content_member=content_member,
@@ -1164,13 +1386,19 @@ class MinerUBidDocumentParser:
                     if key in {"img_path", "image_path", "table_img_path"} and isinstance(
                         child, str
                     ):
-                        references.append(child)
+                        reference = _canonical_image_reference(child)
+                        if reference is not None:
+                            references.append(reference)
                     elif (
                         key == "image_source"
                         and isinstance(child, dict)
                         and isinstance(child.get("path"), str)
                     ):
-                        references.append(child["path"])
+                        reference = _canonical_image_reference(child["path"])
+                        if reference is not None:
+                            references.append(reference)
+                    elif key in {"table_body", "html"}:
+                        references.extend(_table_image_references(child))
                     else:
                         collect(child)
             elif isinstance(value, list):
@@ -1246,7 +1474,12 @@ class MinerUBidDocumentParser:
                     if collection_name == "images":
                         entry["asset_status"] = "unresolved"
                     continue
-                status = statuses.get(reference, "missing")
+                canonical_reference = _canonical_image_reference(reference)
+                status = (
+                    statuses.get(canonical_reference, "missing")
+                    if canonical_reference is not None
+                    else "missing"
+                )
                 entry["asset_status"] = status
                 block_id = entry.get("block_id")
                 for block in document.get("blocks", []):

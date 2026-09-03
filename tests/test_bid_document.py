@@ -477,6 +477,150 @@ def test_structure_content_list_keeps_sections_tables_images_and_sources():
     assert document["images"][0]["source"]["raw_item_index"] == 5
 
 
+def test_structure_content_list_registers_table_images_with_section_and_table_provenance():
+    from app.bid_document import structure_content_list
+
+    shared_path = "images/shared-proof.png"
+    items = [
+        _source_item(
+            "title",
+            "第一章 证明材料",
+            raw_index=0,
+            page_idx=0,
+            bbox=[10, 20, 500, 50],
+            block_id="heading-1",
+        ),
+        _source_item(
+            "table",
+            "",
+            raw_index=1,
+            page_idx=0,
+            bbox=[10, 60, 500, 300],
+            block_id="table-1",
+            table_body=(
+                "<table><tr><td>证明文件</td></tr>"
+                f'<tr><td><img src="{shared_path}"/></td></tr></table>'
+            ),
+        ),
+        _source_item(
+            "image",
+            "独立图片路径与表格内图片相同",
+            raw_index=2,
+            page_idx=0,
+            bbox=[10, 320, 500, 600],
+            block_id="image-1",
+            img_path=shared_path,
+        ),
+    ]
+
+    document = structure_content_list(
+        items,
+        source_filename="bid.docx",
+        source_sha256="sha",
+    )
+
+    assert document["stats"]["image_count"] == 1
+    assert document["tables"][0]["image_ids"] == ["i0001"]
+    assert document["blocks"][1]["metadata"]["image_ids"] == ["i0001"]
+    image = document["images"][0]
+    assert image["image_id"] == "i0001"
+    assert image["section_id"] == "s0001"
+    assert image["section_path"] == ["第一章 证明材料"]
+    assert image["source_type"] == "table_embedded"
+    assert image["source_table_id"] == "t0001"
+    assert image["source_table_block_id"] == "table-1"
+    assert image["source_table_ids"] == ["t0001"]
+    assert set(image["source_block_ids"]) == {"table-1", "image-1"}
+    assert {item["kind"] for item in image["source_references"]} == {
+        "table_embedded",
+        "image",
+    }
+
+
+def test_mineru_bid_parser_extracts_table_embedded_images_once_and_marks_asset_ready(
+    tmp_path,
+):
+    from app.bid_document import MinerUBidDocumentParser
+
+    bid_path = tmp_path / "bid.docx"
+    bid_path.write_bytes(b"fixture bid")
+    embedded_path = "images/embedded-proof.png"
+    table_only_path = "images/table-only-proof.png"
+    content_payload = [
+        {
+            "type": "title",
+            "page_idx": 0,
+            "content": {"level": 1, "title_content": [{"type": "text", "content": "证明材料"}]},
+        },
+        {
+            "type": "table",
+            "page_idx": 0,
+            "content": {
+                "html": (
+                    "<table><tr><td>证明图片</td></tr>"
+                    f'<tr><td><img src="{embedded_path}"></td></tr>'
+                    f'<tr><td><img src="{table_only_path}"></td></tr></table>'
+                )
+            },
+        },
+        {
+            "type": "image",
+            "page_idx": 0,
+            "content": {
+                "image_caption": [{"type": "text", "content": "同一张证明图片"}],
+                "img_path": embedded_path,
+            },
+        },
+    ]
+    raw_content_bytes = json.dumps(content_payload, ensure_ascii=False).encode("utf-8")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("results/content_list.json", raw_content_bytes)
+        archive.writestr("results/images/embedded-proof.png", b"embedded-proof")
+        archive.writestr("results/images/table-only-proof.png", b"table-only-proof")
+    zip_bytes = zip_buffer.getvalue()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tasks":
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": "task-table-image",
+                    "status_url": "/tasks/task-table-image",
+                    "result_url": "/tasks/task-table-image/result",
+                },
+            )
+        if request.url.path == "/tasks/task-table-image":
+            return httpx.Response(200, json={"status": "completed"})
+        if request.url.path == "/tasks/task-table-image/result":
+            return httpx.Response(200, content=zip_bytes)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://mineru.example",
+        trust_env=False,
+    )
+    output_dir = tmp_path / "bid_document_cleaning"
+    parser = MinerUBidDocumentParser(
+        "https://mineru.example",
+        poll_interval_seconds=0,
+        http_client=client,
+    )
+
+    result = parser.parse(bid_path, output_dir=output_dir)
+    structured = json.loads((output_dir / "structured_document.json").read_text())
+
+    assert result["stats"]["image_count"] == 2
+    assert result["diagnostics"]["asset_reference_count"] == 2
+    assert result["stats"]["asset_ready_count"] == 2
+    assert (output_dir / "images/embedded-proof.png").read_bytes() == b"embedded-proof"
+    assert (output_dir / "images/table-only-proof.png").read_bytes() == b"table-only-proof"
+    assert structured["tables"][0]["image_ids"] == ["i0001", "i0002"]
+    assert [image["asset_status"] for image in structured["images"]] == ["ready", "ready"]
+    assert structured["images"][0]["source_table_id"] == "t0001"
+
+
 def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
     from app.bid_document import MinerUBidDocumentParser
 

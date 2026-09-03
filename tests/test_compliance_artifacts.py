@@ -73,10 +73,12 @@ def test_recorder_persists_llm_input_output_and_metadata(tmp_path):
     output_path = recorder.artifact_dir / "llm" / f"{call_id}_output.json"
     input_payload = json.loads(input_path.read_text(encoding="utf-8"))
     output_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert input_payload["batch"] == [{"block_ids": ["b0001"], "text": "须提供证明材料"}]
     assert input_payload["request_payload"]["model"] == "test-model"
     assert "Authorization" not in json.dumps(input_payload)
     assert output_payload["finish_reason"] == "stop"
     assert output_payload["usage"]["total_tokens"] == 29
+    assert output_payload["batch"] == [{"block_ids": ["b0001"], "text": "须提供证明材料"}]
     assert output_payload["parsed_objects"] == {
         "templates": [],
         "project_requirements": [],

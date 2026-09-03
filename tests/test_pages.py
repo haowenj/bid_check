@@ -327,6 +327,90 @@ def test_complete_page_merges_template_match_and_text_review_statuses(
     assert "模拟请求失败" in response.text
 
 
+def test_complete_page_separates_template_semantic_skip_from_business_fail(
+    client,
+    repository,
+    stored_task,
+):
+    artifact_dir = Path(stored_task.bid_file.storage_path).parent / "bid_document_cleaning"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "structured_document.json").write_text(
+        json.dumps(
+            {
+                "sections": [
+                    {
+                        "section_id": "s-semantic",
+                        "parent_section_id": None,
+                        "title": "1 候选模板",
+                        "path": ["1 候选模板"],
+                        "start_order": 1,
+                        "direct_block_ids": ["b-semantic"],
+                    }
+                ],
+                "blocks": [
+                    {
+                        "block_id": "b-semantic",
+                        "type": "paragraph",
+                        "text": "这是另一个文件用途的实际模块内容。",
+                    }
+                ],
+                "tables": [],
+                "images": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(
+        stored_task.task_id,
+        {
+            "templates": [
+                {
+                    "id": "tpl-semantic",
+                    "name": "候选模板",
+                    "section": "格式",
+                    "body": "候选模板正文",
+                    "source": {"source_text": "候选模板正文"},
+                }
+            ],
+            "project_requirements": [],
+            "supplemental_materials": [],
+            "bid_parse": {"status": "success", "stats": {"section_count": 1}},
+            "review_result": {
+                "mode": "template_text",
+                "template_text_reviews": [
+                    {
+                        "template_id": "tpl-semantic",
+                        "template_name": "候选模板",
+                        "bid_module_name": "1 候选模板",
+                        "semantic_match": {
+                            "status": "mismatched",
+                            "reason": "标题相似，但文件用途和核心内容不一致。",
+                        },
+                        "status": "uncertain",
+                        "business_status": "not_run",
+                        "execution_status": "semantic_skipped",
+                        "summary": "候选未通过语义对应确认。",
+                        "issues": [],
+                        "llm_elapsed_ms": 10,
+                    }
+                ],
+                "stats": {"llm_total_calls": 1, "llm_elapsed_ms": 10},
+            },
+        },
+    )
+
+    response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert "语义不匹配" in response.text
+    assert "标题相似，但文件用途和核心内容不一致。" in response.text
+    assert "未执行业务检查" in response.text
+    assert "检查不通过" not in response.text
+
+
 def test_complete_page_includes_contract_style_back_to_top_control(
     client,
     repository,

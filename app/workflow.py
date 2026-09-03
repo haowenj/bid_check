@@ -33,8 +33,10 @@ class BidCheckServices:
     parse: Callable[[FileMetadata], dict[str, Any]]
     review: Callable[
         [dict[str, Any], dict[str, Any]],
-        dict[str, str],
+        dict[str, Any],
     ]
+    extract_with_recorder: Callable[..., dict[str, Any]] | None = None
+    review_with_recorder: Callable[..., dict[str, Any]] | None = None
 
 
 class BidCheckWorkflow:
@@ -162,10 +164,17 @@ class BidCheckWorkflow:
             task.bid_file.filename,
         )
         self.repository.update_stage(task_id, "bid_parse", "running")
+        requirements_future = (
+            self.executor.submit(
+                self.services.extract_with_recorder,
+                task.tender_file,
+                recorder,
+            )
+            if self.services.extract_with_recorder is not None
+            else self.executor.submit(self.services.extract, task.tender_file)
+        )
         futures = {
-            self.executor.submit(self.services.extract, task.tender_file): (
-                "requirements"
-            ),
+            requirements_future: "requirements",
             self.executor.submit(self.services.parse, task.bid_file): "bid_parse",
         }
         outputs: dict[StageName, Any] = {}
@@ -237,10 +246,17 @@ class BidCheckWorkflow:
         try:
             logger.info("workflow.review.start task_id=%s", task_id)
             self.repository.update_stage(task_id, "review", "running")
-            review_result = self.services.review(
-                outputs["requirements"],
-                outputs["bid_parse"],
-            )
+            if self.services.review_with_recorder is not None:
+                review_result = self.services.review_with_recorder(
+                    outputs["requirements"],
+                    outputs["bid_parse"],
+                    recorder=recorder,
+                )
+            else:
+                review_result = self.services.review(
+                    outputs["requirements"],
+                    outputs["bid_parse"],
+                )
             self.repository.complete(
                 task_id,
                 {

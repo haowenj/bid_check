@@ -1,0 +1,47 @@
+<style>
+  .back-to-top {
+    position: fixed;
+    right: max(20px, env(safe-area-inset-right));
+    bottom: max(20px, env(safe-area-inset-bottom));
+    z-index: 10;
+    border: 1px solid #25344f;
+    border-radius: 999px;
+    padding: 10px 14px;
+    background: #172033;
+    color: white;
+    box-shadow: 0 8px 20px #1020382e;
+    font: inherit;
+    cursor: pointer;
+    transition: background-color .2s ease, transform .2s ease;
+  }
+  .back-to-top:hover { background: #25344f; transform: translateY(-2px); }
+  .back-to-top[hidden] { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .back-to-top { transition: none; }
+  }
+</style>
+
+<button id="back-to-top" class="back-to-top" type="button" aria-label="回到顶部" title="回到顶部" hidden>
+  <span aria-hidden="true">↑</span> 回到顶部
+</button>
+
+<script>
+  (() => {
+    const button = document.querySelector('#back-to-top');
+    if (!button) return;
+
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const updateVisibility = () => {
+      button.hidden = window.scrollY < 300;
+    };
+
+    button.addEventListener('click', () => {
+      window.scrollTo({
+        top: 0,
+        behavior: reducedMotion.matches ? 'auto' : 'smooth',
+      });
+    });
+    window.addEventListener('scroll', updateVisibility, { passive: true });
+    updateVisibility();
+  })();
+</script>

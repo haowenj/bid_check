@@ -39,7 +39,7 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v24:{REQUIREMENT_PROMPT_VERSION}"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v25:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v5"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
@@ -180,7 +180,7 @@ class JsonRequirementCache:
         logger.info("cache.read.start backend=json key=%s", key[:12])
         try:
             payload = json.loads(self._path(key).read_text(encoding="utf-8"))
-        except FileNotFoundError, OSError, json.JSONDecodeError:
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
             logger.info(
                 "cache.read.end backend=json key=%s status=miss elapsed_ms=%d",
                 key[:12],
@@ -1255,8 +1255,11 @@ _TEMPLATE_ITEM_NAME_RE = re.compile(
     r"廉洁承诺|关联关系|诉讼仲裁|基本账户|账户信息|业绩情况|业绩表|"
     r"知识产权|安全承诺|资格审查(?:文件|表)|报价表|情况表|声明|承诺函|"
     r"保证金|保函|缴纳|纸质|正本|副本|密封|包封|联合体|授权函|"
-    r"特定关系|控股|管理关系|申报表|偏离表|索引表|开源软件|第三方软件|"
+    r"特定关系|控股|管理关系|申报表|偏离表|开源软件|第三方软件|"
     r"元器件|来源清单|一览表|投标产品承诺|增值税专用发票"
+)
+_TEMPLATE_NAVIGATION_NAME_RE = re.compile(
+    r"索引(?:表|目录)?|目录(?:导航|表)?|导航(?:目录|表)?"
 )
 _TEMPLATE_NUMBER_PREFIX_RE = re.compile(
     r"^\s*(?:[一二三四五六七八九十百千万0-9]+[、.)．]|\([一二三四五六七八九十百千万0-9]+\))\s*"
@@ -1354,6 +1357,21 @@ def _template_name(value: str) -> str:
     return name.strip(" ：:。；;") or "投标文件模板"
 
 
+def _is_template_navigation_title(value: str) -> bool:
+    return bool(_TEMPLATE_NAVIGATION_NAME_RE.search(_template_name(value)))
+
+
+def _is_template_navigation_region(region: FunctionalRegion) -> bool:
+    if _is_template_navigation_title(region.title):
+        return True
+    return any(
+        block.type in {"heading", "paragraph"}
+        and len(block.text.strip()) <= 80
+        and _is_template_navigation_title(block.text)
+        for block in region.blocks[1:]
+    )
+
+
 def _is_template_index_region(region: FunctionalRegion) -> bool:
     text = region.text
     return text.count("PAGEREF") >= 2 or text.count("_Toc") >= 2
@@ -1403,6 +1421,9 @@ _TEMPLATE_MATERIAL_ONLY_RE = re.compile(
 def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) -> bool:
     if block.block_id == region.block_ids[0] or block.text.strip() == region.title.strip():
         return False
+    name = _template_name(block.text)
+    if _is_template_navigation_title(name):
+        return False
     if _has_structural_heading_levels(region.blocks):
         root_level = _block_heading_level(region.blocks[0])
         level = _block_heading_level(block)
@@ -1423,7 +1444,6 @@ def _is_template_item_title(block: StructuredBlock, region: FunctionalRegion) ->
             return False
     elif block.type != "heading":
         return False
-    name = _template_name(block.text)
     if re.match(r"(?:中国电信在职员工|中国电信员工的近亲属)", name):
         return False
     if _functional_region_kind(name) is not None:
@@ -2142,6 +2162,7 @@ def extract_templates_from_regions(
             continue
         if _is_template_index_region(region):
             continue
+        has_navigation_title = _is_template_navigation_region(region)
         index_block_ids = _template_index_block_ids(region)
         candidate_indexes = [
             index
@@ -2207,6 +2228,8 @@ def extract_templates_from_regions(
         if len(region.blocks) == 1:
             continue
         if not item_indexes:
+            if has_navigation_title:
+                continue
             content_blocks = region.blocks[1:] or region.blocks
             templates.append(
                 _template_from_blocks(
@@ -3044,6 +3067,147 @@ class OpenAICompatibleLLM:
                 "LLM 合规要求提取失败：响应结构异常。"
             ) from exc
 
+    def review_template(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        """Run one JSON-only template text comparison call."""
+
+        started_at = time.perf_counter()
+        logger.info(
+            "llm.template_review.start provider=openai_compatible model=%s prompt_chars=%d",
+            self.model,
+            len(system_prompt) + len(user_prompt),
+        )
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "enable_thinking": False,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Connection": "close",
+            },
+            method="POST",
+        )
+        call_context = self._active_call_context()
+        recorder = call_context.get("recorder")
+        call_id = call_context.get("call_id")
+        if recorder is not None and call_id is not None:
+            try:
+                recorder.attach_llm_input(call_id, payload)
+            except Exception as recorder_error:
+                logger.error(
+                    "artifact.llm.input.error call_id=%s error_type=%s",
+                    call_id,
+                    type(recorder_error).__name__,
+                )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout_seconds
+            ) as response:
+                response_text = response.read().decode("utf-8")
+                try:
+                    response_payload = json.loads(response_text)
+                except json.JSONDecodeError:
+                    if recorder is not None and call_id is not None:
+                        try:
+                            recorder.attach_llm_response(
+                                call_id,
+                                raw_response=response_text,
+                            )
+                        except Exception as recorder_error:
+                            logger.error(
+                                "artifact.llm.output.error call_id=%s error_type=%s",
+                                call_id,
+                                type(recorder_error).__name__,
+                            )
+                    raise
+            if recorder is not None and call_id is not None:
+                try:
+                    choice = response_payload.get("choices", [{}])[0]
+                    recorder.attach_llm_response(
+                        call_id,
+                        raw_response=response_payload,
+                        finish_reason=choice.get("finish_reason"),
+                        usage=response_payload.get("usage"),
+                    )
+                except Exception as recorder_error:
+                    logger.error(
+                        "artifact.llm.output.error call_id=%s error_type=%s",
+                        call_id,
+                        type(recorder_error).__name__,
+                    )
+            content = response_payload["choices"][0]["message"]["content"]
+            decoded = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(decoded, dict):
+                raise ValueError("template review result must be a JSON object")
+            logger.info(
+                "llm.template_review.end provider=openai_compatible model=%s elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
+            return decoded
+        except TimeoutError as exc:
+            logger.error(
+                "llm.template_review.error provider=openai_compatible model=%s error_type=timeout elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
+            raise ComplianceExtractionError("LLM 模板文本检查失败：请求超时。") from exc
+        except urllib.error.HTTPError as exc:
+            logger.error(
+                "llm.template_review.error provider=openai_compatible model=%s error_type=http_%s elapsed_ms=%d",
+                self.model,
+                exc.code,
+                _elapsed_ms(started_at),
+            )
+            raise ComplianceExtractionError(
+                f"LLM 模板文本检查失败：HTTP {exc.code}。"
+            ) from exc
+        except urllib.error.URLError as exc:
+            logger.error(
+                "llm.template_review.error provider=openai_compatible model=%s error_type=url_error elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
+            raise ComplianceExtractionError("LLM 模板文本检查失败：网络连接错误。") from exc
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "llm.template_review.error provider=openai_compatible model=%s error_type=invalid_json elapsed_ms=%d",
+                self.model,
+                _elapsed_ms(started_at),
+            )
+            raise ComplianceExtractionError(
+                "LLM 模板文本检查失败：模型响应不是有效 JSON。"
+            ) from exc
+        except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+            logger.error(
+                "llm.template_review.error provider=openai_compatible model=%s error_type=%s elapsed_ms=%d",
+                self.model,
+                type(exc).__name__,
+                _elapsed_ms(started_at),
+            )
+            raise ComplianceExtractionError(
+                "LLM 模板文本检查失败：响应结构异常。"
+            ) from exc
+
+    def review_template_exception(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        """Run one JSON-only template exception-conclusion review call."""
+
+        return self.review_template(system_prompt, user_prompt)
+
 
 def _parsed_document_cache_key(path: Path, parser: DocumentParser) -> str:
     # The parser mode is part of the namespace.  In particular, an old local
@@ -3229,7 +3393,11 @@ def _ambiguous_regions(
     ambiguous: list[FunctionalRegion] = []
     for region in regions:
         if region.kind == "templates":
-            if _is_template_index_region(region) or len(region.blocks) == 1:
+            if (
+                _is_template_index_region(region)
+                or _is_template_navigation_region(region)
+                or len(region.blocks) == 1
+            ):
                 continue
             has_named_template = any(
                 _is_template_item_title(block, region) for block in region.blocks

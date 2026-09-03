@@ -221,7 +221,13 @@
                   <td>
                     {% set text_review = comparison.text_review %}
                     {% if text_review %}
-                      {% if text_review.execution_status == "failed" %}
+                      {% if text_review.execution_status == "semantic_skipped" %}
+                        {% if text_review.semantic_match.status == "mismatched" %}
+                          <span class="comparison-status comparison-status-uncertain">语义不匹配</span>
+                        {% else %}
+                          <span class="comparison-status comparison-status-uncertain">语义匹配不确定</span>
+                        {% endif %}
+                      {% elif text_review.execution_status == "failed" %}
                         <span class="comparison-status comparison-status-uncertain">调用失败</span>
                       {% elif text_review.status == "pass" %}
                         <span class="comparison-status comparison-status-pass">检查通过</span>
@@ -239,7 +245,13 @@
                   <td>
                     {% set attachment_review = comparison.attachment_review %}
                     {% if attachment_review %}
-                      {% if attachment_review.execution_status == "failed" %}
+                      {% if attachment_review.execution_status == "semantic_skipped" %}
+                        {% if attachment_review.semantic_match.status == "mismatched" %}
+                          <span class="comparison-status comparison-status-uncertain">语义不匹配</span>
+                        {% else %}
+                          <span class="comparison-status comparison-status-uncertain">语义匹配不确定</span>
+                        {% endif %}
+                      {% elif attachment_review.execution_status == "failed" %}
                         <span class="comparison-status comparison-status-uncertain">调用失败</span>
                       {% elif attachment_review.status == "pass" %}
                         <span class="comparison-status comparison-status-pass">检查通过</span>
@@ -255,7 +267,9 @@
                   <td class="comparison-info-cell">
                     {% if text_review %}
                       <span>{{ text_review.summary }}</span>
-                      {% if text_review.execution_status == "failed" %}
+                      {% if text_review.execution_status == "semantic_skipped" %}
+                        <small>未执行业务检查；语义判断理由：{{ text_review.semantic_match.reason }}</small>
+                      {% elif text_review.execution_status == "failed" %}
                         <small>{{ text_review.error_type }}：{{ text_review.error_message }}</small>
                       {% elif text_review.status == "fail" and text_review.issues %}
                         <details class="comparison-detail">
@@ -314,7 +328,9 @@
                   <td>{{ review.bid_module_name|default("未唯一匹配", true) }}</td>
                   <td>
                     <span class="comparison-status comparison-status-{{ review.status }}">
-                      {% if review.execution_status == "failed" %}调用失败
+                      {% if review.execution_status == "semantic_skipped" %}
+                        {% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义匹配不确定{% endif %}
+                      {% elif review.execution_status == "failed" %}调用失败
                       {% elif review.status == "pass" %}检查通过
                       {% elif review.status == "fail" %}检查不通过
                       {% elif review.status == "not_applicable" %}不适用
@@ -323,7 +339,9 @@
                   </td>
                   <td>
                     <span>{{ review.summary }}</span>
-                    {% if review.execution_status == "failed" %}
+                    {% if review.execution_status == "semantic_skipped" %}
+                      <small>未执行业务检查；语义判断理由：{{ review.semantic_match.reason }}</small>
+                    {% elif review.execution_status == "failed" %}
                       <small>{{ review.error_type }}：{{ review.error_message }}</small>
                     {% elif review.issues %}
                       <ul class="review-issue-list">
@@ -371,7 +389,9 @@
                   <td><strong>{{ review.template_name }}</strong><small>{{ review.bid_module_name }}</small><small>图片：{{ review.image_ids|join("、") if review.image_ids else "无" }}</small><small>证据图片：{{ review.image_ids|length if review.image_ids else 0 }} 张</small></td>
                   <td>
                     <span class="comparison-status comparison-status-{{ review.status }}">
-                      {% if review.execution_status == "failed" %}调用失败
+                      {% if review.execution_status == "semantic_skipped" %}
+                        {% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义匹配不确定{% endif %}
+                      {% elif review.execution_status == "failed" %}调用失败
                       {% elif review.status == "pass" %}检查通过
                       {% elif review.status == "fail" %}检查不通过
                       {% else %}待确认{% endif %}
@@ -379,7 +399,11 @@
                   </td>
                   <td class="comparison-info-cell">
                     <span>{{ review.summary }}</span>
-                    {% if review.execution_status == "failed" %}<small>{{ review.error_type }}：{{ review.error_message }}</small>{% endif %}
+                    {% if review.execution_status == "semantic_skipped" %}
+                      <small>未执行业务检查；语义判断理由：{{ review.semantic_match.reason }}</small>
+                    {% elif review.execution_status == "failed" %}
+                      <small>{{ review.error_type }}：{{ review.error_message }}</small>
+                    {% endif %}
                   </td>
                   <td class="comparison-info-cell">
                     {% if review.materials %}

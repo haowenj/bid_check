@@ -117,6 +117,7 @@ class ComplianceExtractionRecorder:
                 "batch_count": batch_count,
                 "attempt": attempt,
                 "model": model,
+                "batch": batch,
                 "started_at": started_at,
                 "input_path": f"llm/{call_id}_input.json",
                 "output_path": f"llm/{call_id}_output.json",
@@ -127,7 +128,6 @@ class ComplianceExtractionRecorder:
                 {
                     **state,
                     "retry": attempt > 1,
-                    "batch": batch,
                 },
             )
         self.event(

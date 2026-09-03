@@ -114,6 +114,86 @@ def test_template_is_one_complete_contiguous_check_object():
     assert template["source"]["source_text"] == template["body"]
 
 
+def test_index_navigation_template_is_excluded_but_real_forms_remain():
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2", "b3", "b4", "b5"],
+        blocks=[
+            StructuredBlock(
+                "b1",
+                "heading",
+                "投标文件格式",
+                "投标文件格式",
+                1,
+                heading_level=1,
+            ),
+            StructuredBlock(
+                "b2",
+                "heading",
+                "商务评审索引表",
+                "投标文件格式",
+                2,
+                heading_level=3,
+            ),
+            StructuredBlock(
+                "b3",
+                "table",
+                "序号 | 评审因素 | 投标文件页码",
+                "投标文件格式",
+                3,
+            ),
+            StructuredBlock(
+                "b4",
+                "heading",
+                "法定代表人身份证明",
+                "投标文件格式",
+                4,
+                heading_level=3,
+            ),
+            StructuredBlock(
+                "b5",
+                "paragraph",
+                "姓名：____",
+                "投标文件格式",
+                5,
+            ),
+        ],
+        text="",
+        order=1,
+    )
+
+    templates = extract_templates_from_regions([region])
+
+    assert [item["name"] for item in templates] == ["法定代表人身份证明"]
+
+
+@pytest.mark.parametrize(
+    "navigation_name",
+    ["商务评审索引表", "投标文件目录", "目录导航"],
+)
+def test_standalone_index_navigation_region_is_not_promoted_to_template(
+    navigation_name,
+):
+    region = FunctionalRegion(
+        kind="templates",
+        title="投标文件格式",
+        section="投标文件格式",
+        block_ids=["b1", "b2", "b3"],
+        blocks=[
+            block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+            block("b2", "heading", navigation_name, "投标文件格式", 2),
+            block("b3", "table", "序号 | 评审因素 | 投标文件页码", "投标文件格式", 3),
+        ],
+        text="",
+        order=1,
+    )
+
+    assert extract_templates_from_regions([region]) == []
+    assert extraction_module._ambiguous_regions([region]) == []
+
+
 def test_template_attachment_extraction_ignores_attachment_word_and附加_clause():
     region = FunctionalRegion(
         kind="templates",

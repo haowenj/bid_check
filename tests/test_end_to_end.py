@@ -60,14 +60,54 @@ def test_upload_to_completed_tender_objects_result(client):
     assert payload["supplemental_materials"] == []
     assert payload["bid_parse"]["document_name"] == "投标文件.docx"
     assert payload["review_result"] == {
-        "mode": "mock",
-        "message": "当前版本尚未执行真实合规性检查",
+        "mode": "template_text",
+        "template_text_reviews": [],
+        "stats": {
+            "template_count": 0,
+            "matched_template_count": 0,
+            "code_candidate_count": 0,
+            "selected_template_count": 0,
+            "semantic_matched_count": 0,
+            "semantic_mismatched_count": 0,
+            "semantic_uncertain_count": 0,
+            "no_bid_candidate_template_ids": [],
+            "candidate_without_reliable_bid_text_template_ids": [],
+            "max_concurrency": 3,
+            "llm_total_calls": 0,
+            "llm_completed_calls": 0,
+            "llm_failed_count": 0,
+            "llm_failed_calls": 0,
+            "pass_count": 0,
+            "fail_count": 0,
+            "uncertain_count": 0,
+            "not_applicable_count": 0,
+            "business_status_counts": {
+                "pass": 0,
+                "fail": 0,
+                "uncertain": 0,
+                "not_applicable": 0,
+            },
+            "exception_review_candidate_count": 0,
+            "exception_review_call_count": 0,
+            "exception_review_confirm_count": 0,
+            "exception_review_revise_count": 0,
+            "exception_review_failed_count": 0,
+            "exception_review_llm_elapsed_ms": 0,
+            "exception_review_wall_elapsed_ms": 0,
+            "main_wall_elapsed_ms": 0,
+            "total_llm_elapsed_ms": 0,
+            "total_llm_calls": 0,
+            "total_wall_elapsed_ms": 0,
+            "llm_elapsed_ms": 0,
+            "total_elapsed_ms": 0,
+        },
     }
 
     page_response = client.get(f"/bid-check/tasks/{task_id}")
     assert page_response.status_code == 200
     assert "本次识别 0 个模板、0 条项目专用编制要求和 0 项补充证明材料" in page_response.text
-    assert "尚未执行真实投标文件内容校验" in page_response.text
+    assert "暂无可执行的模板文本检查" in page_response.text
+    assert "不判断签字、盖章、图片、附件真实性或外部状态" in page_response.text
     assert "检查通过" not in page_response.text
     assert "检查不通过" not in page_response.text
 
@@ -102,6 +142,11 @@ def test_upload_valid_tender_extracts_tender_objects_from_document_text(
     assert "商务评分" not in source_text
     assert payload["project_requirements"][0]["value"] == "90 天"
     assert payload["supplemental_materials"][0]["name"] == "营业执照"
+    assert payload["review_result"]["mode"] == "template_text"
+    assert payload["review_result"]["template_text_reviews"] == []
+    assert payload["review_result"]["stats"]["template_count"] == 2
+    assert payload["review_result"]["stats"]["matched_template_count"] == 0
+    assert payload["review_result"]["stats"]["llm_total_calls"] == 0
     artifact_dir = settings.tasks_dir / task_id / "compliance_extraction"
     assert (artifact_dir / "summary.json").is_file()
     assert (artifact_dir / "execution.jsonl").is_file()
