@@ -62,8 +62,15 @@ def test_upload_to_completed_tender_objects_result(client):
     assert payload["review_result"] == {
         "mode": "template_text",
         "template_text_reviews": [],
+        "navigation_exclusions": {
+            "tender_templates": [],
+            "bid_modules": [],
+        },
         "stats": {
             "template_count": 0,
+            "participating_template_count": 0,
+            "navigation_excluded_template_count": 0,
+            "navigation_excluded_bid_section_count": 0,
             "matched_template_count": 0,
             "code_candidate_count": 0,
             "selected_template_count": 0,

@@ -15,9 +15,9 @@ from app.models import FileMetadata
 
 def test_object_cache_version_is_new_and_parse_cache_key_is_stable():
     assert extraction_module.REQUIREMENT_CACHE_VERSION.startswith(
-        "tender-compliance-objects-v25"
+        "tender-compliance-objects-v26"
     )
-    assert extraction_module.PARSED_DOCUMENT_CACHE_VERSION.startswith("mineru-parse-v5")
+    assert extraction_module.PARSED_DOCUMENT_CACHE_VERSION.startswith("mineru-parse-v6")
 
 
 def test_object_cache_key_changes_with_parser_and_llm_configuration(tmp_path):

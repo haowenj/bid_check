@@ -100,3 +100,30 @@ def test_no_sufficient_candidate_is_left_unmatched():
     assert comparison["status_label"] == "未匹配"
     assert comparison["bid"] is None
     assert comparison["candidate_count"] == 0
+
+
+def test_navigation_template_and_bid_module_are_excluded_before_missing_match():
+    navigation_template = _template("商务评审索引表")
+    navigation_template["body"] = (
+        "商务评审索引表\n评审因素 | 投标文件组成 | 对应页码\n1 | 投标函 | 7"
+    )
+    navigation_template["source"]["source_text"] = navigation_template["body"]
+    comparisons = build_template_comparisons(
+        [
+            navigation_template,
+            _template("投标函"),
+        ],
+        [
+            _section(
+                "s-index",
+                "3 商务评审索引表",
+            ),
+            _section(
+                "s-letter",
+                "投标函",
+            ),
+        ],
+    )
+
+    assert [comparison["tender"]["name"] for comparison in comparisons] == ["投标函"]
+    assert comparisons[0]["status"] == "matched"

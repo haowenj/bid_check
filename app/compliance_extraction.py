@@ -33,14 +33,15 @@ from app.models import (
     TenderExtractionResult,
     TenderTemplate,
 )
+from app.navigation_content import classify_navigation_item
 
 logger = logging.getLogger(__name__)
 REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
-REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v25:{REQUIREMENT_PROMPT_VERSION}"
-PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v5"
+REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v26:{REQUIREMENT_PROMPT_VERSION}"
+PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v6"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
 DEFAULT_MINERU_BACKEND = "hybrid-engine"
@@ -310,9 +311,6 @@ def _flatten_mineru_content_list(payload: Any) -> list[dict[str, Any]]:
             raw.get("type", raw.get("block_type", "paragraph"))
         ).lower()
         content = raw.get("content")
-        if raw_type == "index":
-            # The index is a document navigation object, not tender content.
-            continue
         if raw_type == "list" and isinstance(content, dict):
             for item in content.get("list_items", []):
                 if not isinstance(item, dict):
@@ -2160,8 +2158,6 @@ def extract_templates_from_regions(
     for region in regions:
         if region.kind != "templates":
             continue
-        if _is_template_index_region(region):
-            continue
         has_navigation_title = _is_template_navigation_region(region)
         index_block_ids = _template_index_block_ids(region)
         candidate_indexes = [
@@ -2170,6 +2166,29 @@ def extract_templates_from_regions(
             if block.block_id not in index_block_ids
             and _is_template_item_title(block, region)
         ]
+        navigation_indexes = [
+            index
+            for index, block in enumerate(region.blocks[1:], start=1)
+            if _is_template_navigation_title(block.text)
+        ]
+        for navigation_index in navigation_indexes:
+            next_boundary = next(
+                (
+                    boundary
+                    for boundary in range(navigation_index + 1, len(region.blocks))
+                    if boundary in candidate_indexes
+                    or boundary in navigation_indexes
+                ),
+                len(region.blocks),
+            )
+            templates.append(
+                _template_from_blocks(
+                    region=region,
+                    name=region.blocks[navigation_index].text,
+                    blocks=region.blocks[navigation_index:next_boundary],
+                    index=len(templates) + 1,
+                )
+            )
         if _has_structural_heading_levels(region.blocks):
             # MinerU has already distinguished chapter/group/form levels.  Do
             # not re-discover form boundaries from bold text inside a form;
@@ -2229,6 +2248,15 @@ def extract_templates_from_regions(
             continue
         if not item_indexes:
             if has_navigation_title:
+                if not navigation_indexes and _is_template_navigation_title(region.title):
+                    templates.append(
+                        _template_from_blocks(
+                            region=region,
+                            name=region.title,
+                            blocks=region.blocks[1:] or region.blocks,
+                            index=len(templates) + 1,
+                        )
+                    )
                 continue
             content_blocks = region.blocks[1:] or region.blocks
             templates.append(
@@ -2808,6 +2836,34 @@ def _filter_reason_counts(report: Sequence[dict[str, Any]]) -> dict[str, int]:
         reason = str(item.get("reason", "unknown"))
         counts[reason] = counts.get(reason, 0) + 1
     return counts
+
+
+def _annotate_navigation_templates(
+    templates: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Mark navigation templates while keeping their extracted source objects."""
+
+    annotated: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for template in templates:
+        item = dict(template)
+        classification = classify_navigation_item(item)
+        if classification["is_navigation"]:
+            item["compliance_excluded"] = True
+            item["compliance_exclusion_reason"] = classification["reason"]
+            item["navigation_signals"] = list(classification["signals"])
+            excluded.append(
+                {
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "section": item.get("section", ""),
+                    "block_ids": list(item.get("block_ids", [])),
+                    "reason": classification["reason"],
+                    "signals": list(classification["signals"]),
+                }
+            )
+        annotated.append(item)
+    return annotated, excluded
 
 
 def _is_transient_extraction_error(error: ComplianceExtractionError) -> bool:
@@ -3819,6 +3875,9 @@ def extract_tender_compliance_objects(
         "project_front_table_recovered": False,
         "functional_regions": 0,
         "template_count": 0,
+        "participating_template_count": 0,
+        "navigation_excluded_template_count": 0,
+        "navigation_excluded_templates": [],
         "project_requirement_count": 0,
         "supplemental_material_count": 0,
         "filtered_objects": 0,
@@ -3899,6 +3958,9 @@ def extract_tender_compliance_objects(
         stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
         if _valid_object_result(cached):
             result: TenderExtractionResult = cached
+            result["templates"], navigation_exclusions = _annotate_navigation_templates(
+                result["templates"]
+            )
             stats["cache_hit"] = True
             stats["parser_execution_source"] = "result_cache"
             descriptor = getattr(active_parser, "cache_descriptor", None)
@@ -3907,10 +3969,19 @@ def extract_tender_compliance_objects(
             if isinstance(descriptor, dict):
                 stats["parser_transport"] = descriptor.get("transport")
             stats["template_count"] = len(result["templates"])
+            stats["participating_template_count"] = (
+                stats["template_count"] - len(navigation_exclusions)
+            )
+            stats["navigation_excluded_template_count"] = len(navigation_exclusions)
+            stats["navigation_excluded_templates"] = navigation_exclusions
             stats["project_requirement_count"] = len(result["project_requirements"])
             stats["supplemental_material_count"] = len(result["supplemental_materials"])
             persist_artifact("02_functional_regions.json", {"source": "result_cache", "regions": []})
             persist_result(result, source="result_cache")
+            persist_artifact(
+                "06_navigation_exclusion_report.json",
+                {"tender_templates": navigation_exclusions, "bid_modules": []},
+            )
             run_status = "complete"
             record_event(
                 "cache.check.end",
@@ -4118,11 +4189,27 @@ def extract_tender_compliance_objects(
                 if not succeeded:
                     raise ComplianceExtractionError("LLM 对象提取未完成。")
 
+        result["templates"], navigation_exclusions = _annotate_navigation_templates(
+            result["templates"]
+        )
+        eligible_templates = [
+            template
+            for template in result["templates"]
+            if not template.get("compliance_excluded")
+        ]
         applicability_started_at = time.perf_counter()
         filtered_templates, applicability_report = apply_project_applicability(
-            result["templates"], result["project_requirements"]
+            eligible_templates, result["project_requirements"]
         )
-        result["templates"] = filtered_templates
+        filtered_template_ids = {
+            str(template.get("id", "")) for template in filtered_templates
+        }
+        result["templates"] = [
+            template
+            for template in result["templates"]
+            if template.get("compliance_excluded")
+            or str(template.get("id", "")) in filtered_template_ids
+        ]
         result["supplemental_materials"] = _dedupe_supplemental_materials(
             result["supplemental_materials"], result["templates"]
         )
@@ -4131,10 +4218,19 @@ def extract_tender_compliance_objects(
         stats["filtered_objects"] = len(applicability_report)
         stats["filtered_by_reason"] = _filter_reason_counts(applicability_report)
         stats["template_count"] = len(normalized["templates"])
+        stats["participating_template_count"] = (
+            stats["template_count"] - len(navigation_exclusions)
+        )
+        stats["navigation_excluded_template_count"] = len(navigation_exclusions)
+        stats["navigation_excluded_templates"] = navigation_exclusions
         stats["project_requirement_count"] = len(normalized["project_requirements"])
         stats["supplemental_material_count"] = len(normalized["supplemental_materials"])
         persist_result(normalized)
         persist_artifact("06_filter_report.json", applicability_report)
+        persist_artifact(
+            "06_navigation_exclusion_report.json",
+            {"tender_templates": navigation_exclusions, "bid_modules": []},
+        )
         if cache is not None:
             cache.set(cache_key, normalized)
         record_event(

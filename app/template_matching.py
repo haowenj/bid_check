@@ -5,6 +5,11 @@ import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
 
+from app.navigation_content import (
+    filter_navigation_sections,
+    filter_navigation_templates,
+)
+
 MATCH_STATUS_LABELS = {
     "matched": "已匹配",
     "unmatched": "未匹配",
@@ -71,8 +76,10 @@ def build_template_comparisons(
     decision on behalf of the reviewer.
     """
 
-    tender_templates = templates if isinstance(templates, list) else []
-    sections = bid_sections if isinstance(bid_sections, list) else []
+    raw_templates = templates if isinstance(templates, list) else []
+    raw_sections = bid_sections if isinstance(bid_sections, list) else []
+    tender_templates, _excluded_templates = filter_navigation_templates(raw_templates)
+    sections, _excluded_sections = filter_navigation_sections(raw_sections)
     normalized_sections = [
         (section, normalize_module_title(section.get("title", "")))
         for section in sections

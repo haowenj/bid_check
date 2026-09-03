@@ -162,6 +162,23 @@ def test_clean_items_removes_only_deterministic_noise_and_keeps_material_objects
     assert all("source_path" in entry for entry in log)
 
 
+def test_clean_items_preserves_navigation_items_for_compliance_boundary_filter():
+    from app.bid_document import clean_items, flatten_mineru_content_list
+
+    flattened = flatten_mineru_content_list(
+        [
+            {"type": "index", "text": "商务评审索引表", "page_idx": 1},
+            {"type": "text", "text": "投标函", "page_idx": 1},
+        ]
+    )
+
+    cleaned, log = clean_items(flattened)
+
+    assert [item["type"] for item in cleaned] == ["index", "text"]
+    assert cleaned[0]["text"] == "商务评审索引表"
+    assert log == []
+
+
 def test_clean_items_retains_non_dict_values_for_raw_traceability():
     from app.bid_document import clean_items
 

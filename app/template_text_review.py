@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.navigation_content import (
+    filter_navigation_sections,
+    filter_navigation_templates,
+)
 from app.template_matching import build_template_comparisons
 from app.template_placeholder_residual import find_template_placeholder_residuals
 
@@ -1273,6 +1277,9 @@ def _review_exception_template(
 def _review_stats(
     *,
     template_count: int,
+    participating_template_count: int,
+    navigation_excluded_templates: list[dict[str, Any]],
+    navigation_excluded_bid_sections: list[dict[str, Any]],
     matched_template_count: int,
     code_candidate_count: int,
     no_bid_candidate_template_ids: list[str],
@@ -1312,6 +1319,9 @@ def _review_stats(
     }
     return {
         "template_count": template_count,
+        "participating_template_count": participating_template_count,
+        "navigation_excluded_template_count": len(navigation_excluded_templates),
+        "navigation_excluded_bid_section_count": len(navigation_excluded_bid_sections),
         "matched_template_count": matched_template_count,
         "code_candidate_count": code_candidate_count,
         "selected_template_count": len(results),
@@ -1490,13 +1500,13 @@ def run_template_text_review(
     templates = [
         candidate for candidate in raw_templates if isinstance(candidate, dict)
     ] if isinstance(raw_templates, list) else []
+    extracted_templates = templates
+    templates, excluded_templates = filter_navigation_templates(extracted_templates)
 
     document = _read_structured_document(parsed_bid) or {}
-    raw_sections = document.get("sections", [])
-    if not isinstance(raw_sections, list):
-        raw_sections = []
     _sections, sections_by_id = _materialized_sections(document)
-    comparisons = build_template_comparisons(templates, raw_sections)
+    sections, excluded_sections = filter_navigation_sections(_sections)
+    comparisons = build_template_comparisons(templates, sections)
     matched_template_count = sum(
         comparison.get("status") == "matched" for comparison in comparisons
     )
@@ -1701,8 +1711,15 @@ def run_template_text_review(
     review_result = {
         "mode": "template_text",
         "template_text_reviews": results,
+        "navigation_exclusions": {
+            "tender_templates": excluded_templates,
+            "bid_modules": excluded_sections,
+        },
         "stats": _review_stats(
-            template_count=len(templates),
+            template_count=len(extracted_templates),
+            participating_template_count=len(templates),
+            navigation_excluded_templates=excluded_templates,
+            navigation_excluded_bid_sections=excluded_sections,
             matched_template_count=matched_template_count,
             code_candidate_count=len(jobs),
             no_bid_candidate_template_ids=no_bid_candidate_template_ids,
@@ -1728,7 +1745,10 @@ def run_template_text_review(
         recorder.event(
             "template.text.review.end",
             status="complete",
-            template_count=len(templates),
+            template_count=len(templates) + len(excluded_templates),
+            participating_template_count=len(templates),
+            navigation_excluded_template_count=len(excluded_templates),
+            navigation_excluded_bid_section_count=len(excluded_sections),
             matched_template_count=matched_template_count,
             llm_total_calls=review_result["stats"]["llm_total_calls"],
             llm_failed_count=review_result["stats"]["llm_failed_count"],

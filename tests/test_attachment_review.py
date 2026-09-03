@@ -153,6 +153,58 @@ def test_attachment_candidate_uses_full_template_body_when_attachments_are_empty
     assert template_has_attachment_requirement(template) is True
 
 
+def test_navigation_template_and_bid_module_skip_attachment_review():
+    template = _template(
+        "商务评审索引表",
+        "商务评审索引表\n评审因素 | 投标文件组成 | 对应页码\n1 | 资格审查资料 | 19",
+    )
+    document = {
+        "sections": [
+            {
+                "section_id": "s-index",
+                "title": "3 商务评审索引表",
+                "path": ["3 商务评审索引表"],
+                "direct_block_ids": ["b-index-heading", "b-index-table"],
+            }
+        ],
+        "blocks": [
+            {
+                "block_id": "b-index-heading",
+                "type": "heading",
+                "text": "3 商务评审索引表",
+                "order": 1,
+            },
+            {
+                "block_id": "b-index-table",
+                "type": "table",
+                "text": "评审因素 | 投标文件组成 | 对应页码\n1 | 资格审查资料 | 19",
+                "order": 2,
+            },
+        ],
+        "images": [],
+    }
+    llm = RecordingAttachmentLLM()
+
+    result = run_attachment_review(
+        {"templates": [template]},
+        {"structured_document": document},
+        llm=llm,
+    )
+
+    assert result["attachment_reviews"] == []
+    assert llm.calls == []
+    assert result["stats"]["template_count"] == 1
+    assert result["stats"]["participating_template_count"] == 0
+    assert result["stats"]["selected_template_count"] == 0
+    assert result["stats"]["semantic_matched_count"] == 0
+    assert result["navigation_exclusions"]["tender_templates"][0]["name"] == (
+        "商务评审索引表"
+    )
+    assert result["navigation_exclusions"]["bid_modules"][0]["section_id"] == (
+        "s-index"
+    )
+
+
 def test_attachment_candidate_does_not_use_attachment_placeholder_alone():
     template = _template("投标函", "本页填写投标函正文。")
     template["attachments"] = ["身份证复印件"]

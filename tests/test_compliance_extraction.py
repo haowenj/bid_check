@@ -27,6 +27,22 @@ from app.compliance_extraction import (
 from app.models import FileMetadata
 
 
+def test_compliance_mineru_flatten_keeps_raw_index_items_for_later_filtering():
+    flattened = extraction_module._flatten_mineru_content_list(
+        [
+            {
+                "type": "index",
+                "content": "商务评审索引表\n对应页码",
+                "page_idx": 2,
+            },
+            {"type": "text", "text": "投标函"},
+        ]
+    )
+
+    assert [item["type"] for item in flattened] == ["index", "text"]
+    assert flattened[0]["content"] == "商务评审索引表\n对应页码"
+
+
 def block(
     block_id: str,
     block_type: str,
@@ -114,7 +130,7 @@ def test_template_is_one_complete_contiguous_check_object():
     assert template["source"]["source_text"] == template["body"]
 
 
-def test_index_navigation_template_is_excluded_but_real_forms_remain():
+def test_index_navigation_template_is_preserved_and_marked_for_later_exclusion():
     region = FunctionalRegion(
         kind="templates",
         title="投标文件格式",
@@ -166,14 +182,17 @@ def test_index_navigation_template_is_excluded_but_real_forms_remain():
 
     templates = extract_templates_from_regions([region])
 
-    assert [item["name"] for item in templates] == ["法定代表人身份证明"]
+    assert [item["name"] for item in templates] == [
+        "商务评审索引表",
+        "法定代表人身份证明",
+    ]
 
 
 @pytest.mark.parametrize(
     "navigation_name",
     ["商务评审索引表", "投标文件目录", "目录导航"],
 )
-def test_standalone_index_navigation_region_is_not_promoted_to_template(
+def test_standalone_index_navigation_region_is_preserved_for_later_exclusion(
     navigation_name,
 ):
     region = FunctionalRegion(
@@ -190,7 +209,9 @@ def test_standalone_index_navigation_region_is_not_promoted_to_template(
         order=1,
     )
 
-    assert extract_templates_from_regions([region]) == []
+    templates = extract_templates_from_regions([region])
+
+    assert [item["name"] for item in templates] == [navigation_name]
     assert extraction_module._ambiguous_regions([region]) == []
 
 
@@ -1640,6 +1661,40 @@ def test_main_extractor_returns_complete_three_collection_result_and_artifacts(t
     assert summary["stats"]["project_requirement_count"] == 2
     assert summary["stats"]["supplemental_material_count"] == 1
     assert summary["stats"]["llm_total_calls"] == 0
+
+
+def test_main_extractor_keeps_and_marks_navigation_template(tmp_path):
+    tender = tmp_path / "tender.docx"
+    tender.write_bytes(b"tender")
+    blocks = [
+        block("b1", "heading", "投标文件格式", "投标文件格式", 1),
+        block("b2", "heading", "商务评审索引表", "投标文件格式", 2),
+        block(
+            "b3",
+            "table",
+            "评审因素 | 投标文件组成 | 对应页码\n1 | 投标函 | 7",
+            "投标文件格式",
+            3,
+        ),
+        block("b4", "heading", "投标函", "投标文件格式", 4),
+        block("b5", "paragraph", "投标人名称：____", "投标文件格式", 5),
+    ]
+
+    class FakeParser:
+        def parse(self, path):
+            return blocks
+
+    result = extract_tender_compliance_objects(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=FakeParser(),
+    )
+
+    navigation = next(
+        item for item in result["templates"] if item["name"] == "商务评审索引表"
+    )
+    assert navigation["compliance_excluded"] is True
+    assert navigation["compliance_exclusion_reason"] == "navigation_content"
+    assert result["templates"][-1]["name"] == "投标函"
 
 
 def test_llm_template_segments_replace_coarse_fallback_and_ignore_materials_in_template_region(

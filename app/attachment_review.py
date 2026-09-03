@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.navigation_content import (
+    filter_navigation_sections,
+    filter_navigation_templates,
+)
 from app.template_matching import build_template_comparisons, normalize_module_title
 
 logger = logging.getLogger(__name__)
@@ -1319,6 +1323,9 @@ def _review_one_attachment(
 def _attachment_stats(
     *,
     template_count: int,
+    participating_template_count: int,
+    navigation_excluded_templates: list[dict[str, Any]],
+    navigation_excluded_bid_sections: list[dict[str, Any]],
     matched_template_count: int,
     code_candidate_count: int,
     no_bid_candidate_template_ids: list[str],
@@ -1357,6 +1364,9 @@ def _attachment_stats(
     ]
     return {
         "template_count": template_count,
+        "participating_template_count": participating_template_count,
+        "navigation_excluded_template_count": len(navigation_excluded_templates),
+        "navigation_excluded_bid_section_count": len(navigation_excluded_bid_sections),
         "matched_template_count": matched_template_count,
         "code_candidate_count": code_candidate_count,
         "selected_template_count": len(results),
@@ -1402,17 +1412,17 @@ def run_attachment_review(
     started_at = time.perf_counter()
     raw_templates = extraction_result.get("templates", [])
     templates = [item for item in raw_templates if isinstance(item, dict)] if isinstance(raw_templates, list) else []
+    extracted_templates = templates
+    templates, excluded_templates = filter_navigation_templates(extracted_templates)
     document, artifact_dir = _read_structured_document(parsed_bid)
-    raw_sections = document.get("sections", []) if isinstance(document, dict) else []
-    if not isinstance(raw_sections, list):
-        raw_sections = []
     (
         _sections,
         sections_by_id,
         images_by_block_id,
         images_by_id,
     ) = _materialized_sections(document or {})
-    comparisons = build_template_comparisons(templates, raw_sections)
+    sections, excluded_sections = filter_navigation_sections(_sections)
+    comparisons = build_template_comparisons(templates, sections)
     matched_template_count = sum(
         comparison.get("status") == "matched" for comparison in comparisons
     )
@@ -1496,8 +1506,15 @@ def run_attachment_review(
     review_result = {
         "mode": "attachments",
         "attachment_reviews": results,
+        "navigation_exclusions": {
+            "tender_templates": excluded_templates,
+            "bid_modules": excluded_sections,
+        },
         "stats": _attachment_stats(
-            template_count=len(templates),
+            template_count=len(extracted_templates),
+            participating_template_count=len(templates),
+            navigation_excluded_templates=excluded_templates,
+            navigation_excluded_bid_sections=excluded_sections,
             matched_template_count=matched_template_count,
             code_candidate_count=len(jobs),
             no_bid_candidate_template_ids=no_bid_candidate_template_ids,
@@ -1512,7 +1529,10 @@ def run_attachment_review(
         recorder.event(
             "attachment.review.end",
             status="complete",
-            template_count=len(templates),
+            template_count=len(extracted_templates),
+            participating_template_count=len(templates),
+            navigation_excluded_template_count=len(excluded_templates),
+            navigation_excluded_bid_section_count=len(excluded_sections),
             matched_template_count=matched_template_count,
             selected_template_count=len(results),
             llm_total_calls=review_result["stats"]["llm_total_calls"],

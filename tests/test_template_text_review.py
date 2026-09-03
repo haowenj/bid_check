@@ -454,6 +454,59 @@ def test_template_semantic_mismatch_skips_business_review_and_stats_as_candidate
     assert result["stats"]["fail_count"] == 0
 
 
+def test_navigation_template_and_bid_module_skip_all_template_review_stages():
+    template = _template(
+        "商务评审索引表",
+        "商务评审索引表\n评审因素 | 投标文件组成 | 对应页码\n1 | 投标函 | 7",
+        [],
+    )
+    document = {
+        "sections": [
+            {
+                "section_id": "s-index",
+                "title": "3 商务评审索引表",
+                "path": ["3 商务评审索引表"],
+                "direct_block_ids": ["b-index-heading", "b-index-table"],
+            }
+        ],
+        "blocks": [
+            {
+                "block_id": "b-index-heading",
+                "type": "heading",
+                "text": "3 商务评审索引表",
+                "order": 1,
+            },
+            {
+                "block_id": "b-index-table",
+                "type": "table",
+                "text": "评审因素 | 投标文件组成 | 对应页码\n1 | 投标函 | 7",
+                "order": 2,
+            },
+        ],
+    }
+    llm = RecordingReviewLLM()
+
+    result = run_template_text_review(
+        {"templates": [template]},
+        {"structured_document": document},
+        llm=llm,
+    )
+
+    assert result["template_text_reviews"] == []
+    assert llm.calls == []
+    assert result["stats"]["template_count"] == 1
+    assert result["stats"]["participating_template_count"] == 0
+    assert result["stats"]["selected_template_count"] == 0
+    assert result["stats"]["semantic_matched_count"] == 0
+    assert result["stats"]["exception_review_call_count"] == 0
+    assert result["navigation_exclusions"]["tender_templates"][0]["name"] == (
+        "商务评审索引表"
+    )
+    assert result["navigation_exclusions"]["bid_modules"][0]["section_id"] == (
+        "s-index"
+    )
+
+
 def test_template_semantic_uncertain_does_not_force_business_uncertain_result():
     llm = FixedSemanticReviewLLM(
         {
@@ -1231,6 +1284,9 @@ def test_all_matched_templates_run_with_bounded_concurrency_and_stable_order():
     )
     assert result["stats"] == {
         "template_count": 8,
+        "participating_template_count": 8,
+        "navigation_excluded_template_count": 0,
+        "navigation_excluded_bid_section_count": 0,
         "matched_template_count": 6,
         "code_candidate_count": 6,
         "selected_template_count": 6,
