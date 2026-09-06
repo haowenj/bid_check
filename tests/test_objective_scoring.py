@@ -687,3 +687,41 @@ def test_performance_amount_is_normalized_from_ocr_facts_not_table_value(tmp_pat
     assert case["amount"]["value"] == 3640
     assert case["amount"]["unit"] == "万元"
     assert case["amount"]["basis"] == "contract_fact"
+
+
+def test_performance_amount_keeps_max_score_when_unknown_cases_cannot_change_tier(tmp_path):
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    confirmed = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="fail",
+        amount_text="36400000元",
+        signed_date_text="2025年2月10日",
+    )
+    unresolved = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="uncertain",
+        amount_text="按费率结算",
+        signed_date_text="2025年3月10日",
+    )
+    result = run_objective_scoring(
+        make_rule_with_performance_item("score_item_011", "类似案例2"),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts={
+            "10_performance_reviews.json": {
+                "performance_reviews": [qualification, confirmed, unresolved],
+                "stats": {},
+            }
+        },
+    )
+
+    item = result["score_items"][0]
+    assert item["status"] == "auto_scored"
+    assert item["score"] == 5
+    assert item["calculation"]["max_score_proven_by_confirmed_amount"] is True
+    assert item["calculation"]["unresolved_case_numbers"] == ["2"]

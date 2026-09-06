@@ -1018,6 +1018,24 @@ def _performance_handler(
                 if isinstance(case.get("amount"), Mapping)
                 and isinstance(case["amount"].get("cumulative_value"), (int, float))
             )
+            if confirmed_amount >= 1900:
+                return _status_result(
+                    result,
+                    status="auto_scored",
+                    score=5,
+                    reason="已确认的评分业绩累计金额已达到最高档1900万元，未确认业绩不会改变本项最高分结果。",
+                    facts=common_facts,
+                    calculation={
+                        "formula": "剔除资格要求业绩后累计当前评分规则确认的合同金额，并按1900/1500/1000万元档位计分",
+                        "qualified_excluded_amount": qualified_excluded_amount,
+                        "confirmed_cumulative_amount": confirmed_amount,
+                        "scoring_amount": confirmed_amount,
+                        "unresolved_case_numbers": [case["case_number"] for case in unresolved],
+                        "max_score_proven_by_confirmed_amount": True,
+                    },
+                    evidence=evidence,
+                    related_artifacts=related,
+                )
             reason = "存在评分业绩的当前评分条件或累计金额无法确认，无法可靠确定金额分档。"
             calculation = {
                 "formula": "剔除资格要求业绩后累计当前评分规则确认的合同金额，并按1900/1500/1000万元档位计分",
