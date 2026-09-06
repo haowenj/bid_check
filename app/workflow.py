@@ -38,6 +38,7 @@ class BidCheckServices:
     extract_with_recorder: Callable[..., dict[str, Any]] | None = None
     extract_evaluation_with_recorder: Callable[..., dict[str, Any]] | None = None
     score_objective_with_recorder: Callable[..., dict[str, Any]] | None = None
+    execute_veto_with_recorder: Callable[..., dict[str, Any]] | None = None
     review_with_recorder: Callable[..., dict[str, Any]] | None = None
 
 
@@ -88,6 +89,7 @@ class BidCheckWorkflow:
             "bid_parse_elapsed_ms": None,
             "review_elapsed_ms": None,
             "objective_scoring_elapsed_ms": None,
+            "veto_rule_execution_elapsed_ms": None,
             "total_elapsed_ms": None,
         }
         if recorder is not None:
@@ -237,6 +239,66 @@ class BidCheckWorkflow:
                             scoring_elapsed_ms,
                         )
                         return
+                veto_rule_reviews = None
+                if self.services.execute_veto_with_recorder is not None:
+                    veto_started_at = time.perf_counter()
+                    record_event(
+                        "workflow.stage.start",
+                        stage="veto_rule_execution",
+                        task_id=task_id,
+                        mode="evaluation",
+                        file=task.bid_file.filename,
+                    )
+                    try:
+                        veto_rule_reviews = self.services.execute_veto_with_recorder(
+                            task.tender_file,
+                            task.bid_file,
+                            evaluation_result,
+                            objective_scores=objective_scores,
+                            recorder=recorder,
+                        )
+                        veto_elapsed_ms = _elapsed_ms(veto_started_at)
+                        workflow_stats[
+                            "veto_rule_execution_elapsed_ms"
+                        ] = veto_elapsed_ms
+                        record_event(
+                            "workflow.stage.end",
+                            stage="veto_rule_execution",
+                            task_id=task_id,
+                            mode="evaluation",
+                            status="complete",
+                            result=_result_summary(veto_rule_reviews),
+                            elapsed_ms=veto_elapsed_ms,
+                        )
+                    except Exception as veto_error:
+                        veto_elapsed_ms = _elapsed_ms(veto_started_at)
+                        workflow_stats[
+                            "veto_rule_execution_elapsed_ms"
+                        ] = veto_elapsed_ms
+                        record_event(
+                            "workflow.stage.error",
+                            stage="veto_rule_execution",
+                            task_id=task_id,
+                            mode="evaluation",
+                            status="failed",
+                            error_type=type(veto_error).__name__,
+                            error_message=str(veto_error),
+                            elapsed_ms=veto_elapsed_ms,
+                        )
+                        self.repository.fail(task_id, "review", str(veto_error))
+                        finalize_workflow(
+                            status="failed",
+                            failed_stage="review",
+                            error=veto_error,
+                        )
+                        logger.error(
+                            "workflow.stage.error stage=veto_rule_execution mode=evaluation task_id=%s error_type=%s elapsed_ms=%d",
+                            task_id,
+                            type(veto_error).__name__,
+                            veto_elapsed_ms,
+                        )
+                        return
+
                 self.repository.complete(
                     task_id,
                     {
@@ -246,6 +308,11 @@ class BidCheckWorkflow:
                             if objective_scores is not None
                             else {}
                         ),
+                        **(
+                            {"veto_rule_reviews": veto_rule_reviews}
+                            if veto_rule_reviews is not None
+                            else {}
+                        ),
                     },
                 )
                 workflow_stats["review_elapsed_ms"] = 0
@@ -253,7 +320,11 @@ class BidCheckWorkflow:
                     "workflow.review.skip",
                     task_id=task_id,
                     mode="evaluation",
-                    reason="evaluation_mode_does_not_run_subjective_or_veto_scoring",
+                    reason=(
+                        "evaluation_mode_does_not_run_subjective_scoring"
+                        if veto_rule_reviews is not None
+                        else "evaluation_mode_does_not_run_subjective_or_veto_scoring"
+                    ),
                 )
                 finalize_workflow(status="complete")
                 logger.info(

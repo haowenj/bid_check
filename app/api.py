@@ -48,6 +48,7 @@ from app.objective_scoring import (
     load_reusable_tender_evidence,
     run_objective_scoring,
 )
+from app.veto_rule_execution import run_veto_rule_execution
 from app.config import Settings, load_settings
 from app.models import BidCheckTask, FileMetadata
 from app.repository import BidCheckRepository
@@ -595,6 +596,36 @@ def build_default_workflow(
             bid_parse_fallback_used=parser_fallback_used,
         )
 
+    def execute_veto(
+        tender_file: FileMetadata,
+        bid_file: FileMetadata,
+        evaluation_result: dict[str, Any],
+        *,
+        objective_scores: dict[str, Any] | None = None,
+        recorder=None,
+    ) -> dict[str, Any]:
+        evidence = load_reusable_bid_evidence(bid_file)
+        if evidence["bid_document"] is None:
+            bid_path = Path(bid_file.storage_path).expanduser().resolve()
+            clean_bid_document(
+                bid_file,
+                parser=bid_parser,
+                output_dir=bid_path.parent / "bid_document_cleaning",
+            )
+            evidence = load_reusable_bid_evidence(bid_file)
+        return run_veto_rule_execution(
+            evaluation_result,
+            bid_file,
+            bid_document=evidence["bid_document"],
+            artifact_dir=(
+                Path(evidence["bid_document_artifact"]).parent
+                if evidence["bid_document_artifact"]
+                else None
+            ),
+            objective_scores=objective_scores,
+            recorder=recorder,
+        )
+
     services = BidCheckServices(
         extract=extract_requirements,
         parse=partial(
@@ -610,6 +641,7 @@ def build_default_workflow(
         extract_with_recorder=extract_requirements,
         extract_evaluation_with_recorder=extract_evaluation,
         score_objective_with_recorder=score_objective,
+        execute_veto_with_recorder=execute_veto,
         review_with_recorder=partial(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,

@@ -366,3 +366,56 @@ def test_evaluation_workflow_runs_objective_scoring_after_rule_extraction(
         ("evaluate", "招标文件.docx"),
         ("score", "招标文件.docx", "投标文件.docx"),
     ]
+
+
+def test_evaluation_workflow_runs_veto_execution_after_objective_scoring(
+    task_repository, tmp_path
+):
+    calls = []
+    rules = evaluation_result()
+    scores = {"score_items": [], "stats": {"objective_item_count": 0}}
+    veto = {"veto_rule_reviews": [], "stats": {"formal_rule_count": 0}}
+
+    def evaluate(tender_file, recorder=None):
+        del recorder
+        calls.append("evaluate")
+        return rules
+
+    def score(tender_file, bid_file, evaluation_rules, recorder=None):
+        del tender_file, bid_file, recorder
+        calls.append("objective")
+        assert evaluation_rules is rules
+        return scores
+
+    def execute(
+        tender_file,
+        bid_file,
+        evaluation_rules,
+        objective_scores=None,
+        recorder=None,
+    ):
+        del tender_file, bid_file, recorder
+        calls.append("veto")
+        assert evaluation_rules is rules
+        assert objective_scores is scores
+        return veto
+
+    services = BidCheckServices(
+        extract=lambda _: empty_objects(),
+        parse=lambda _: {"status": "unused"},
+        review=lambda *_: {"status": "unused"},
+        extract_evaluation_with_recorder=evaluate,
+        score_objective_with_recorder=score,
+        execute_veto_with_recorder=execute,
+    )
+    task = create_evaluation_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    completed = task_repository.get(task.task_id)
+    assert completed is not None
+    assert completed.result["veto_rule_reviews"] == veto
+    assert calls == ["evaluate", "objective", "veto"]
