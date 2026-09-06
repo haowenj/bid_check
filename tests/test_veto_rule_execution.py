@@ -219,6 +219,37 @@ def test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_js
     assert "related_artifacts" in review
 
 
+def test_veto_execution_preserves_compiled_rule_source_fields_verbatim(tmp_path):
+    rule = make_rule(
+        "veto_compiled",
+        "编译规则",
+        "编译触发条件",
+        original="编译原文",
+    )
+    rule["additional_consequence"] = "编译阶段附加后果"
+    rule["evidence_requirements"] = ["编译阶段证据要求"]
+    rule["source"] = {
+        "section": "3.1初步评审",
+        "block_ids": ["tender-b9"],
+        "source_text": "3.1.3编译原文",
+        "page": 42,
+    }
+
+    review = run_veto_rule_execution(
+        make_rules(veto_rules=[rule]),
+        bid_file(tmp_path),
+    )["veto_rule_reviews"][0]
+
+    assert review["id"] == rule["id"]
+    assert review["name"] == rule["name"]
+    assert review["original_rule"] == rule["original_rule"]
+    assert review["trigger_condition"] == rule["trigger_condition"]
+    assert review["consequence"] == rule["consequence"]
+    assert review["additional_consequence"] == rule["additional_consequence"]
+    assert review["evidence_requirements"] == rule["evidence_requirements"]
+    assert review["tender_rule_source"] == rule["source"]
+
+
 def test_business_only_file_does_not_trigger_star_rule(tmp_path):
     result = run_veto_rule_execution(
         make_rules(
@@ -235,6 +266,69 @@ def test_business_only_file_does_not_trigger_star_rule(tmp_path):
     )
 
     assert result["veto_rule_reviews"][0]["status"] == "file_scope_missing"
+
+
+def test_rule_applicability_precedes_bid_scope_for_project_specific_exclusions(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_limit",
+                    "超过最高投标限价",
+                    "投标报价超过最高投标限价",
+                ),
+                make_rule(
+                    "veto_bond",
+                    "未递交投标保证金",
+                    "未递交投标保证金或者保证金有瑕疵",
+                ),
+            ]
+        ),
+        bid_file(tmp_path),
+        tender_evidence={
+            "artifact_path": "/tmp/tender/01_parsed_blocks.json",
+            "blocks": [
+                {
+                    "block_id": "tender-limit",
+                    "section": "投标人须知前附表",
+                    "text": "3.3.3最高投标限价或者其计算方法：不设置最高投标限价",
+                },
+                {
+                    "block_id": "tender-bond",
+                    "section": "投标人须知前附表",
+                    "text": "3.5.1投标保证金：无需递交投标保证金",
+                },
+            ],
+        },
+    )
+
+    limit, bond = result["veto_rule_reviews"]
+    assert limit["status"] == "not_applicable"
+    assert bond["status"] == "not_applicable"
+    assert limit["applicability"]["status"] == "not_applicable"
+    assert bond["applicability"]["status"] == "not_applicable"
+    assert limit["applicability"]["evidence"][0]["block_ids"] == ["tender-limit"]
+    assert bond["applicability"]["evidence"][0]["block_ids"] == ["tender-bond"]
+    assert limit["triggered"] is False
+    assert bond["triggered"] is False
+
+
+def test_conditional_rule_without_tender_applicability_fact_is_uncertain(tmp_path):
+    review = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_limit",
+                    "超过最高投标限价",
+                    "投标报价超过最高投标限价",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+    )["veto_rule_reviews"][0]
+
+    assert review["status"] == "evidence_insufficient"
+    assert review["applicability"]["status"] == "applicability_uncertain"
 
 
 def test_low_price_requires_evaluation_process_and_is_not_auto_triggered(tmp_path):
@@ -598,3 +692,55 @@ def test_preliminary_aggregate_links_to_a_triggered_child_without_duplicate_caus
     assert parent["status"] == "triggered"
     assert parent["triggered_by"] == ["veto_001"]
     assert child["parent_rule_ids"] == ["veto_002"]
+
+
+def test_parent_relations_use_semantic_rule_anchors_and_skip_delivery_parent(tmp_path):
+    rules = make_rules(
+        veto_rules=[
+            make_rule(
+                "veto_006",
+                "逾期送达或未按要求密封",
+                "出现下列情形之一：逾期送达或者未按要求密封，不予接收投标文件",
+                original="4.1.5出现下列情形之一时不予接收投标文件：逾期送达或者未按要求密封。",
+            ),
+            make_rule(
+                "veto_009",
+                "否决投标情形（通用）",
+                "投标人有以下情形之一的，评标委员会应当否决其投标",
+                original=(
+                    "3.1.2投标人有以下情形之一的，评标委员会应当否决其投标："
+                    "投标报价高于最高投标限价；没有按照要求提供投标担保；"
+                    "投标报价低于成本。"
+                ),
+            ),
+            make_rule(
+                "veto_limit",
+                "超过最高投标限价",
+                "投标报价超过最高投标限价",
+            ),
+            make_rule(
+                "veto_bond",
+                "未递交投标保证金",
+                "没有按照招标文件要求提供投标担保或者担保有瑕疵",
+            ),
+            make_rule(
+                "veto_cost",
+                "低于成本价投标否决",
+                "投标报价低于成本且不能合理说明",
+            ),
+            make_rule(
+                "veto_validity",
+                "投标有效期不满足要求",
+                "投标有效期不满足招标文件要求",
+            ),
+        ]
+    )
+
+    reviews = run_veto_rule_execution(rules, bid_file(tmp_path))["veto_rule_reviews"]
+    by_id = {item["id"]: item for item in reviews}
+
+    assert by_id["veto_limit"]["parent_rule_ids"] == ["veto_009"]
+    assert by_id["veto_bond"]["parent_rule_ids"] == ["veto_009"]
+    assert by_id["veto_cost"]["parent_rule_ids"] == ["veto_009"]
+    assert by_id["veto_validity"]["parent_rule_ids"] == []
+    assert by_id["veto_006"]["parent_rule_ids"] == []

@@ -100,6 +100,7 @@ def load_reusable_tender_evidence(
             "artifact_path": str(artifact_path),
             "announcement_date": None,
             "announcement_date_source": None,
+            "blocks": [],
         }
 
     candidates: list[dict[str, str]] = []
@@ -135,6 +136,9 @@ def load_reusable_tender_evidence(
         "artifact_path": str(artifact_path),
         "announcement_date": announcement_date,
         "announcement_date_source": source,
+        "blocks": [dict(block) for block in blocks if isinstance(block, Mapping)]
+        if isinstance(blocks, list)
+        else [],
     }
 
 

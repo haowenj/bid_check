@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ VETO_STATUSES = frozenset(
     {
         "triggered",
         "not_triggered",
+        "not_applicable",
         "evidence_insufficient",
         "file_scope_missing",
         "external_data_required",
@@ -97,6 +99,16 @@ _CHINESE_DIGITS = {
     "九": 9,
 }
 
+_APPLICABILITY_STATUSES = frozenset(
+    {"applicable", "not_applicable", "applicability_uncertain"}
+)
+_PROJECT_SPECIFIC_SECTIONS = (
+    "投标人须知前附表",
+    "招标文件否决投标条款汇总",
+    "专用部分",
+    "前附表",
+)
+
 
 def _as_text(value: Any) -> str:
     if isinstance(value, str):
@@ -109,14 +121,7 @@ def _as_text(value: Any) -> str:
 def _copy_source(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {"section": "", "block_ids": [], "source_text": ""}
-    block_ids = value.get("block_ids", [])
-    return {
-        "section": _as_text(value.get("section")),
-        "block_ids": [str(item) for item in block_ids]
-        if isinstance(block_ids, list)
-        else [],
-        "source_text": _as_text(value.get("source_text")),
-    }
+    return deepcopy(dict(value))
 
 
 def _rule_text(rule: Mapping[str, Any]) -> str:
@@ -181,12 +186,17 @@ def _is_business_only(
 
 
 def _is_preliminary_aggregate_text(text: str) -> bool:
+    if _contains_any(text, ("逾期送达", "未送达指定地点", "密封", "不予接收")):
+        return False
     if _contains_any(text, _PRELIMINARY_TERMS) and _contains_any(
         text,
         ("有一项", "任一项", "不通过", "不符合"),
     ):
         return True
-    return _contains_any(text, ("任一情形", "存在以下任一", "下列情形之一"))
+    return _contains_any(
+        text,
+        ("任一情形", "存在以下任一", "下列情形之一", "以下情形之一"),
+    )
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -302,13 +312,19 @@ def _review_base(rule: Mapping[str, Any]) -> dict[str, Any]:
         "original_rule": _as_text(rule.get("original_rule")),
         "trigger_condition": _as_text(rule.get("trigger_condition")),
         "consequence": _as_text(rule.get("consequence")),
-        "additional_consequence": rule.get("additional_consequence"),
+        "additional_consequence": deepcopy(rule.get("additional_consequence")),
         "evidence_requirements": (
-            [str(item) for item in evidence_requirements]
+            deepcopy(evidence_requirements)
             if isinstance(evidence_requirements, list)
             else []
         ),
         "tender_rule_source": source,
+        "applicability": {
+            "status": "applicable",
+            "reason": "该规则已由招标文件编译为当前项目正式规则，未发现明确的不适用事实。",
+            "facts": [],
+            "evidence": [],
+        },
         "status": "evidence_insufficient",
         "triggered": False,
         "facts_required": [],
@@ -324,6 +340,194 @@ def _review_base(rule: Mapping[str, Any]) -> dict[str, Any]:
         },
         "parent_rule_ids": [],
         "triggered_by": [],
+        "rule_relations": [],
+    }
+
+
+def _tender_context_records(
+    evaluation_rules: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if isinstance(tender_evidence, Mapping):
+        blocks = tender_evidence.get("blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    continue
+                text = _as_text(block.get("text"))
+                if not text:
+                    continue
+                block_id = _as_text(block.get("block_id"))
+                records.append(
+                    {
+                        "section": _as_text(block.get("section")),
+                        "block_ids": [block_id] if block_id else [],
+                        "source_text": text,
+                        "artifact": _as_text(tender_evidence.get("artifact_path"))
+                        or "01_parsed_blocks.json",
+                    }
+                )
+    if records:
+        return records
+
+    source_sections = evaluation_rules.get("source_sections", [])
+    if not isinstance(source_sections, list):
+        return records
+    for source in source_sections:
+        if not isinstance(source, Mapping):
+            continue
+        text = _as_text(source.get("source_text"))
+        if not text:
+            continue
+        block_ids = source.get("block_ids", [])
+        records.append(
+            {
+                "section": _as_text(source.get("section")),
+                "block_ids": deepcopy(block_ids) if isinstance(block_ids, list) else [],
+                "source_text": text,
+                "artifact": "11_evaluation_rules.json",
+            }
+        )
+    return records
+
+
+def _is_project_specific_tender_record(record: Mapping[str, Any]) -> bool:
+    section = _as_text(record.get("section"))
+    text = _as_text(record.get("source_text"))
+    return _contains_any(section, _PROJECT_SPECIFIC_SECTIONS) or bool(
+        re.search(
+            r"(?:1\.4\s*最高投标限价|3\.3\.3\s*最高投标限价|"
+            r"3\.5(?:\.1)?\s*投标保证金|第一部分：专用部分)",
+            text,
+        )
+    )
+
+
+def _applicability_for_rule(
+    rule: Mapping[str, Any],
+    *,
+    evaluation_rules: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    rule_name = _as_text(rule.get("name"))
+    text = _rule_text(rule)
+    records = [
+        record
+        for record in _tender_context_records(evaluation_rules, tender_evidence)
+        if _is_project_specific_tender_record(record)
+    ]
+
+    kind = None
+    if "最高投标限价" in rule_name:
+        kind = "highest_bid_limit"
+        negative_terms = (
+            "不设置最高投标限价",
+            "不设最高投标限价",
+            "不涉及最高投标限价",
+        )
+        positive_terms = ("设置最高投标限价", "设有最高投标限价")
+    elif "投标保证金" in rule_name or "投标担保" in rule_name:
+        kind = "bid_bond"
+        negative_terms = (
+            "无需递交投标保证金",
+            "不要求递交投标保证金",
+            "不涉及要求递交投标保证金",
+            "不设置投标保证金",
+        )
+        positive_terms = ("要求递交投标保证金", "要求投标人递交投标保证金")
+    else:
+        return {
+            "status": "applicable",
+            "reason": "该规则不是当前已识别的项目条件性规则，按编译结果进入执行。",
+            "facts": [],
+            "evidence": [],
+        }
+
+    relevant: list[dict[str, Any]] = []
+    for record in records:
+        record_text = _as_text(record.get("source_text"))
+        if kind == "highest_bid_limit" and "最高投标限价" not in record_text:
+            continue
+        if kind == "bid_bond" and "投标保证金" not in record_text:
+            continue
+        relevant.append(record)
+
+    if not relevant:
+        return {
+            "status": "applicability_uncertain",
+            "reason": "当前招标侧没有可核验的项目专用条件，不能确定该条件性规则是否适用。",
+            "facts": [],
+            "evidence": [],
+        }
+
+    matched_negative: list[dict[str, Any]] = []
+    matched_positive: list[dict[str, Any]] = []
+    for record in relevant:
+        record_text = _as_text(record.get("source_text"))
+        negative = [term for term in negative_terms if term in record_text]
+        positive = [term for term in positive_terms if term in record_text]
+        if negative:
+            matched_negative.append({"record": record, "terms": negative})
+        elif positive:
+            matched_positive.append({"record": record, "terms": positive})
+
+    if matched_negative:
+        facts = [
+            {
+                "kind": kind,
+                "status": "not_applicable",
+                "matched_terms": item["terms"],
+            }
+            for item in matched_negative
+        ]
+        evidence = [
+            {
+                "artifact": item["record"]["artifact"],
+                "block_ids": item["record"]["block_ids"],
+                "source_text": item["record"]["source_text"],
+                "matched_terms": item["terms"],
+            }
+            for item in matched_negative
+        ]
+        label = "最高投标限价" if kind == "highest_bid_limit" else "投标保证金"
+        return {
+            "status": "not_applicable",
+            "reason": f"招标文件项目专用条件明确：本项目不适用{label}否决规则。",
+            "facts": facts,
+            "evidence": evidence,
+        }
+
+    if matched_positive:
+        facts = [
+            {
+                "kind": kind,
+                "status": "applicable",
+                "matched_terms": item["terms"],
+            }
+            for item in matched_positive
+        ]
+        evidence = [
+            {
+                "artifact": item["record"]["artifact"],
+                "block_ids": item["record"]["block_ids"],
+                "source_text": item["record"]["source_text"],
+                "matched_terms": item["terms"],
+            }
+            for item in matched_positive
+        ]
+        return {
+            "status": "applicable",
+            "reason": "招标文件项目专用条件明确该条件性规则适用。",
+            "facts": facts,
+            "evidence": evidence,
+        }
+
+    return {
+        "status": "applicability_uncertain",
+        "reason": "已找到项目专用条款，但其内容不足以明确判断该条件性规则是否适用。",
+        "facts": [],
+        "evidence": [],
     }
 
 
@@ -818,6 +1022,46 @@ def _is_preliminary_aggregate(rule: Mapping[str, Any]) -> bool:
     return _is_preliminary_aggregate_text(_rule_text(rule))
 
 
+def _semantic_relation_anchor(
+    child_rule: Mapping[str, Any],
+    parent_rule: Mapping[str, Any],
+) -> str | None:
+    child_text = _rule_text(child_rule)
+    parent_text = _rule_text(parent_rule)
+    if _contains_any(child_text, ("逾期送达", "未送达指定地点", "密封", "不予接收")):
+        return None
+    if "最高投标限价" in child_text and (
+        "最高投标限价" in parent_text
+        and _contains_any(parent_text, ("高于", "超过", "不得超过"))
+    ):
+        return "最高投标限价"
+    if _contains_any(child_text, ("投标保证金", "投标担保")) and (
+        _contains_any(parent_text, ("投标保证金", "投标担保"))
+        and _contains_any(parent_text, ("提供", "瑕疵", "没有按照"))
+    ):
+        return "投标保证金/投标担保"
+    if "低于成本" in child_text and "低于成本" in parent_text:
+        return "低于成本"
+    if "资格" in child_text and _contains_any(
+        parent_text,
+        ("资格条件", "资格审查", "不符合国家或者招标文件规定的资格"),
+    ):
+        return "资格条件"
+    child_source = child_rule.get("source")
+    child_section = (
+        _as_text(child_source.get("section"))
+        if isinstance(child_source, Mapping)
+        else ""
+    )
+    if (
+        "资格审查" in child_section
+        and _contains_any(parent_text, ("初步评审", "评审标准"))
+        and "有一项" in parent_text
+    ):
+        return "初步评审资格子项"
+    return None
+
+
 def _link_preliminary_relations(
     reviews: list[dict[str, Any]],
     rules: list[Mapping[str, Any]],
@@ -835,16 +1079,15 @@ def _link_preliminary_relations(
             if child_index == parent_index or _is_preliminary_aggregate(child_rule):
                 continue
             child = reviews[child_index]
-            source = _copy_source(child_rule.get("source"))
-            child_text = _rule_text(child_rule)
-            if not (
-                _contains_any(source.get("section", ""), _PRELIMINARY_TERMS)
-                or _contains_any(child_text, ("资格", "形式评审", "响应性"))
-            ):
+            relation = _semantic_relation_anchor(child_rule, rules[parent_index])
+            if relation is None:
                 continue
             parent_id = _as_text(rules[parent_index].get("id"))
             if parent_id and parent_id not in child["parent_rule_ids"]:
                 child["parent_rule_ids"].append(parent_id)
+                child["rule_relations"].append(
+                    {"parent_rule_id": parent_id, "relation": relation}
+                )
             if child.get("status") != "triggered":
                 continue
             child_id = _as_text(child_rule.get("id"))
@@ -861,6 +1104,7 @@ def _link_preliminary_relations(
                 {
                     "derived_from_rule_id": child_id,
                     "relation": "preliminary_review_aggregate",
+                    "relation_anchor": relation,
                     "status": "triggered",
                 }
             ]
@@ -912,14 +1156,26 @@ def _stats(
     started_at: float,
 ) -> dict[str, Any]:
     status_counts = {status: 0 for status in sorted(VETO_STATUSES)}
+    applicability_counts = {
+        status: 0 for status in sorted(_APPLICABILITY_STATUSES)
+    }
     for review in reviews:
         status = _as_text(review.get("status"))
         if status in VETO_STATUSES:
             status_counts[status] += 1
+        applicability = review.get("applicability")
+        applicability_status = (
+            _as_text(applicability.get("status"))
+            if isinstance(applicability, Mapping)
+            else ""
+        )
+        if applicability_status in _APPLICABILITY_STATUSES:
+            applicability_counts[applicability_status] += 1
     return {
         "formal_rule_count": len(reviews),
         "triggered_count": status_counts["triggered"],
         "status_counts": status_counts,
+        "applicability_counts": applicability_counts,
         "llm_total_calls": 0,
         "ocr_reused": bool(evidence.get("bid_document_hash_verified")),
         "duplicate_parse": False,
@@ -937,6 +1193,7 @@ def run_veto_rule_execution(
     artifact_dir: Path | None = None,
     existing_artifacts: Mapping[str, Any] | None = None,
     objective_scores: Mapping[str, Any] | None = None,
+    tender_evidence: Mapping[str, Any] | None = None,
     recorder: ComplianceExtractionRecorder | None = None,
 ) -> dict[str, Any]:
     """Execute formal veto rules from reusable structured evidence only."""
@@ -951,15 +1208,44 @@ def run_veto_rule_execution(
     raw_rules = evaluation_rules.get("veto_rules", [])
     rules = [rule for rule in raw_rules if isinstance(rule, Mapping)] \
         if isinstance(raw_rules, list) else []
-    reviews = [
-        _dispatch_rule(
-            _review_base(rule),
-            rule=rule,
-            evidence=evidence,
-            bid_file=bid_file,
+    reviews: list[dict[str, Any]] = []
+    for rule in rules:
+        review = _review_base(rule)
+        applicability = _applicability_for_rule(
+            rule,
+            evaluation_rules=evaluation_rules,
+            tender_evidence=tender_evidence,
         )
-        for rule in rules
-    ]
+        review["applicability"] = applicability
+        if applicability["status"] == "not_applicable":
+            review = _finish_review(
+                review,
+                status="not_applicable",
+                reason=applicability["reason"],
+                facts_required=["招标文件项目专用条件"],
+                confirmed_facts=applicability["facts"],
+                evidence=applicability["evidence"],
+                related_artifacts=[
+                    str(item.get("artifact"))
+                    for item in applicability["evidence"]
+                    if isinstance(item, Mapping) and item.get("artifact")
+                ],
+            )
+        elif applicability["status"] == "applicability_uncertain":
+            review = _finish_review(
+                review,
+                status="evidence_insufficient",
+                reason=applicability["reason"],
+                facts_required=["招标文件项目专用条件"],
+            )
+        else:
+            review = _dispatch_rule(
+                review,
+                rule=rule,
+                evidence=evidence,
+                bid_file=bid_file,
+            )
+        reviews.append(review)
     _link_preliminary_relations(reviews, rules)
     reviews = [_enforce_audit_chain(review) for review in reviews]
     result: dict[str, Any] = {

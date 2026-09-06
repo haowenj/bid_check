@@ -604,6 +604,7 @@ def build_default_workflow(
         objective_scores: dict[str, Any] | None = None,
         recorder=None,
     ) -> dict[str, Any]:
+        tender_evidence = load_reusable_tender_evidence(tender_file)
         evidence = load_reusable_bid_evidence(bid_file)
         if evidence["bid_document"] is None:
             bid_path = Path(bid_file.storage_path).expanduser().resolve()
@@ -623,6 +624,7 @@ def build_default_workflow(
                 else None
             ),
             objective_scores=objective_scores,
+            tender_evidence=tender_evidence,
             recorder=recorder,
         )
 

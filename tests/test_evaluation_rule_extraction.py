@@ -396,6 +396,119 @@ def test_normalizer_rebinds_imprecise_model_source_to_matching_block():
     assert normalized["score_items"][0]["source"]["block_ids"] == ["b2"]
 
 
+def test_normalizer_filters_veto_rule_from_dominant_procurement_mode():
+    from app.evaluation_rule_extraction import (
+        _coerce_evaluation_output,
+        _normalize_evaluation_sources,
+    )
+
+    candidate = _candidate("b1", "评标办法", "公开招标文件，投标人提交投标文件。")
+    candidate = candidate.__class__(
+        **{
+            **candidate.__dict__,
+            "block_ids": ["b1", "b2"],
+            "text": (
+                "公开招标文件，投标人提交投标文件，投标人应按招标文件编制投标文件。\n"
+                "响应供应商按照询比文件提交响应文件，存在情形时否决响应。"
+            ),
+            "blocks": [
+                _block(
+                    "b1",
+                    "paragraph",
+                    "公开招标文件，投标人提交投标文件，投标人应按招标文件编制投标文件。",
+                    "评标办法",
+                    1,
+                ),
+                _block(
+                    "b2",
+                    "paragraph",
+                    "响应供应商按照询比文件提交响应文件，存在情形时否决响应。",
+                    "评标办法",
+                    2,
+                ),
+            ],
+        }
+    )
+    output = _coerce_evaluation_output(
+        {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [
+                {
+                    "name": "否决响应情形（询比/供应商）",
+                    "trigger_condition": "响应供应商存在询比文件规定的否决响应情形",
+                    "consequence": "否决响应",
+                    "evidence_requirements": [],
+                    "original_rule": "响应供应商按照询比文件提交响应文件，存在情形时否决响应。",
+                    "source_block_ids": ["b2"],
+                }
+            ],
+            "uncertain_rules": [],
+        }
+    )
+
+    normalized = _normalize_evaluation_sources(output, [candidate])
+
+    assert normalized["veto_rules"] == []
+    assert normalized["uncertain_rules"][0]["rule_type"] == "veto_rule"
+    assert normalized["uncertain_rules"][0]["uncertainty_reason"] == (
+        "procurement_mode_template_contamination"
+    )
+    assert normalized["uncertain_rules"][0]["source"]["block_ids"] == ["b2"]
+
+
+def test_normalizer_rebinds_low_cost_rule_to_its_actual_source_block():
+    from app.evaluation_rule_extraction import (
+        _coerce_evaluation_output,
+        _normalize_evaluation_sources,
+    )
+
+    candidate = _candidate("b1", "3.1初步评审", "表头")
+    candidate = candidate.__class__(
+        **{
+            **candidate.__dict__,
+            "block_ids": ["b1", "b2", "b3", "b4"],
+            "text": "表头\n3.1.2通用否决\n3.1.3低于成本价投标，评标委员会应当否决其投标\n3.1.4算术错误修正",
+            "blocks": [
+                _block("b1", "heading", "3.1初步评审", "评标办法", 1),
+                _block("b2", "paragraph", "3.1.2通用否决", "评标办法", 2),
+                _block(
+                    "b3",
+                    "paragraph",
+                    "3.1.3低于成本价投标，评标委员会应当否决其投标",
+                    "评标办法",
+                    3,
+                ),
+                _block("b4", "paragraph", "3.1.4算术错误修正", "评标办法", 4),
+            ],
+        }
+    )
+    output = _coerce_evaluation_output(
+        {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [
+                {
+                    "name": "低于成本价投标否决",
+                    "trigger_condition": "投标人不能合理说明低于成本价",
+                    "consequence": "否决其投标",
+                    "evidence_requirements": [],
+                    "original_rule": "3.1.3低于成本价投标，评标委员会应当否决其投标",
+                    "source_block_ids": ["b4"],
+                }
+            ],
+            "uncertain_rules": [],
+        }
+    )
+
+    normalized = _normalize_evaluation_sources(output, [candidate])
+
+    assert normalized["veto_rules"][0]["source"]["block_ids"] == ["b3"]
+    assert normalized["veto_rules"][0]["source"]["source_text"] == (
+        "3.1.3低于成本价投标，评标委员会应当否决其投标"
+    )
+
+
 def test_normalizer_rebinds_whole_candidate_hint_and_keeps_unexplicit_veto_uncertain():
     from app.evaluation_rule_extraction import (
         _coerce_evaluation_output,

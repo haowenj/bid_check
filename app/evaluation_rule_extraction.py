@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 EVALUATION_RULE_SCHEMA_VERSION = "evaluation-rules-v1"
 EVALUATION_RULE_PROMPT_VERSION = "evaluation-rule-extraction-prompt-v1"
 EVALUATION_RULE_CACHE_VERSION = (
-    f"evaluation-rule-extraction-v9:{EVALUATION_RULE_PROMPT_VERSION}"
+    f"evaluation-rule-extraction-v10:{EVALUATION_RULE_PROMPT_VERSION}"
 )
 EVALUATION_LLM_MAX_CONCURRENCY = 5
 _EVALUATION_LLM_SEMAPHORE = threading.BoundedSemaphore(
@@ -82,6 +82,12 @@ _MAJOR_CHAPTER_RE = re.compile(
 _NON_EVALUATION_MAJOR_RE = re.compile(
     r"合同条款|技术规范书|技术需求|投标文件格式|其他附件|招标公告|投标人须知"
 )
+_PROCUREMENT_MODE_TERMS: dict[str, tuple[str, ...]] = {
+    "tender": ("招标", "投标人", "投标文件", "投标"),
+    "comparison": ("询比", "供应商须知", "响应供应商", "响应文件", "响应"),
+    "quotation": ("询价", "报价供应商", "报价文件", "询价文件"),
+    "negotiation": ("谈判", "谈判供应商", "谈判文件", "谈判响应"),
+}
 
 
 class EvaluationRuleExtractionError(RuntimeError):
@@ -626,6 +632,22 @@ def _source_supports_rule(rule: str, source_text: str) -> bool:
     )
 
 
+_GENERIC_VETO_SOURCE_CLAUSES = {
+    _compact_rule_text("评标委员会应当否决其投标"),
+    _compact_rule_text("其投标将被否决"),
+    _compact_rule_text("有一项不符合评审标准"),
+}
+
+
+def _distinctive_rule_clauses(rule: str) -> list[str]:
+    return [
+        compact
+        for clause in re.split(r"[，。；、：:,.!?！？…]+", rule)
+        if len(compact := _compact_rule_text(clause)) >= 8
+        and compact not in _GENERIC_VETO_SOURCE_CLAUSES
+    ]
+
+
 def _has_explicit_veto_consequence(text: str) -> bool:
     if re.search(r"可能(?:会)?导致[^。；\n]{0,30}(?:被否决|废标|无效)", text):
         return False
@@ -683,8 +705,15 @@ def _rule_source_ids(
     # paragraph), but rebind a whole-candidate hint to the block containing
     # the actual rule text whenever possible.
     is_broad_hint = hinted_set == set(candidate.block_ids) or len(hinted_ids) > 4
-    if not is_broad_hint and len(hinted_ids) <= 8 and _source_supports_rule(
-        rule, hinted_source
+    if not is_broad_hint and len(hinted_ids) <= 8 and (
+        _compact_rule_text(rule) in _compact_rule_text(hinted_source)
+        or any(
+            clause in _compact_rule_text(hinted_source)
+            for clause in _distinctive_rule_clauses(rule)
+        )
+    ) and any(
+        clause in _compact_rule_text(hinted_source)
+        for clause in _distinctive_rule_clauses(rule)
     ):
         return list(hinted_ids)
     rule_key = _compact_rule_text(rule)
@@ -702,12 +731,21 @@ def _rule_source_ids(
     ]
     if exact_matches:
         return exact_matches[:1]
-    clause_matches = [
-        block.block_id
-        for block in candidate.blocks
-        if any(clause in _compact_rule_text(block.text) for clause in clauses)
-    ]
-    return clause_matches or list(hinted_ids)
+    distinctive_clauses = _distinctive_rule_clauses(rule)
+    scored_matches = []
+    for block in candidate.blocks:
+        block_key = _compact_rule_text(block.text)
+        score = sum(len(clause) for clause in distinctive_clauses if clause in block_key)
+        if score:
+            scored_matches.append((score, block.order, block.block_id))
+    if scored_matches:
+        best_score = max(item[0] for item in scored_matches)
+        return [
+            block_id
+            for score, _, block_id in sorted(scored_matches, key=lambda item: item[1])
+            if score == best_score
+        ][:1]
+    return list(hinted_ids)
 
 
 def _source_for_rule_ids(
@@ -720,6 +758,48 @@ def _source_for_rule_ids(
     if resolved_ids == list(hinted_ids):
         return _source_for_ids(hinted_ids, candidates)
     return _source_for_ids(resolved_ids, [candidate])
+
+
+def _procurement_mode_scores(text: str) -> dict[str, int]:
+    return {
+        mode: sum(text.count(term) for term in terms)
+        for mode, terms in _PROCUREMENT_MODE_TERMS.items()
+    }
+
+
+def _dominant_procurement_mode(
+    candidates: Sequence[EvaluationCandidate],
+) -> str | None:
+    text = "\n".join(candidate.text for candidate in candidates)
+    scores = _procurement_mode_scores(text)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if not ranked or ranked[0][1] < 2:
+        return None
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    return ranked[0][0]
+
+
+def _is_procurement_mode_template_contamination(
+    item: Mapping[str, Any],
+    candidates: Sequence[EvaluationCandidate],
+) -> bool:
+    dominant_mode = _dominant_procurement_mode(candidates)
+    if dominant_mode is None:
+        return False
+    rule_scores = _procurement_mode_scores(
+        " ".join(
+            str(item.get(field, ""))
+            for field in ("name", "trigger_condition", "original_rule")
+        )
+    )
+    dominant_score = rule_scores.get(dominant_mode, 0)
+    alternative_scores = [
+        score
+        for mode, score in rule_scores.items()
+        if mode != dominant_mode
+    ]
+    return dominant_score == 0 and max(alternative_scores, default=0) >= 2
 
 
 def _source_payload(
@@ -905,6 +985,19 @@ def _normalize_evaluation_sources(
                     source_ids=source_ids,
                     source_text=source_text,
                     reason="source_text_not_supported",
+                    description=raw_item["name"],
+                    rule_type="veto_rule",
+                )
+            )
+            continue
+        if _is_procurement_mode_template_contamination(raw_item, candidates):
+            normalized["uncertain_rules"].append(
+                _uncertain_from_item(
+                    raw_item,
+                    candidate=candidate,
+                    source_ids=source_ids,
+                    source_text=source_text,
+                    reason="procurement_mode_template_contamination",
                     description=raw_item["name"],
                     rule_type="veto_rule",
                 )
@@ -1820,7 +1913,21 @@ def extract_tender_evaluation_rules(
         }
         write_artifact(
             "12_evaluation_filter_report.json",
-            {"filtered_count": len(filter_report), "items": filter_report},
+            {
+                "filtered_count": len(filter_report),
+                "items": filter_report,
+                "rule_filtered_count": sum(
+                    item.get("uncertainty_reason")
+                    == "procurement_mode_template_contamination"
+                    for item in merged["uncertain_rules"]
+                ),
+                "rule_items": [
+                    item
+                    for item in merged["uncertain_rules"]
+                    if item.get("uncertainty_reason")
+                    == "procurement_mode_template_contamination"
+                ],
+            },
         )
         write_formal_artifact(result)
         if cache is not None:
