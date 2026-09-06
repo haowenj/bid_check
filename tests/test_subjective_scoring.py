@@ -144,7 +144,7 @@ def _hash_matched_bid(tmp_path, blocks):
     return bid_path, document
 
 
-def test_run_subjective_scoring_scores_only_matched_item_and_writes_artifact(tmp_path):
+def test_score_item_001_does_not_trust_self_attestation(tmp_path):
     bid_path, document = _hash_matched_bid(
         tmp_path,
         [
@@ -207,15 +207,20 @@ def test_run_subjective_scoring_scores_only_matched_item_and_writes_artifact(tmp
 
     assert result["schema_version"] == "subjective-score-v1"
     assert result["stats"]["subjective_item_count"] == 2
-    assert result["stats"]["ai_scored_count"] == 1
+    assert result["stats"]["ai_scored_count"] == 0
+    assert result["stats"]["evidence_insufficient_count"] == 1
     assert result["stats"]["file_scope_missing_count"] == 1
-    assert result["stats"]["llm_total_calls"] == 1
-    assert len(llm.calls) == 1
-    assert len(llm.calls[0]["content"]) == 1
-    assert result["score_items"][0]["status"] == "ai_scored"
-    assert result["score_items"][0]["recommended_score"] == 5
-    assert result["score_items"][0]["evidence"][0]["relation"] == (
-        "对应评分规则判断"
+    assert result["stats"]["llm_total_calls"] == 0
+    assert len(llm.calls) == 0
+    assert result["score_items"][0]["status"] == "evidence_insufficient"
+    assert result["score_items"][0]["recommended_score"] is None
+    checks = result["score_items"][0]["deduction_checks"]
+    assert len(checks) == 5
+    assert all(check["status"] == "insufficient" for check in checks)
+    assert all(
+        check["auxiliary_evidence"][0]["relation"]
+        == "仅作为投标人自我承诺辅助证据"
+        for check in checks
     )
     assert result["score_items"][1]["status"] == "file_scope_missing"
     assert result["score_items"][1]["recommended_score"] is None
@@ -223,6 +228,242 @@ def test_run_subjective_scoring_scores_only_matched_item_and_writes_artifact(tmp
     assert result["stats"]["total_score_computed"] is False
     assert result["stats"]["ranking_computed"] is False
     assert result["stats"]["veto_executed"] is False
+
+
+def _quality_score_item_001_rules():
+    return {
+        "score_items": [
+            {
+                "id": "score_item_001",
+                "name": "投标文件编写质量的情况",
+                "full_score": 5,
+                "original_rule": (
+                    "未按规定制作投标文件、文件内容错误、文件内容模糊不清、"
+                    "材料缺失、标书阅读困难的，每具备一项扣1分，扣完为止。"
+                ),
+                "conditions": {
+                    "items": [
+                        "未按规定制作投标文件",
+                        "文件内容错误",
+                        "文件内容模糊不清",
+                        "材料缺失",
+                        "标书阅读困难",
+                    ]
+                },
+                "scoring_method": {"description": "每具备一项扣1分，扣完为止"},
+                "evidence_requirements": ["投标文件整体"],
+                "evaluation_type": "subjective",
+            }
+        ]
+    }
+
+
+def _complete_quality_artifacts():
+    return {
+        "08_template_text_reviews.json": {
+            "template_text_reviews": [
+                {
+                    "template_id": "template-1",
+                    "template_name": "投标函",
+                    "status": "pass",
+                    "business_status": "pass",
+                    "final_status": "pass",
+                    "issues": [],
+                }
+            ],
+            "stats": {
+                "participating_template_count": 1,
+                "selected_template_count": 1,
+                "matched_template_count": 1,
+                "semantic_uncertain_count": 0,
+                "no_bid_candidate_template_ids": [],
+            },
+        },
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "template_id": "template-1",
+                    "template_name": "投标函",
+                    "status": "pass",
+                    "business_status": "pass",
+                    "execution_status": "completed",
+                    "requirements": [{"status": "pass"}],
+                }
+            ],
+            "stats": {
+                "participating_template_count": 1,
+                "selected_template_count": 1,
+                "matched_template_count": 1,
+                "semantic_uncertain_count": 0,
+                "no_bid_candidate_template_ids": [],
+            },
+        },
+        "10_file_requirement_reviews.json": {
+            "requirements": [
+                {"requirement": "材料提交完整性", "status": "pass"}
+            ],
+            "stats": {
+                "requirement_count": 1,
+                "pass_count": 1,
+                "fail_count": 0,
+                "not_supported_count": 0,
+            },
+        },
+        "10_performance_reviews.json": {
+            "performance_reviews": [],
+            "stats": {},
+        },
+    }
+
+
+def _quality_document(tmp_path, *, present_name=None):
+    bid_path, document = _hash_matched_bid(
+        tmp_path,
+        [
+            {
+                "block_id": "b0218",
+                "type": "paragraph",
+                "section": "13.5 评审要求承诺函",
+                "text": "投标文件编写质量的情况良好，相关事实检查完成。",
+                "order": 1,
+            }
+        ],
+    )
+    labels = [
+        "未按规定制作投标文件",
+        "文件内容错误",
+        "文件内容模糊不清",
+        "材料缺失",
+        "标书阅读困难",
+    ]
+    document["quality_checks"] = [
+        {
+            "name": label,
+            "status": "fail" if label == present_name else "pass",
+            "reason": "结构化质量事实检查结果",
+            "evidence": [
+                {
+                    "block_id": "b0218",
+                    "quote": "投标文件编写质量的情况良好，相关事实检查完成。",
+                }
+            ],
+        }
+        for label in labels
+    ]
+    return bid_path, document
+
+
+def test_score_item_001_scores_only_after_all_five_facts_are_covered(tmp_path):
+    bid_path, document = _quality_document(tmp_path)
+    llm = RecordingSubjectiveLLM(
+        {
+            "score_band": "扣分规则",
+            "recommended_score": 5,
+            "reason": "五类扣分项均有结构化事实检查且确认不存在。",
+            "evidence": [
+                {
+                    "block_id": "b0218",
+                    "quote": "投标文件编写质量的情况良好，相关事实检查完成。",
+                }
+            ],
+        }
+    )
+
+    result = run_subjective_scoring(
+        _quality_score_item_001_rules(),
+        FileMetadata("商务投标文件部分.docx", bid_path.stat().st_size, str(bid_path)),
+        subjective_llm=llm,
+        bid_document=document,
+        existing_artifacts=_complete_quality_artifacts(),
+    )
+
+    item = result["score_items"][0]
+    assert item["status"] == "ai_scored"
+    assert item["recommended_score"] == 5
+    assert len(llm.calls) == 1
+    assert len(item["deduction_checks"]) == 5
+    assert all(check["confirmed_exists"] is False for check in item["deduction_checks"])
+    assert all(check["evidence"] for check in item["deduction_checks"])
+
+
+def test_score_item_001_applies_one_point_deduction_from_confirmed_fact(tmp_path):
+    bid_path, document = _quality_document(tmp_path, present_name="文件内容错误")
+    llm = RecordingSubjectiveLLM(
+        {
+            "score_band": "扣分规则",
+            "recommended_score": 4,
+            "reason": "已确认一项文件内容错误，按规则扣1分。",
+            "evidence": [
+                {
+                    "block_id": "b0218",
+                    "quote": "投标文件编写质量的情况良好，相关事实检查完成。",
+                }
+            ],
+        }
+    )
+
+    result = run_subjective_scoring(
+        _quality_score_item_001_rules(),
+        FileMetadata("商务投标文件部分.docx", bid_path.stat().st_size, str(bid_path)),
+        subjective_llm=llm,
+        bid_document=document,
+        existing_artifacts=_complete_quality_artifacts(),
+    )
+
+    item = result["score_items"][0]
+    assert item["status"] == "ai_scored"
+    assert item["recommended_score"] == 4
+    checks = {check["deduction_item"]: check for check in item["deduction_checks"]}
+    assert checks["文件内容错误"]["confirmed_exists"] is True
+    assert checks["文件内容错误"]["evidence"]
+
+
+def test_score_item_001_keeps_missing_fill_in_format_and_links_evidence_to_block(
+    tmp_path,
+):
+    actual_text = "投标文件编写质量的情况：残留模板提示文字"
+    bid_path, document = _hash_matched_bid(
+        tmp_path,
+        [
+            {
+                "block_id": "b-format",
+                "type": "paragraph",
+                "section": "13.5 评审要求承诺函",
+                "text": actual_text,
+                "order": 1,
+            }
+        ],
+    )
+    artifacts = _complete_quality_artifacts()
+    artifacts["08_template_text_reviews.json"]["template_text_reviews"][0].update(
+        {
+            "status": "fail",
+            "final_status": "fail",
+            "issues": [
+                {
+                    "type": "missing_fill",
+                    "actual": actual_text,
+                    "requirement": "模板提示文字应在填写实际值后清理。",
+                }
+            ],
+        }
+    )
+    result = run_subjective_scoring(
+        _quality_score_item_001_rules(),
+        FileMetadata("商务投标文件部分.docx", bid_path.stat().st_size, str(bid_path)),
+        subjective_llm=RecordingSubjectiveLLM({}),
+        bid_document=document,
+        existing_artifacts=artifacts,
+    )
+
+    item = result["score_items"][0]
+    checks = {check["deduction_item"]: check for check in item["deduction_checks"]}
+    assert checks["未按规定制作投标文件"]["confirmed_exists"] is True
+    assert any(
+        "b-format" in evidence.get("block_ids", [])
+        for evidence in checks["未按规定制作投标文件"]["evidence"]
+    )
+    assert checks["材料缺失"]["status"] == "insufficient"
 
 
 def test_run_subjective_scoring_rejects_out_of_band_or_untrusted_evidence(tmp_path):

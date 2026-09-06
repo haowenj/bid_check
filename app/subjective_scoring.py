@@ -67,6 +67,20 @@ _SERVICE_ITEM_TERMS = (
     "服务质量保障",
     "服务方案",
 )
+_SCORE_ITEM_001_ID = "score_item_001"
+_SCORE_ITEM_001_DEDUCTIONS = (
+    "未按规定制作投标文件",
+    "文件内容错误",
+    "文件内容模糊不清",
+    "材料缺失",
+    "标书阅读困难",
+)
+_QUALITY_ABSENT_STATUSES = frozenset(
+    {"pass", "absent", "confirmed_absent", "not_applicable", "not_found"}
+)
+_QUALITY_PRESENT_STATUSES = frozenset(
+    {"fail", "present", "confirmed_present", "exists", "issue"}
+)
 
 
 def _as_text(value: Any) -> str:
@@ -407,7 +421,7 @@ def _base_result(
         for block in compact_blocks
         if _as_text(block.get("block_id"))
     ]
-    return {
+    result = {
         "score_item_id": _as_text(item.get("id")),
         "rule_name": _as_text(item.get("name")),
         "max_score": _full_score(item),
@@ -420,6 +434,700 @@ def _base_result(
         "block_ids": block_ids,
         "uncertainty": _uncertainty(uncertainty, default_note=reason),
     }
+    deduction_checks = item.get("deduction_checks")
+    if isinstance(deduction_checks, list):
+        result["deduction_checks"] = [
+            dict(check) for check in deduction_checks if isinstance(check, Mapping)
+        ]
+    return result
+
+
+def _quality_review_status(entry: Mapping[str, Any]) -> str:
+    for key in ("final_status", "business_status", "status"):
+        value = _as_text(entry.get(key)).strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _quality_review_entries(
+    artifacts: Mapping[str, Any],
+    artifact_name: str,
+    *keys: str,
+) -> list[dict[str, Any]]:
+    payload = artifacts.get(artifact_name)
+    if not isinstance(payload, Mapping):
+        return []
+    entries: list[dict[str, Any]] = []
+    for key in keys:
+        raw_entries = payload.get(key, [])
+        if not isinstance(raw_entries, list):
+            continue
+        entries.extend(
+            dict(entry) for entry in raw_entries if isinstance(entry, Mapping)
+        )
+    return entries
+
+
+def _quality_stats(
+    artifacts: Mapping[str, Any],
+    artifact_name: str,
+) -> Mapping[str, Any]:
+    payload = artifacts.get(artifact_name)
+    stats = payload.get("stats") if isinstance(payload, Mapping) else None
+    return stats if isinstance(stats, Mapping) else {}
+
+
+def _quality_coverage_complete(
+    artifacts: Mapping[str, Any],
+    artifact_name: str,
+    entries: Sequence[Mapping[str, Any]],
+) -> bool:
+    stats = _quality_stats(artifacts, artifact_name)
+    expected = stats.get("participating_template_count")
+    selected = stats.get("selected_template_count")
+    if not isinstance(expected, int) or not isinstance(selected, int):
+        return False
+    if expected <= 0 or selected < expected or len(entries) < expected:
+        return False
+    if any(
+        isinstance(stats.get(key), int) and stats.get(key, 0) > 0
+        for key in ("semantic_uncertain_count", "semantic_mismatched_count")
+    ):
+        return False
+    no_bid_candidates = stats.get("no_bid_candidate_template_ids", [])
+    if isinstance(no_bid_candidates, list) and no_bid_candidates:
+        return False
+    for entry in entries:
+        if _quality_review_status(entry) not in _QUALITY_ABSENT_STATUSES:
+            return False
+        if entry.get("final_issues") or entry.get("issues"):
+            return False
+        requirements = entry.get("requirements", [])
+        if isinstance(requirements, list) and any(
+            isinstance(requirement, Mapping)
+            and _quality_review_status(requirement) not in _QUALITY_ABSENT_STATUSES
+            for requirement in requirements
+        ):
+            return False
+    return True
+
+
+def _quality_issue_entries(
+    entries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for entry in entries:
+        for key in (
+            "final_issues",
+            "issues",
+            "deterministic_placeholder_residuals",
+            "requirements",
+        ):
+            raw_issues = entry.get(key, [])
+            if not isinstance(raw_issues, list):
+                continue
+            issues.extend(
+                dict(issue) for issue in raw_issues if isinstance(issue, Mapping)
+            )
+    return issues
+
+
+def _quality_value_text(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False)
+    return _as_text(value)
+
+
+def _quality_block_ids(value: Any) -> list[str]:
+    block_ids: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, Mapping):
+            for key, child in node.items():
+                normalized_key = _as_text(key).lower()
+                if normalized_key in {"block_id", "bid_block_id"}:
+                    block_id = _as_text(child).strip()
+                    if block_id:
+                        block_ids.add(block_id)
+                elif normalized_key in {"block_ids", "bid_block_ids"}:
+                    if isinstance(child, list):
+                        block_ids.update(
+                            _as_text(block_id).strip()
+                            for block_id in child
+                            if _as_text(block_id).strip()
+                        )
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return sorted(block_ids)
+
+
+def _quality_quote(value: Mapping[str, Any]) -> str:
+    for key in (
+        "quote",
+        "bid_text",
+        "actual",
+        "message",
+        "summary",
+        "reason",
+        "requirement",
+    ):
+        text = _as_text(value.get(key)).strip()
+        if text:
+            return text[:800]
+    return ""
+
+
+def _quality_artifact_evidence(
+    artifact_name: str,
+    value: Mapping[str, Any],
+    document: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    nested_values: list[Mapping[str, Any]] = [value]
+    for key in (
+        "final_issues",
+        "issues",
+        "deterministic_placeholder_residuals",
+        "requirements",
+    ):
+        raw_values = value.get(key, [])
+        if isinstance(raw_values, list):
+            nested_values.extend(
+                child for child in raw_values if isinstance(child, Mapping)
+            )
+    for child in nested_values[:5]:
+        reference: dict[str, Any] = {"artifact": artifact_name}
+        block_ids = _quality_block_ids(child)
+        if block_ids:
+            reference["block_ids"] = block_ids
+        quote = _quality_quote(child)
+        if quote:
+            reference["quote"] = quote
+            if "block_ids" not in reference and isinstance(document, Mapping):
+                matched_block_ids = [
+                    _as_text(block.get("block_id"))
+                    for block in _document_blocks(document)
+                    if _as_text(block.get("block_id"))
+                    and _normalized(quote)
+                    in _normalized(block.get("text"))
+                ]
+                if matched_block_ids:
+                    reference["block_ids"] = matched_block_ids[:3]
+        if "template_id" in child:
+            reference["record_id"] = _as_text(child.get("template_id"))
+        if "requirement" in child:
+            reference["requirement"] = _as_text(child.get("requirement"))
+        evidence.append(reference)
+    return evidence
+
+
+def _quality_structured_checks(
+    document: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(document, Mapping):
+        return {}
+    raw_checks: Any = document.get("quality_checks")
+    diagnostics = document.get("diagnostics")
+    if raw_checks is None and isinstance(diagnostics, Mapping):
+        raw_checks = diagnostics.get("quality_checks")
+    if raw_checks is None:
+        stats = document.get("stats")
+        if isinstance(stats, Mapping):
+            raw_checks = stats.get("quality_checks")
+    checks: list[dict[str, Any]] = []
+    if isinstance(raw_checks, list):
+        checks = [dict(check) for check in raw_checks if isinstance(check, Mapping)]
+    elif isinstance(raw_checks, Mapping):
+        for name, check in raw_checks.items():
+            if isinstance(check, Mapping):
+                entry = dict(check)
+                entry.setdefault("name", _as_text(name))
+                checks.append(entry)
+    return {
+        _normalized(check.get("name") or check.get("deduction_item")): check
+        for check in checks
+        if _normalized(check.get("name") or check.get("deduction_item"))
+    }
+
+
+def _quality_structured_evidence(
+    check: Mapping[str, Any],
+    document: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    blocks_by_id = {
+        _as_text(block.get("block_id")): block
+        for block in _document_blocks(document)
+        if _as_text(block.get("block_id"))
+    }
+    raw_evidence = check.get("evidence", [])
+    if not isinstance(raw_evidence, list):
+        return []
+    evidence: list[dict[str, Any]] = []
+    for entry in raw_evidence:
+        if not isinstance(entry, Mapping):
+            continue
+        block_id = _as_text(entry.get("block_id")).strip()
+        quote = _as_text(entry.get("quote")).strip()
+        source_block = blocks_by_id.get(block_id)
+        if (
+            not block_id
+            or not quote
+            or source_block is None
+            or _normalized(quote) not in _normalized(source_block.get("text"))
+        ):
+            continue
+        evidence.append(
+            {
+                "artifact": "structured_document.json",
+                "block_id": block_id,
+                "quote": quote,
+                "relation": _as_text(entry.get("relation"))
+                or "对应结构化质量事实",
+            }
+        )
+    return evidence
+
+
+def _quality_fact(
+    deduction_item: str,
+    *,
+    confirmed_exists: bool | None,
+    reason: str,
+    evidence: Sequence[Mapping[str, Any]] = (),
+    source_artifacts: Sequence[str] = (),
+) -> dict[str, Any]:
+    status = (
+        "confirmed_present"
+        if confirmed_exists is True
+        else "confirmed_absent"
+        if confirmed_exists is False
+        else "insufficient"
+    )
+    return {
+        "deduction_item": deduction_item,
+        "status": status,
+        "confirmed_exists": confirmed_exists,
+        "reason": reason,
+        "evidence": [dict(item) for item in evidence],
+        "source_artifacts": list(dict.fromkeys(source_artifacts)),
+    }
+
+
+def _score_item_001_facts(
+    document: Mapping[str, Any] | None,
+    artifacts: Mapping[str, Any],
+    matched_blocks: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    structured_checks = _quality_structured_checks(document)
+    template_name = "08_template_text_reviews.json"
+    attachment_name = "09_attachment_reviews.json"
+    file_name = "10_file_requirement_reviews.json"
+    template_entries = _quality_review_entries(
+        artifacts, template_name, "template_text_reviews"
+    )
+    attachment_entries = _quality_review_entries(
+        artifacts, attachment_name, "attachment_reviews"
+    )
+    file_entries = _quality_review_entries(
+        artifacts, file_name, "requirements", "file_requirement_reviews"
+    )
+    template_complete = _quality_coverage_complete(
+        artifacts, template_name, template_entries
+    )
+    attachment_complete = _quality_coverage_complete(
+        artifacts, attachment_name, attachment_entries
+    )
+    file_stats = _quality_stats(artifacts, file_name)
+    file_complete = bool(
+        file_entries
+        and isinstance(file_stats.get("requirement_count"), int)
+        and len(file_entries) >= file_stats.get("requirement_count", 0)
+        and all(_quality_review_status(entry) in _QUALITY_ABSENT_STATUSES for entry in file_entries)
+        and file_stats.get("fail_count", 0) == 0
+        and file_stats.get("not_supported_count", 0) == 0
+    )
+    template_issues = _quality_issue_entries(template_entries)
+    attachment_issues = _quality_issue_entries(attachment_entries)
+    attestation_evidence = [
+        {
+            "artifact": "structured_document.json",
+            "block_id": _as_text(block.get("block_id")),
+            "quote": _as_text(block.get("text")),
+            "relation": "仅作为投标人自我承诺辅助证据",
+            "sufficient": False,
+        }
+        for block in matched_blocks
+        if (
+            "承诺" in _as_text(block.get("section"))
+            or "承诺" in _as_text(block.get("text"))
+            or "不存在" in _as_text(block.get("text"))
+        )
+    ][:2]
+
+    def explicit_fact(label: str) -> dict[str, Any] | None:
+        check = structured_checks.get(_normalized(label))
+        if check is None:
+            return None
+        status = _as_text(check.get("status")).strip().lower()
+        evidence = _quality_structured_evidence(check, document)
+        if status in _QUALITY_ABSENT_STATUSES and evidence:
+            return _quality_fact(
+                label,
+                confirmed_exists=False,
+                reason="结构化质量事实检查确认该类问题不存在。",
+                evidence=evidence,
+                source_artifacts=["structured_document.json"],
+            )
+        if status in _QUALITY_PRESENT_STATUSES and evidence:
+            return _quality_fact(
+                label,
+                confirmed_exists=True,
+                reason="结构化质量事实检查确认该类问题存在。",
+                evidence=evidence,
+                source_artifacts=["structured_document.json"],
+            )
+        return _quality_fact(
+            label,
+            confirmed_exists=None,
+            reason="结构化质量事实缺少可核验的 block 证据。",
+            evidence=evidence,
+            source_artifacts=["structured_document.json"],
+        )
+
+    def fallback_fact(
+        label: str,
+        *,
+        confirmed_exists: bool | None,
+        reason: str,
+        evidence: Sequence[Mapping[str, Any]],
+        source_artifacts: Sequence[str],
+    ) -> dict[str, Any]:
+        fact = _quality_fact(
+            label,
+            confirmed_exists=confirmed_exists,
+            reason=reason,
+            evidence=evidence or attestation_evidence,
+            source_artifacts=source_artifacts,
+        )
+        if attestation_evidence:
+            fact["auxiliary_evidence"] = [dict(item) for item in attestation_evidence]
+        return fact
+
+    format_bad = [
+        entry
+        for entry in template_entries
+        if _quality_review_status(entry) == "fail"
+    ]
+    format_bad.extend(
+        entry
+        for entry in file_entries
+        if _quality_review_status(entry) == "fail"
+    )
+    format_evidence = [
+        reference
+        for entry in format_bad[:5]
+        for reference in _quality_artifact_evidence(
+            template_name if entry in template_entries else file_name,
+            entry,
+            document,
+        )
+    ]
+    if format_bad:
+        format_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[0],
+            confirmed_exists=True,
+            reason="现有模板或文件检查发现未按招标文件要求制作的具体问题。",
+            evidence=format_evidence,
+            source_artifacts=[template_name, file_name],
+        )
+    elif template_complete and file_complete:
+        format_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[0],
+            confirmed_exists=False,
+            reason="现有模板检查和文件检查均完成且未发现制作规范问题。",
+            evidence=[
+                reference
+                for entry in template_entries[:5]
+                for reference in _quality_artifact_evidence(
+                    template_name, entry, document
+                )
+            ],
+            source_artifacts=[template_name, file_name],
+        )
+    else:
+        format_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[0],
+            confirmed_exists=None,
+            reason="模板或文件检查覆盖不完整，无法确认不存在制作规范问题。",
+            evidence=[],
+            source_artifacts=[template_name, file_name],
+        )
+
+    content_issue_types = (
+        "content_error",
+        "content_mismatch",
+        "wrong_value",
+        "invalid_value",
+        "semantic_error",
+        "事实错误",
+        "内容错误",
+        "内容不一致",
+    )
+    content_issues = [
+        issue
+        for issue in template_issues
+        if any(
+            term in _normalized(_quality_value_text(issue.get("type")))
+            or term in _normalized(json.dumps(issue, ensure_ascii=False))
+            for term in content_issue_types
+        )
+    ]
+    if content_issues:
+        content_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[1],
+            confirmed_exists=True,
+            reason="模板检查明确记录了文件内容错误或内容不一致问题。",
+            evidence=[
+                reference
+                for issue in content_issues[:5]
+                for reference in _quality_artifact_evidence(
+                    template_name, issue, document
+                )
+            ],
+            source_artifacts=[template_name],
+        )
+    elif template_complete:
+        content_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[1],
+            confirmed_exists=False,
+            reason="模板文本检查覆盖完整且未发现内容错误。",
+            evidence=[
+                reference
+                for entry in template_entries[:5]
+                for reference in _quality_artifact_evidence(
+                    template_name, entry, document
+                )
+            ],
+            source_artifacts=[template_name],
+        )
+    else:
+        content_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[1],
+            confirmed_exists=None,
+            reason="现有模板检查存在未完成或不确定结果，无法确认不存在内容错误。",
+            evidence=[
+                reference
+                for entry in template_entries[:3]
+                for reference in _quality_artifact_evidence(
+                    template_name, entry, document
+                )
+            ],
+            source_artifacts=[template_name],
+        )
+
+    clarity_terms = ("模糊", "不清", "unreadable", "blur", "ocr_failed")
+    clarity_issues = [
+        issue
+        for issue in [*template_issues, *attachment_issues]
+        if any(term in _normalized(json.dumps(issue, ensure_ascii=False)) for term in clarity_terms)
+    ]
+    if clarity_issues:
+        clarity_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[2],
+            confirmed_exists=True,
+            reason="现有检查明确记录了内容模糊或不可清晰识别的问题。",
+            evidence=[
+                reference
+                for issue in clarity_issues[:5]
+                for reference in _quality_artifact_evidence(
+                    template_name, issue, document
+                )
+            ],
+            source_artifacts=[template_name, attachment_name],
+        )
+    else:
+        clarity_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[2],
+            confirmed_exists=None,
+            reason="结构化解析能够提供解析结果，但现有产物没有覆盖完整清晰度事实。",
+            evidence=[
+                {
+                    "artifact": "structured_document.json",
+                    "quote": json.dumps(
+                        (document or {}).get("stats", {}), ensure_ascii=False
+                    )[:800],
+                    "relation": "仅证明已有结构化解析产物，不足以确认清晰度",
+                }
+            ],
+            source_artifacts=["structured_document.json"],
+        )
+
+    missing_issue_types = (
+        "missing_content",
+        "missing_attachment",
+        "missing_material",
+        "材料缺失",
+        "未提供",
+    )
+    missing_issues = [
+        issue
+        for issue in [*template_issues, *attachment_issues]
+        if any(
+            term in _normalized(_quality_value_text(issue.get("type")))
+            or term in _normalized(json.dumps(issue, ensure_ascii=False))
+            for term in missing_issue_types
+        )
+    ]
+    file_material_issues = [
+        entry
+        for entry in file_entries
+        if _quality_review_status(entry) == "fail"
+        and not any(
+            term in _normalized(_quality_value_text(entry.get("requirement")))
+            for term in ("大小", "容量", "mb", "文件大小")
+        )
+    ]
+    attachment_bad = [
+        entry
+        for entry in attachment_entries
+        if _quality_review_status(entry) == "fail"
+        or any(
+            _quality_review_status(requirement) == "fail"
+            for requirement in entry.get("requirements", [])
+            if isinstance(requirement, Mapping)
+        )
+    ]
+    if missing_issues or file_material_issues or attachment_bad:
+        material_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[3],
+            confirmed_exists=True,
+            reason="现有模板、附件或文件检查明确记录了材料或必填内容缺失。",
+            evidence=[
+                reference
+                for artifact_name, entries in (
+                    (template_name, missing_issues),
+                    (file_name, file_material_issues),
+                    (attachment_name, attachment_bad),
+                )
+                for entry in entries[:5]
+                for reference in _quality_artifact_evidence(
+                    artifact_name, entry, document
+                )
+            ],
+            source_artifacts=[template_name, attachment_name, file_name],
+        )
+    elif template_complete and attachment_complete and file_complete:
+        material_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[3],
+            confirmed_exists=False,
+            reason="模板、附件和文件检查覆盖完整且未发现材料缺失。",
+            evidence=[
+                reference
+                for artifact_name, entries in (
+                    (template_name, template_entries),
+                    (attachment_name, attachment_entries),
+                    (file_name, file_entries),
+                )
+                for entry in entries[:2]
+                for reference in _quality_artifact_evidence(
+                    artifact_name, entry, document
+                )
+            ],
+            source_artifacts=[template_name, attachment_name, file_name],
+        )
+    else:
+        material_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[3],
+            confirmed_exists=None,
+            reason="现有材料检查覆盖不完整或存在不确定结果，无法确认材料完整。",
+            evidence=[],
+            source_artifacts=[template_name, attachment_name, file_name],
+        )
+
+    readability_terms = ("阅读困难", "readability", "unreadable", "无法阅读")
+    readability_issues = [
+        issue
+        for issue in [*template_issues, *attachment_issues]
+        if any(term in _normalized(json.dumps(issue, ensure_ascii=False)) for term in readability_terms)
+    ]
+    if readability_issues:
+        readability_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[4],
+            confirmed_exists=True,
+            reason="现有检查明确记录了标书阅读困难问题。",
+            evidence=[
+                reference
+                for issue in readability_issues[:5]
+                for reference in _quality_artifact_evidence(
+                    template_name, issue, document
+                )
+            ],
+            source_artifacts=[template_name, "structured_document.json"],
+        )
+    else:
+        readability_fact = fallback_fact(
+            _SCORE_ITEM_001_DEDUCTIONS[4],
+            confirmed_exists=None,
+            reason="现有产物没有完整覆盖标书阅读困难的独立检查事实。",
+            evidence=[
+                {
+                    "artifact": "structured_document.json",
+                    "quote": "结构化投标解析产物已复用",
+                    "relation": "缺少独立阅读困难检查结论",
+                }
+            ],
+            source_artifacts=["structured_document.json"],
+        )
+
+    facts_by_label = {
+        fact["deduction_item"]: fact
+        for fact in (
+            format_fact,
+            content_fact,
+            clarity_fact,
+            material_fact,
+            readability_fact,
+        )
+    }
+    for label in _SCORE_ITEM_001_DEDUCTIONS:
+        explicit = explicit_fact(label)
+        if explicit is not None and (
+            explicit.get("confirmed_exists") is True
+            or facts_by_label[label].get("confirmed_exists") is not True
+        ):
+            facts_by_label[label] = explicit
+    return [facts_by_label[label] for label in _SCORE_ITEM_001_DEDUCTIONS]
+
+
+def _quality_facts_complete(facts: Sequence[Mapping[str, Any]]) -> bool:
+    return len(facts) == len(_SCORE_ITEM_001_DEDUCTIONS) and all(
+        fact.get("confirmed_exists") in {True, False}
+        and isinstance(fact.get("evidence"), list)
+        and bool(fact.get("evidence"))
+        for fact in facts
+    )
+
+
+def _quality_facts_reason(facts: Sequence[Mapping[str, Any]]) -> str:
+    insufficient = [
+        _as_text(fact.get("deduction_item"))
+        for fact in facts
+        if fact.get("confirmed_exists") not in {True, False}
+    ]
+    if not insufficient:
+        return "score_item_001 五类扣分项缺少可核验覆盖证据，无法确认不扣分。"
+    return (
+        "score_item_001 五类扣分项事实覆盖不足，无法确认不扣分："
+        + "、".join(insufficient)
+        + "；评审要求承诺函仅作为辅助证据。"
+    )
 
 
 def _normalize_evidence(
@@ -489,6 +1197,22 @@ def _validate_llm_result(
         if _as_text(block.get("block_id"))
     }
     evidence = _normalize_evidence(raw_result.get("evidence"), blocks_by_id)
+    deduction_checks = item.get("deduction_checks")
+    if isinstance(deduction_checks, list) and deduction_checks:
+        confirmed_present_count = sum(
+            check.get("confirmed_exists") is True
+            for check in deduction_checks
+            if isinstance(check, Mapping)
+        )
+        expected_score = (
+            float(max_score) - confirmed_present_count
+            if max_score is not None
+            else None
+        )
+        if expected_score is not None and score_as_float != expected_score:
+            raise SubjectiveScoringError(
+                "recommended_score 未按五类扣分项确认结果每项扣1分计算"
+            )
     return {
         "score_item_id": _as_text(item.get("id")),
         "rule_name": _as_text(item.get("name")),
@@ -501,6 +1225,11 @@ def _validate_llm_result(
         "evidence": evidence,
         "block_ids": sorted(blocks_by_id),
         "uncertainty": _uncertainty(raw_result.get("uncertainty")),
+        "deduction_checks": [
+            dict(check) for check in deduction_checks if isinstance(check, Mapping)
+        ]
+        if isinstance(deduction_checks, list)
+        else [],
     }
 
 
@@ -558,6 +1287,7 @@ class OpenAICompatibleSubjectiveScoreLLM:
                 "conditions",
                 "scoring_method",
                 "evidence_requirements",
+                "deduction_checks",
             )
         }
         prompt = (
@@ -566,6 +1296,8 @@ class OpenAICompatibleSubjectiveScoreLLM:
             "整份投标文件或输入之外的信息。必须先选择 allowed_bands 中的原始评分档，"
             "再给出属于该档的 recommended_score。每条 evidence 必须引用输入中的真实 block_id"
             "和直接摘录；无法确认时不要猜测，返回 uncertainty 并保持证据边界。"
+            "如果输入包含 deduction_checks，必须逐项依据其 confirmed_exists 结果；"
+            "每个 confirmed_present 按原始规则扣1分，不能把自我承诺当作已确认不存在。"
             "只返回 JSON 对象，字段必须为 score_band、recommended_score、reason、evidence、uncertainty。\n\n"
             f"评分项规则：{json.dumps(rule_payload, ensure_ascii=False)}\n"
             f"允许的评分档：{json.dumps(list(allowed_bands), ensure_ascii=False)}\n"
@@ -805,14 +1537,50 @@ def run_subjective_scoring(
         blocks = match.get("blocks", [])
         blocks = [dict(block) for block in blocks if isinstance(block, Mapping)]
         if match.get("status") != "matched":
+            item_without_match = item
+            reason = _as_text(match.get("reason")) or "未定位到评分证据。"
+            if _as_text(item.get("id")) == _SCORE_ITEM_001_ID:
+                deduction_checks = _score_item_001_facts(
+                    evidence.get("bid_document"),
+                    evidence.get("artifacts", {})
+                    if isinstance(evidence.get("artifacts"), Mapping)
+                    else {},
+                    blocks,
+                )
+                item_without_match = dict(item)
+                item_without_match["deduction_checks"] = deduction_checks
+                reason = _quality_facts_reason(deduction_checks)
+                if not reason:
+                    reason = "未定位到评分项对应正文 block，无法形成完整评分证据。"
             records[index] = _base_result(
-                item,
+                item_without_match,
                 status=_as_text(match.get("status")) or "evidence_insufficient",
-                reason=_as_text(match.get("reason")) or "未定位到评分证据。",
+                reason=reason,
                 matched_blocks=blocks,
             )
             continue
-        eligible.append((index, item, blocks, _allowed_score_bands(item)))
+        item_for_scoring = item
+        if _as_text(item.get("id")) == _SCORE_ITEM_001_ID:
+            deduction_checks = _score_item_001_facts(
+                evidence.get("bid_document"),
+                evidence.get("artifacts", {})
+                if isinstance(evidence.get("artifacts"), Mapping)
+                else {},
+                blocks,
+            )
+            item_for_scoring = dict(item)
+            item_for_scoring["deduction_checks"] = deduction_checks
+            if not _quality_facts_complete(deduction_checks):
+                records[index] = _base_result(
+                    item_for_scoring,
+                    status="evidence_insufficient",
+                    reason=_quality_facts_reason(deduction_checks),
+                    matched_blocks=blocks,
+                )
+                continue
+        eligible.append(
+            (index, item_for_scoring, blocks, _allowed_score_bands(item_for_scoring))
+        )
 
     call_stats: dict[int, tuple[bool, bool, int]] = {}
     if eligible:
