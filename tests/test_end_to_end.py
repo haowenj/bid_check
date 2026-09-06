@@ -59,7 +59,16 @@ def test_upload_to_completed_tender_objects_result(client):
     assert payload["project_requirements"] == []
     assert payload["supplemental_materials"] == []
     assert payload["bid_parse"]["document_name"] == "投标文件.docx"
-    assert payload["review_result"] == {
+    assert {
+        key: value
+        for key, value in payload["review_result"].items()
+        if key
+        not in {
+            "file_requirement_reviews",
+            "file_requirement_stats",
+            "file_requirement_original_file",
+        }
+    } == {
         "mode": "template_text",
         "template_text_reviews": [],
         "navigation_exclusions": {
@@ -109,12 +118,16 @@ def test_upload_to_completed_tender_objects_result(client):
             "total_elapsed_ms": 0,
         },
     }
+    assert payload["review_result"]["file_requirement_reviews"] == []
+    assert payload["review_result"]["file_requirement_stats"]["requirement_count"] == 0
+    assert payload["review_result"]["file_requirement_original_file"]["filename"] == "投标文件.docx"
 
     page_response = client.get(f"/bid-check/tasks/{task_id}")
     assert page_response.status_code == 200
-    assert "本次识别 0 个模板、0 条项目专用编制要求和 0 项补充证明材料" in page_response.text
-    assert "暂无可执行的模板文本检查" in page_response.text
-    assert "不判断签字、盖章、图片、附件真实性或外部状态" in page_response.text
+    assert "以下按模板规范、附件、业绩合同和文件自身四个检查范围展示合规性结果。" in page_response.text
+    assert "模板规范检查" in page_response.text
+    assert "未发现需处理的模板规范问题" in page_response.text
+    assert "不判断签字、盖章、图片、附件真实性或外部状态" not in page_response.text
     assert "检查通过" not in page_response.text
     assert "检查不通过" not in page_response.text
 

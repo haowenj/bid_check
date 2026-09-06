@@ -1293,11 +1293,11 @@ def test_complete_page_renders_attachment_facts_and_requirement_conclusion(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "已执行指定模板文本与附件检查" in response.text
-    assert "附件检查结果" in response.text
-    assert "视觉事实" in response.text
-    assert "身份证人像面" in response.text
-    assert "身份证材料满足要求。" in response.text
+    assert "附件检查" in response.text
+    assert "未发现需处理的附件问题" in response.text
+    assert "视觉事实" not in response.text
+    assert "身份证人像面" not in response.text
+    assert "身份证材料满足要求。" not in response.text
 
 
 def test_attachment_review_writes_traceable_artifact_and_events(tmp_path: Path):

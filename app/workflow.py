@@ -246,16 +246,25 @@ class BidCheckWorkflow:
         try:
             logger.info("workflow.review.start task_id=%s", task_id)
             self.repository.update_stage(task_id, "review", "running")
+            bid_parse_for_review = (
+                dict(outputs["bid_parse"])
+                if isinstance(outputs["bid_parse"], dict)
+                else {"parsed_bid": outputs["bid_parse"]}
+            )
+            # Keep the original upload metadata beside the parsed document. The
+            # file-level checker reads this metadata and stats the original
+            # storage path, never a MinerU cleaning artifact.
+            bid_parse_for_review["original_file_metadata"] = task.bid_file.to_dict()
             if self.services.review_with_recorder is not None:
                 review_result = self.services.review_with_recorder(
                     outputs["requirements"],
-                    outputs["bid_parse"],
+                    bid_parse_for_review,
                     recorder=recorder,
                 )
             else:
                 review_result = self.services.review(
                     outputs["requirements"],
-                    outputs["bid_parse"],
+                    bid_parse_for_review,
                 )
             self.repository.complete(
                 task_id,

@@ -17,6 +17,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal, InvalidOperation
 from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -28,6 +29,7 @@ import httpx
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import (
     FileMetadata,
+    FileRequirement,
     ProjectRequirement,
     SupplementalMaterial,
     TenderExtractionResult,
@@ -36,7 +38,7 @@ from app.models import (
 from app.navigation_content import classify_navigation_item
 
 logger = logging.getLogger(__name__)
-REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v1"
+REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v5-single-file"
 # Keep object-result and parsed-document caches independently versioned.  A
 # change to the MinerU adapter must invalidate parsed blocks as well as the
 # downstream deterministic result.
@@ -103,7 +105,12 @@ class CandidateWindow:
     section: str
     text: str
     order: int
-    kind: Literal["templates", "project_requirements", "supplemental_materials"] = "templates"
+    kind: Literal[
+        "templates",
+        "project_requirements",
+        "supplemental_materials",
+        "file_requirements",
+    ] = "templates"
 
 
 FunctionalRegionKind = Literal[
@@ -1044,6 +1051,26 @@ _EXCLUDED_REGION_TITLE_RE = re.compile(
 _MAJOR_SECTION_TITLE_RE = re.compile(
     r"^第[一二三四五六七八九十百千万0-9]+[章节部分篇]\s*"
 )
+_FILE_REQUIREMENT_REGION_RE = re.compile(
+    r"投标人须知(?:前附表)?|投标文件(?:组成|编制|制作|递交)|"
+    r"电子投标文件|电子招标投标|上传|加密|解密|密封和标记|"
+    r"特别说明|补充条款"
+)
+_FILE_REQUIREMENT_EXCLUDED_REGION_RE = re.compile(
+    r"投标文件(?:格式|模板)|响应文件(?:格式|模板)|"
+    r"商务投标文件格式|技术投标文件格式|报价文件格式|"
+    r"合同(?:条款|协议)|技术(?:需求|规格)|工程量清单|"
+    r"评标办法|评审办法|评分标准|评标委员会|招标代理|中标候选人"
+)
+
+
+def _is_file_requirement_excluded_title(title: str) -> bool:
+    normalized = _normalize_region_title(title)
+    if re.search(r"电子投标文件格式", normalized) and not re.search(
+        r"模板|范本", normalized
+    ):
+        return False
+    return bool(_FILE_REQUIREMENT_EXCLUDED_REGION_RE.search(normalized))
 
 
 def _strip_markup(text: str) -> str:
@@ -1246,6 +1273,103 @@ def identify_functional_regions(
 
     flush()
     return regions
+
+
+def _file_requirement_region_title(block: StructuredBlock) -> bool:
+    """Return whether a structural title can introduce single-file context."""
+
+    if block.type not in {"heading", "paragraph"}:
+        return False
+    title = _normalize_region_title(block.text)
+    if not title or len(title) > 120:
+        return False
+    if re.search(r"\b(?:TOC|PAGEREF|_Toc|HYPERLINK)\b", title, re.IGNORECASE):
+        return False
+    if _is_file_requirement_excluded_title(title):
+        return False
+    if block.type == "paragraph" and re.search(r"[。；;，,：:]", title):
+        return False
+    return bool(_FILE_REQUIREMENT_REGION_RE.search(title))
+
+
+def _file_requirement_boundary(
+    block: StructuredBlock,
+    current_blocks: Sequence[StructuredBlock],
+) -> bool:
+    """Close a candidate at an unrelated structural section boundary."""
+
+    if block.type != "heading" or not current_blocks:
+        return False
+    current_level = _block_heading_level(current_blocks[0])
+    block_level = _block_heading_level(block)
+    if current_level is not None and block_level is not None:
+        return block_level <= current_level
+    return True
+
+
+def build_file_requirement_candidates(
+    blocks: Iterable[StructuredBlock],
+) -> list[CandidateWindow]:
+    """Build complete, low-noise contexts for single-upload-file requirements.
+
+    This is deliberately a structural pass rather than a keyword snippet
+    search.  A front-table block stays intact, while unrelated headings close
+    the current context before their large bodies can leak into the prompt.
+    """
+
+    ordered_blocks = sorted(blocks, key=lambda item: item.order)
+    candidates: list[CandidateWindow] = []
+    current_blocks: list[StructuredBlock] = []
+
+    def flush() -> None:
+        nonlocal current_blocks
+        if not current_blocks:
+            return
+        candidates.append(
+            CandidateWindow(
+                block_ids=[block.block_id for block in current_blocks],
+                section=current_blocks[0].section or current_blocks[0].text.strip(),
+                text="\n".join(block.text for block in current_blocks).strip(),
+                order=current_blocks[0].order,
+                kind="file_requirements",
+            )
+        )
+        current_blocks = []
+
+    for block in ordered_blocks:
+        title_is_candidate = _file_requirement_region_title(block)
+        is_excluded_title = bool(
+            block.type in {"heading", "paragraph"}
+            and _is_file_requirement_excluded_title(block.text)
+            and (
+                block.type == "heading"
+                or block.text.strip() == block.section.strip()
+                or not re.search(r"[。；;，,：:]", block.text)
+            )
+        )
+        is_major_boundary = bool(
+            block.type == "heading"
+            and _MAJOR_SECTION_TITLE_RE.search(block.text.strip())
+            and not title_is_candidate
+            and not is_excluded_title
+        )
+
+        if title_is_candidate:
+            if current_blocks and _file_requirement_boundary(block, current_blocks):
+                flush()
+            current_blocks.append(block)
+            continue
+        if is_excluded_title or is_major_boundary:
+            flush()
+            continue
+        if current_blocks:
+            if _file_requirement_boundary(block, current_blocks):
+                flush()
+            else:
+                current_blocks.append(block)
+
+    flush()
+    return [candidate for candidate in candidates if candidate.text]
 
 
 _TEMPLATE_ITEM_NAME_RE = re.compile(
@@ -2724,17 +2848,266 @@ def _normalize_source(
     }
 
 
+_FILE_REQUIREMENT_OUTPUT_FIELDS = {
+    "name",
+    "requirement",
+    "target",
+    "requirement_type",
+    "constraint_status",
+    "parameters",
+    "auto_checkable",
+    "support_reason",
+    "source_block_ids",
+}
+_FILE_REQUIREMENT_TYPES = {"size", "extension", "filename", "other"}
+_FILE_REQUIREMENT_OUT_OF_SCOPE_RE = re.compile(
+    r"分别(?:上传|提交|递交)|同时(?:提交|上传|提供)|备份文件|"
+    r"(?:商务标|技术标|报价文件).{0,20}(?:分别|各|同时)|"
+    r"U\s*盘|优盘|光盘|纸质|正本|副本|密封|包装|外部标记|"
+    r"多个文件|文件组合|另附\s*(?:Excel|PDF|Word|电子表格)|"
+    r"(?:PDF|Excel|Word).{0,8}(?:组合|各一份|同时)"
+)
+_FILE_REQUIREMENT_PLATFORM_RE = re.compile(
+    r"(?:系统|平台|网站|客户端).{0,16}(?:最大支持|支持上传|上传上限|容量上限)"
+    r"|(?:最大支持|支持上传|上传上限|容量上限).{0,16}(?:系统|平台|网站|客户端)"
+)
+_FILE_REQUIREMENT_EXPLICIT_LIMIT_RE = re.compile(
+    r"(?:不得|不能|不超过|小于等于|≤|上限|限值|最大为|最大不超过|应控制在)"
+)
+_FILE_NAME_GENERIC_LABELS = {
+    "项目名称",
+    "项目编号",
+    "标段名称",
+    "标包名称",
+    "投标人名称",
+    "供应商名称",
+    "采购人名称",
+}
+_FILE_SIZE_UNITS = {
+    "B": 1,
+    "BYTE": 1,
+    "BYTES": 1,
+    "KB": 1024,
+    "KIB": 1024,
+    "MB": 1024**2,
+    "MIB": 1024**2,
+    "GB": 1024**3,
+    "GIB": 1024**3,
+}
+
+
+def _coerce_file_requirement_output(value: Any) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(value, dict):
+        raise ComplianceExtractionError("文件级要求 Schema 校验失败：结果不是 JSON 对象。")
+    if set(value) - {"file_requirements"}:
+        raise ComplianceExtractionError("文件级要求 Schema 校验失败：包含未允许的顶层字段。")
+    items = value.get("file_requirements", [])
+    if not isinstance(items, list):
+        raise ComplianceExtractionError("文件级要求 Schema 校验失败：file_requirements 必须是数组。")
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) - _FILE_REQUIREMENT_OUTPUT_FIELDS:
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：包含未允许字段。"
+            )
+        for field_name in ("name", "requirement", "target", "requirement_type", "constraint_status", "support_reason"):
+            if not isinstance(item.get(field_name), str) or not item[field_name].strip():
+                raise ComplianceExtractionError(
+                    f"文件级要求 Schema 校验失败：{field_name} 无效。"
+                )
+        if item["requirement_type"] not in _FILE_REQUIREMENT_TYPES:
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：requirement_type 无效。"
+            )
+        if not isinstance(item.get("parameters"), dict):
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：parameters 必须是对象。"
+            )
+        if not isinstance(item.get("auto_checkable"), bool):
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：auto_checkable 必须是布尔值。"
+            )
+        source_block_ids = item.get("source_block_ids")
+        if not isinstance(source_block_ids, list) or not source_block_ids or not all(
+            isinstance(block_id, str) and block_id.strip() for block_id in source_block_ids
+        ):
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：source_block_ids 无效。"
+            )
+        result.append(dict(item))
+    return {"file_requirements": result}
+
+
+def _numeric_value(value: Any) -> int | float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if decimal_value <= 0:
+        return None
+    if decimal_value == decimal_value.to_integral_value():
+        return int(decimal_value)
+    return float(decimal_value)
+
+
+def _normalize_file_requirement_parameters(
+    requirement_type: str,
+    parameters: dict[str, Any],
+) -> tuple[dict[str, Any], bool, str | None]:
+    normalized = dict(parameters)
+    if requirement_type == "size":
+        raw_value = parameters.get("max_value", parameters.get("value"))
+        numeric_value = _numeric_value(raw_value)
+        unit = str(parameters.get("unit", "")).strip().upper()
+        factor = _FILE_SIZE_UNITS.get(unit)
+        if numeric_value is None or factor is None:
+            return normalized, False, "大小上限缺少可识别的数值或单位"
+        normalized["raw_value"] = numeric_value
+        normalized["raw_unit"] = unit
+        normalized["limit_bytes"] = int(Decimal(str(numeric_value)) * factor)
+        return normalized, True, None
+    if requirement_type == "extension":
+        raw_extensions = parameters.get(
+            "allowed_extensions",
+            parameters.get("allowed_suffixes", parameters.get("extensions", [])),
+        )
+        if isinstance(raw_extensions, str):
+            raw_extensions = re.split(r"[,、/；;\s]+", raw_extensions)
+        if not isinstance(raw_extensions, list):
+            raw_extensions = []
+        extensions = []
+        for value in raw_extensions:
+            suffix = str(value).strip().lower()
+            if not suffix:
+                continue
+            if not suffix.startswith("."):
+                suffix = "." + suffix
+            if re.fullmatch(r"\.[a-z0-9][a-z0-9._-]*", suffix):
+                extensions.append(suffix)
+        normalized["allowed_extensions"] = list(dict.fromkeys(extensions))
+        if not normalized["allowed_extensions"]:
+            return normalized, False, "文件格式要求缺少可识别的扩展名"
+        return normalized, True, None
+    if requirement_type == "filename":
+        contains = parameters.get("contains", [])
+        if isinstance(contains, str):
+            contains = [contains]
+        if not isinstance(contains, list):
+            contains = []
+        contains = [str(value).strip() for value in contains if str(value).strip()]
+        normalized["contains"] = list(dict.fromkeys(contains))
+        concrete = [
+            value
+            for value in contains
+            if value not in _FILE_NAME_GENERIC_LABELS
+            and not re.search(r"[<《【\[{（(].*(?:名称|编号|投标人).*[>》】\]}）)]", value)
+        ]
+        if not concrete:
+            return normalized, False, "命名规则缺少可核对的具体项目或投标人值"
+        normalized["concrete_contains"] = concrete
+        return normalized, True, None
+    return normalized, False, "当前没有针对该单文件属性的确定性比较器"
+
+
+def normalize_file_requirements(
+    value: Any,
+    blocks: Sequence[StructuredBlock],
+    *,
+    filtered_report: list[dict[str, Any]] | None = None,
+) -> list[FileRequirement]:
+    """Validate, scope-filter and source-ground LLM file requirements."""
+
+    output = _coerce_file_requirement_output(value)
+    block_map = {block.block_id: block for block in blocks}
+    normalized: list[FileRequirement] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+
+    def reject(raw_item: dict[str, Any], reason: str) -> None:
+        requirement = str(raw_item.get("requirement", "")).strip()
+        logger.info(
+            "file_requirements.filtered reason=%s requirement=%s",
+            reason,
+            requirement,
+        )
+        if filtered_report is not None:
+            filtered_report.append(
+                {
+                    "reason": reason,
+                    "name": raw_item.get("name", ""),
+                    "requirement": requirement,
+                    "target": raw_item.get("target", ""),
+                    "constraint_status": raw_item.get("constraint_status", ""),
+                    "source_block_ids": list(raw_item.get("source_block_ids", [])),
+                }
+            )
+
+    for raw_item in output["file_requirements"]:
+        requirement = raw_item["requirement"].strip()
+        target = raw_item["target"].strip()
+        constraint_status = raw_item["constraint_status"].strip()
+        if target != "single_bid_file":
+            reject(raw_item, "non_single_file_target")
+            continue
+        if constraint_status != "explicit_constraint":
+            reject(raw_item, "not_explicit_constraint")
+            continue
+        if _FILE_REQUIREMENT_OUT_OF_SCOPE_RE.search(requirement):
+            reject(raw_item, "out_of_scope")
+            continue
+        if _FILE_REQUIREMENT_PLATFORM_RE.search(requirement) and not _FILE_REQUIREMENT_EXPLICIT_LIMIT_RE.search(requirement):
+            reject(raw_item, "platform_capability")
+            continue
+        source_ids = list(dict.fromkeys(raw_item["source_block_ids"]))
+        if not source_ids or any(block_id not in block_map for block_id in source_ids):
+            raise ComplianceExtractionError(
+                "文件级要求 Schema 校验失败：来源 block_id 不存在。"
+            )
+        dedupe_key = (requirement, raw_item["requirement_type"], tuple(source_ids))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        parameters, structurally_checkable, parameter_reason = _normalize_file_requirement_parameters(
+            raw_item["requirement_type"], raw_item["parameters"]
+        )
+        auto_checkable = bool(raw_item["auto_checkable"]) and structurally_checkable
+        support_reason = raw_item["support_reason"].strip()
+        if parameter_reason:
+            support_reason = parameter_reason
+        source = _normalize_source(
+            {"block_ids": source_ids, "source_text": ""},
+            block_map,
+        )
+        normalized.append(
+            {
+                "id": f"file_requirement_{len(normalized) + 1:03d}",
+                "name": raw_item["name"].strip(),
+                "requirement": requirement,
+                "target": target,
+                "requirement_type": raw_item["requirement_type"],
+                "constraint_status": constraint_status,
+                "parameters": parameters,
+                "auto_checkable": auto_checkable,
+                "support_reason": support_reason,
+                "source": source,
+            }
+        )
+    return normalized
+
+
 def normalize_tender_extraction_sources(
     result: TenderExtractionResult,
     blocks: Sequence[StructuredBlock],
 ) -> TenderExtractionResult:
-    """Validate and restore source metadata for all three object collections."""
+    """Validate and restore source metadata for all extracted object collections."""
 
     block_map = {block.block_id: block for block in blocks}
     normalized: TenderExtractionResult = {
         "templates": [],
         "project_requirements": [],
         "supplemental_materials": [],
+        "file_requirements": [],
     }
     for key in normalized:
         for raw_item in result.get(key, []):
@@ -2931,6 +3304,85 @@ class DeterministicComplianceLLM:
         )
         return result
 
+    def extract_file_requirements(
+        self,
+        candidates: Sequence[CandidateWindow],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Provide a conservative local fallback for obvious single-file rules."""
+
+        result: dict[str, list[dict[str, Any]]] = {"file_requirements": []}
+        for candidate in candidates:
+            for line in re.split(r"[\n；;。]+", candidate.text):
+                text = line.strip()
+                if not text:
+                    continue
+                size_match = re.search(
+                    r"(?:文件|电子投标文件|组成部分)[^\n；;。]{0,40}"
+                    r"(?:不得|不能|不超过|小于等于|≤)\s*"
+                    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>KB|MB|GB|B)",
+                    text,
+                    re.IGNORECASE,
+                )
+                if size_match and not _FILE_REQUIREMENT_PLATFORM_RE.search(text):
+                    result["file_requirements"].append(
+                        {
+                            "name": "投标文件大小限制",
+                            "requirement": text,
+                            "target": "single_bid_file",
+                            "requirement_type": "size",
+                            "constraint_status": "explicit_constraint",
+                            "parameters": {
+                                "max_value": float(size_match.group("value")),
+                                "unit": size_match.group("unit").upper(),
+                            },
+                            "auto_checkable": True,
+                            "support_reason": "原文明确给出单份文件大小上限",
+                            "source_block_ids": list(candidate.block_ids),
+                        }
+                    )
+                extension_match = re.search(
+                    r"(?:文件格式|格式|采用|保存为)\s*(?:为|是|：|:)??\s*"
+                    r"(?P<extension>PDF|DOCX?|XLSX?|PPTX?|ZIP|RAR)\s*(?:格式)?",
+                    text,
+                    re.IGNORECASE,
+                )
+                if extension_match and not _FILE_REQUIREMENT_OUT_OF_SCOPE_RE.search(text):
+                    result["file_requirements"].append(
+                        {
+                            "name": "投标文件格式",
+                            "requirement": text,
+                            "target": "single_bid_file",
+                            "requirement_type": "extension",
+                            "constraint_status": "explicit_constraint",
+                            "parameters": {
+                                "allowed_extensions": [extension_match.group("extension")]
+                            },
+                            "auto_checkable": True,
+                            "support_reason": "原文明确给出单份文件格式",
+                            "source_block_ids": list(candidate.block_ids),
+                        }
+                    )
+                filename_match = re.search(
+                    r"文件(?:名称|名)[^\n；;。]{0,50}(?:应|须|需|必须).{0,30}"
+                    r"(?:包含|含有|命名为)",
+                    text,
+                )
+                if filename_match:
+                    result["file_requirements"].append(
+                        {
+                            "name": "投标文件名称规范",
+                            "requirement": text,
+                            "target": "single_bid_file",
+                            "requirement_type": "filename",
+                            "constraint_status": "explicit_constraint",
+                            "parameters": {"contains": ["项目名称", "投标人名称"]},
+                            "auto_checkable": False,
+                            "support_reason": "原文要求命名，但当前上下文未提供具体名称值",
+                            "source_block_ids": list(candidate.block_ids),
+                        }
+                    )
+        return result
+
 
 class OpenAICompatibleLLM:
     def __init__(
@@ -3121,6 +3573,106 @@ class OpenAICompatibleLLM:
             )
             raise ComplianceExtractionError(
                 "LLM 合规要求提取失败：响应结构异常。"
+            ) from exc
+
+    def extract_file_requirements(
+        self,
+        candidates: Sequence[CandidateWindow],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Extract only explicit constraints on the current single bid file."""
+
+        started_at = time.perf_counter()
+        source = "\n\n".join(
+            f"[{candidate.section}] block_ids={','.join(candidate.block_ids)}\n{candidate.text}"
+            for candidate in candidates
+        )
+        prompt = (
+            "从以下已经按章节结构筛选的招标文件上下文中，提取所有明确要求当前这一份电子投标文件自身属性的规则。"
+            "只返回 JSON 对象 {\"file_requirements\":[]}，每项只能包含 name、requirement、target、"
+            "requirement_type、constraint_status、parameters、auto_checkable、support_reason、source_block_ids。"
+            "target 必须为 single_bid_file；requirement_type 只能为 size、extension、filename、other；"
+            "constraint_status 只有在原文明示投标约束时才填 explicit_constraint。"
+            "size 的 parameters 保留 max_value、unit；extension 保留 allowed_extensions；filename 保留原文明确的具体字面量，"
+            "如果只有“项目名称/投标人名称”等待外部事实的泛化标签，仍可提取但 auto_checkable 必须为 false。"
+            "source_block_ids 必须且只能复制输入上下文中的真实 block_id，不得生成 source_text。"
+            "每个返回项都必须有至少一个 source_block_ids；如果不能确定来源 block，直接不返回该项而返回空数组。"
+            "support_reason 只写不超过100字的直接依据，不得写分析过程、复核过程或自我对话。"
+            "LLM 只负责提取和结构化，不检查投标文件，不得猜测缺失的名称、编号或容量。"
+            "若原文明确写“单个电子投标文件”或“单个组成部分”的大小上限，且该上限可直接用于当前这一份上传文件，"
+            "应提取为 single_bid_file 的 size 规则；“单个组成部分大小不超过50MB”属于每个待上传单文件的上限，"
+            "即使同一段还出现“分别编制/分别上传”，也必须保留这一条单文件上限；只排除“总容量”“全部组成部分合计”等集合总量要求。"
+            "严格排除以下内容：文件数量、分别提交或分别上传商务标/技术标/报价文件、备份文件、多个文件组合或多格式组合、"
+            "U盘/光盘、纸质正副本、密封包装外部标记、文件之间关系，以及无法仅靠当前单份文件元数据判断的要求。"
+            "“系统最大支持上传 500MB”这类平台能力说明不是投标约束，必须排除。"
+            "不得把平台支持上传容量当作投标约束。原文不明确是否为投标约束时不要返回。\n\n"
+            + source
+        )
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "enable_thinking": False,
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "你是招标文件单份电子投标文件属性要求提取器。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Connection": "close",
+            },
+            method="POST",
+        )
+        call_context = self._active_call_context()
+        recorder = call_context.get("recorder")
+        call_id = call_context.get("call_id")
+        if recorder is not None and call_id is not None:
+            recorder.attach_llm_input(call_id, payload)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            if recorder is not None and call_id is not None:
+                choice = response_payload.get("choices", [{}])[0]
+                recorder.attach_llm_response(
+                    call_id,
+                    raw_response=response_payload,
+                    finish_reason=choice.get("finish_reason"),
+                    usage=response_payload.get("usage"),
+                )
+            content = response_payload["choices"][0]["message"]["content"]
+            decoded = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(decoded, dict):
+                raise ValueError("file requirement result must be a JSON object")
+            result = _coerce_file_requirement_output(decoded)
+            logger.info(
+                "llm.file_requirements.end provider=openai_compatible model=%s candidates=%d candidate_chars=%d requirements=%d elapsed_ms=%d",
+                self.model,
+                len(candidates),
+                len(source),
+                len(result["file_requirements"]),
+                _elapsed_ms(started_at),
+            )
+            return result
+        except TimeoutError as exc:
+            raise ComplianceExtractionError("LLM 文件级要求提取失败：请求超时。") from exc
+        except urllib.error.HTTPError as exc:
+            raise ComplianceExtractionError(
+                f"LLM 文件级要求提取失败：HTTP {exc.code}。"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ComplianceExtractionError("LLM 文件级要求提取失败：网络连接错误。") from exc
+        except json.JSONDecodeError as exc:
+            raise ComplianceExtractionError(
+                "LLM 文件级要求提取失败：模型响应不是有效 JSON。"
+            ) from exc
+        except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ComplianceExtractionError(
+                "LLM 文件级要求提取失败：响应结构异常。"
             ) from exc
 
     def review_template(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
@@ -3381,6 +3933,7 @@ def _empty_tender_extraction_result() -> TenderExtractionResult:
         "templates": [],
         "project_requirements": [],
         "supplemental_materials": [],
+        "file_requirements": [],
     }
 
 
@@ -3860,6 +4413,18 @@ def extract_tender_compliance_objects(
         "template_elapsed_ms": None,
         "project_requirement_elapsed_ms": None,
         "supplemental_material_elapsed_ms": None,
+        "file_requirement_candidate_count": 0,
+        "file_requirement_candidate_chars": 0,
+        "file_requirement_prompt_chars": 0,
+        "file_requirement_extraction_source": None,
+        "file_requirement_llm_elapsed_ms": 0,
+        "file_requirement_llm_total_calls": 0,
+        "file_requirement_llm_completed_calls": 0,
+        "file_requirement_llm_failed_calls": 0,
+        "file_requirement_llm_output_count": 0,
+        "file_requirement_filtered_count": 0,
+        "file_requirement_filtered_by_reason": {},
+        "file_requirement_count": 0,
         "applicability_elapsed_ms": None,
         "parsed_blocks": 0,
         "parsed_block_counts": {},
@@ -3928,6 +4493,10 @@ def extract_tender_compliance_objects(
             "05_supplemental_materials.json",
             {"source": source, "supplemental_materials": result["supplemental_materials"]},
         )
+        persist_artifact(
+            "09_file_requirements.json",
+            {"source": source, "file_requirements": result["file_requirements"]},
+        )
         persist_artifact("07_result.json", result)
 
     try:
@@ -3958,6 +4527,7 @@ def extract_tender_compliance_objects(
         stats["cache_elapsed_ms"] = _elapsed_ms(cache_started_at)
         if _valid_object_result(cached):
             result: TenderExtractionResult = cached
+            result["file_requirements"] = list(result.get("file_requirements", []))
             result["templates"], navigation_exclusions = _annotate_navigation_templates(
                 result["templates"]
             )
@@ -3976,6 +4546,7 @@ def extract_tender_compliance_objects(
             stats["navigation_excluded_templates"] = navigation_exclusions
             stats["project_requirement_count"] = len(result["project_requirements"])
             stats["supplemental_material_count"] = len(result["supplemental_materials"])
+            stats["file_requirement_count"] = len(result["file_requirements"])
             persist_artifact("02_functional_regions.json", {"source": "result_cache", "regions": []})
             persist_result(result, source="result_cache")
             persist_artifact(
@@ -3990,6 +4561,7 @@ def extract_tender_compliance_objects(
                 templates=stats["template_count"],
                 project_requirements=stats["project_requirement_count"],
                 supplemental_materials=stats["supplemental_material_count"],
+                file_requirements=stats["file_requirement_count"],
             )
             record_event(
                 "compliance.extract.end",
@@ -3998,6 +4570,7 @@ def extract_tender_compliance_objects(
                 templates=stats["template_count"],
                 project_requirements=stats["project_requirement_count"],
                 supplemental_materials=stats["supplemental_material_count"],
+                file_requirements=stats["file_requirement_count"],
             )
             return result
 
@@ -4096,7 +4669,116 @@ def extract_tender_compliance_objects(
             "templates": templates,
             "project_requirements": project_requirements,
             "supplemental_materials": supplemental_materials,
+            "file_requirements": [],
         }
+
+        file_candidates = build_file_requirement_candidates(blocks)
+        file_candidate_chars = sum(len(candidate.text) for candidate in file_candidates)
+        file_prompt_chars = sum(
+            len(
+                f"[{candidate.section}] block_ids={','.join(candidate.block_ids)}\n"
+                f"{candidate.text}"
+            )
+            for candidate in file_candidates
+        )
+        stats["file_requirement_candidate_count"] = len(file_candidates)
+        stats["file_requirement_candidate_chars"] = file_candidate_chars
+        stats["file_requirement_prompt_chars"] = file_prompt_chars
+        persist_artifact(
+            "08_file_requirement_candidates.json",
+            {
+                "candidate_count": len(file_candidates),
+                "candidate_chars": file_candidate_chars,
+                "prompt_chars": file_prompt_chars,
+                "candidates": _serialize_candidates(file_candidates),
+            },
+        )
+        file_requirement_extractor = getattr(active_llm, "extract_file_requirements", None)
+        if file_requirement_extractor is None and active_llm is None:
+            fallback_llm = DeterministicComplianceLLM()
+            file_requirement_extractor = fallback_llm.extract_file_requirements
+            stats["file_requirement_extraction_source"] = "deterministic_fallback"
+        elif file_requirement_extractor is not None:
+            stats["file_requirement_extraction_source"] = type(active_llm).__name__
+        if file_candidates and callable(file_requirement_extractor):
+            file_filter_report: list[dict[str, Any]] = []
+            file_call_id = (
+                active_recorder.start_llm_call(
+                    batch_index=1,
+                    batch_count=1,
+                    attempt=1,
+                    model=getattr(active_llm, "model", "deterministic"),
+                    batch=_serialize_candidates(file_candidates),
+                )
+                if active_recorder is not None
+                else None
+            )
+            if isinstance(active_llm, OpenAICompatibleLLM):
+                active_llm.set_call_context(
+                    recorder=active_recorder,
+                    call_id=file_call_id,
+                )
+            stats["file_requirement_llm_total_calls"] += 1
+            file_call_started_at = time.perf_counter()
+            try:
+                raw_file_output = file_requirement_extractor(file_candidates)
+                if isinstance(raw_file_output, dict):
+                    raw_items = raw_file_output.get("file_requirements", [])
+                    stats["file_requirement_llm_output_count"] = (
+                        len(raw_items) if isinstance(raw_items, list) else 0
+                    )
+                file_requirements = normalize_file_requirements(
+                    raw_file_output,
+                    blocks,
+                    filtered_report=file_filter_report,
+                )
+                result["file_requirements"] = file_requirements
+                file_elapsed_ms = _elapsed_ms(file_call_started_at)
+                stats["file_requirement_llm_elapsed_ms"] = file_elapsed_ms
+                stats["file_requirement_llm_completed_calls"] += 1
+                stats["file_requirement_filtered_count"] = len(file_filter_report)
+                stats["file_requirement_filtered_by_reason"] = _filter_reason_counts(
+                    file_filter_report
+                )
+                if active_recorder is not None and file_call_id is not None:
+                    active_recorder.complete_llm_call(
+                        file_call_id,
+                        parsed_objects=raw_file_output,
+                        schema_valid=True,
+                        elapsed_ms=file_elapsed_ms,
+                    )
+            except Exception as exc:
+                file_elapsed_ms = _elapsed_ms(file_call_started_at)
+                stats["file_requirement_llm_elapsed_ms"] = file_elapsed_ms
+                stats["file_requirement_llm_failed_calls"] += 1
+                file_filter_report.append(
+                    {
+                        "reason": "schema_or_call_error",
+                        "name": "",
+                        "requirement": "",
+                        "target": "",
+                        "constraint_status": "",
+                        "source_block_ids": [],
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
+                stats["file_requirement_filtered_count"] = len(file_filter_report)
+                stats["file_requirement_filtered_by_reason"] = _filter_reason_counts(
+                    file_filter_report
+                )
+                result["file_requirements"] = []
+                logger.warning(
+                    "file_requirements.extract.error error_type=%s; existing extraction continues without formal file rules",
+                    type(exc).__name__,
+                )
+                if active_recorder is not None and file_call_id is not None:
+                    active_recorder.fail_llm_call(
+                        file_call_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        elapsed_ms=file_elapsed_ms,
+                    )
 
         ambiguous = _ambiguous_regions(regions)
         if active_llm is not None and not isinstance(active_llm, DeterministicComplianceLLM) and ambiguous:
@@ -4225,7 +4907,15 @@ def extract_tender_compliance_objects(
         stats["navigation_excluded_templates"] = navigation_exclusions
         stats["project_requirement_count"] = len(normalized["project_requirements"])
         stats["supplemental_material_count"] = len(normalized["supplemental_materials"])
+        stats["file_requirement_count"] = len(normalized["file_requirements"])
         persist_result(normalized)
+        persist_artifact(
+            "09_file_requirement_filter_report.json",
+            {
+                "filtered_count": stats["file_requirement_filtered_count"],
+                "filtered_by_reason": stats["file_requirement_filtered_by_reason"],
+            },
+        )
         persist_artifact("06_filter_report.json", applicability_report)
         persist_artifact(
             "06_navigation_exclusion_report.json",
@@ -4239,6 +4929,7 @@ def extract_tender_compliance_objects(
             templates=stats["template_count"],
             project_requirements=stats["project_requirement_count"],
             supplemental_materials=stats["supplemental_material_count"],
+            file_requirements=stats["file_requirement_count"],
             filtered_objects=stats["filtered_objects"],
             elapsed_ms=_elapsed_ms(started_at),
         )

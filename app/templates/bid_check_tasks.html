@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+
+{% block title %}任务列表 · 标书检查{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumb" aria-label="面包屑">
+    <a href="/bid-check">标书检查</a>
+    <span aria-hidden="true">/</span>
+    <span>任务列表</span>
+  </nav>
+
+  <header class="page-heading task-list-heading">
+    <div>
+      <span class="eyebrow">BID CHECK / TASKS</span>
+      <h1>检查任务列表</h1>
+      <p>查看历史任务的执行状态，并进入对应的合规性校验结果。</p>
+    </div>
+    <a class="button primary" href="/bid-check">创建新任务 <span aria-hidden="true">→</span></a>
+  </header>
+
+  <section class="card task-list-card" aria-labelledby="task-list-heading">
+    <div class="section-heading task-list-section-heading">
+      <div>
+        <span class="section-number">TASKS</span>
+        <h2 id="task-list-heading">全部任务</h2>
+      </div>
+      <span class="requirement-count">{{ task_count }} 个任务</span>
+    </div>
+
+    {% if task_rows %}
+      <div class="task-list" role="list">
+        {% for row in task_rows %}
+          {% set task = row.task %}
+          {% set counts = row.issue_counts %}
+          <article class="task-list-item task-list-item-{{ task.status }}" data-task-row="{{ task.task_id }}" role="listitem">
+            <a class="task-list-item-link" href="/bid-check/tasks/{{ task.task_id }}">
+              <div class="task-list-main">
+                <div class="task-list-item-heading">
+                  <span class="task-list-status task-list-status-{{ task.status }}">{{ row.status_label }}</span>
+                  <strong>{{ task.bid_file.filename }}</strong>
+                </div>
+                <div class="task-list-meta">任务 {{ task.task_id[:8] }} · {{ row.created_at_display }} · {{ row.check_mode_label }}</div>
+                <div class="task-list-files">
+                  <span><small>招标文件</small>{{ task.tender_file.filename }}</span>
+                  <span><small>投标文件</small>{{ task.bid_file.filename }}</span>
+                </div>
+                {% if task.status == "failed" and task.error_message %}
+                  <p class="task-list-message task-list-message-failed">{{ task.error_message }}</p>
+                {% elif task.status == "running" %}
+                  <p class="task-list-message">任务正在执行，点击查看实时进度。</p>
+                {% elif task.status == "pending" %}
+                  <p class="task-list-message">任务等待执行。</p>
+                {% endif %}
+              </div>
+              <div class="task-list-side">
+                {% if row.has_result %}
+                  <div class="task-list-metrics" aria-label="问题统计">
+                    <div><small>模板规范</small><strong>{{ counts.template }}</strong></div>
+                    <div><small>附件</small><strong>{{ counts.attachment }}</strong></div>
+                    <div><small>业绩合同</small><strong>{{ counts.performance }}</strong></div>
+                    <div><small>文件自身</small><strong>{{ counts.file }}</strong></div>
+                  </div>
+                  <span class="task-list-total">查看检查结果 <span aria-hidden="true">→</span></span>
+                {% else %}
+                  <span class="task-list-total">查看进度 <span aria-hidden="true">→</span></span>
+                {% endif %}
+              </div>
+            </a>
+            {% if task.status in ["complete", "failed"] %}
+              <button class="task-delete-button" type="button" data-delete-task="{{ task.task_id }}" data-task-name="{{ task.bid_file.filename }}">删除</button>
+            {% else %}
+              <button class="task-delete-button" type="button" disabled title="任务执行中暂不可删除">删除</button>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="task-list-empty">
+        <span class="task-list-empty-icon" aria-hidden="true">＋</span>
+        <strong>还没有检查任务</strong>
+        <p>上传招标文件和投标文件后，任务会出现在这里。</p>
+        <a class="button primary" href="/bid-check">创建第一个任务</a>
+      </div>
+    {% endif %}
+  </section>
+
+  <dialog class="task-delete-dialog" data-delete-dialog aria-labelledby="delete-dialog-heading">
+    <form method="dialog">
+      <span class="eyebrow">DELETE TASK</span>
+      <h2 id="delete-dialog-heading">确认删除任务</h2>
+      <p>删除后将同时清理数据库记录和该任务产生的所有文件，此操作不可恢复。</p>
+      <p class="task-delete-target" data-delete-target></p>
+      <div class="task-delete-actions">
+        <button class="button" type="button" data-delete-cancel>取消</button>
+        <button class="button task-delete-confirm" type="button" data-delete-confirm>删除任务</button>
+      </div>
+    </form>
+  </dialog>
+  <div class="task-delete-feedback" data-delete-feedback role="alert" hidden></div>
+{% endblock %}
+
+{% block scripts %}
+  <script>
+    (() => {
+      const dialog = document.querySelector("[data-delete-dialog]");
+      if (!dialog) return;
+      const taskList = document.querySelector(".task-list");
+      const target = dialog.querySelector("[data-delete-target]");
+      const cancelButton = dialog.querySelector("[data-delete-cancel]");
+      const confirmButton = dialog.querySelector("[data-delete-confirm]");
+      const feedback = document.querySelector("[data-delete-feedback]");
+      let pending = null;
+
+      const closeDialog = () => {
+        pending = null;
+        dialog.close();
+      };
+
+      document.querySelectorAll("[data-delete-task]").forEach((button) => {
+        button.addEventListener("click", () => {
+          pending = {
+            button,
+            row: button.closest("[data-task-row]"),
+            taskId: button.dataset.deleteTask,
+            taskName: button.dataset.taskName,
+          };
+          target.textContent = `${pending.taskName}（任务 ${pending.taskId.slice(0, 8)}）`;
+          feedback.hidden = true;
+          dialog.showModal();
+        });
+      });
+
+      cancelButton.addEventListener("click", closeDialog);
+      dialog.addEventListener("cancel", () => {
+        pending = null;
+      });
+      confirmButton.addEventListener("click", async () => {
+        if (!pending) return;
+        const current = pending;
+        confirmButton.disabled = true;
+        cancelButton.disabled = true;
+        current.button.disabled = true;
+        current.button.textContent = "删除中…";
+        try {
+          const response = await fetch(`/api/bid-check/tasks/${encodeURIComponent(current.taskId)}`, {method: "DELETE"});
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(payload.detail || "删除任务失败，请稍后重试。");
+          closeDialog();
+          current.row.remove();
+          if (!taskList || !taskList.querySelector("[data-task-row]")) {
+            window.location.reload();
+          }
+        } catch (error) {
+          dialog.close();
+          feedback.textContent = error.message;
+          feedback.hidden = false;
+          current.button.disabled = false;
+          current.button.textContent = "删除";
+          pending = null;
+        } finally {
+          confirmButton.disabled = false;
+          cancelButton.disabled = false;
+        }
+      });
+    })();
+  </script>
+{% endblock %}

@@ -58,6 +58,133 @@
   {% endfor %}
 {%- endmacro %}
 
+{% macro render_template_issues(comparisons, reviews) -%}
+  {% for comparison in comparisons|default([], true) %}
+    {% if comparison.status in ["unmatched", "ambiguous"] %}
+      <article class="final-issue-card">
+        <div class="final-issue-heading">
+          <strong>{{ comparison.tender.name }}</strong>
+          {% if comparison.status == "unmatched" %}<span class="comparison-status comparison-status-fail">未匹配</span>{% else %}<span class="comparison-status comparison-status-uncertain">对应关系待确认</span>{% endif %}
+        </div>
+        <p>{{ comparison.match_basis }}</p>
+        {% if comparison.candidates %}<small>候选模块：{{ comparison.candidates|map(attribute="title")|join("、") }}</small>{% endif %}
+      </article>
+    {% endif %}
+  {% endfor %}
+  {% for review in reviews|default([], true) %}
+    {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+      <article class="final-issue-card">
+        <div class="final-issue-heading">
+          <strong>{{ review.template_name }}</strong>
+          {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+          {% elif review.execution_status == "semantic_skipped" %}<span class="comparison-status comparison-status-uncertain">{% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义对应待确认{% endif %}</span>
+          {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+          {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+        </div>
+        <small>对应模块：{{ review.bid_module_name|default("未唯一匹配", true) }}</small>
+        {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+        {% if review.execution_status == "semantic_skipped" and review.semantic_match.reason %}<p>语义判断：{{ review.semantic_match.reason }}</p>{% endif %}
+        {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+        {% if review.issues %}
+          <ul class="review-issue-list">
+            {% for issue in review.issues %}
+              <li><strong>{{ issue.type }}</strong>：{{ issue.reason }}{% if issue.requirement or issue.actual %}<br><small>要求：{{ issue.requirement|default("未记录", true) }}；实际：{{ issue.actual|default("未记录", true) }}</small>{% endif %}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </article>
+    {% endif %}
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_attachment_issues(reviews) -%}
+  {% for review in reviews|default([], true) %}
+    {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+      <article class="final-issue-card">
+        <div class="final-issue-heading">
+          <strong>{{ review.template_name }}</strong>
+          {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+          {% elif review.execution_status == "semantic_skipped" %}<span class="comparison-status comparison-status-uncertain">{% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义对应待确认{% endif %}</span>
+          {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+          {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+        </div>
+        <small>对应模块：{{ review.bid_module_name|default("未唯一匹配", true) }}</small>
+        <small>证据图片：{{ review.image_ids|length if review.image_ids else 0 }} 张{% if review.image_ids %}（{{ review.image_ids|join("、") }}）{% endif %}</small>
+        {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+        {% if review.execution_status == "semantic_skipped" and review.semantic_match.reason %}<p>语义判断：{{ review.semantic_match.reason }}</p>{% endif %}
+        {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+        {% if review.requirements %}
+          <ul class="review-issue-list">
+            {% for requirement in review.requirements %}
+              {% if requirement.status in ["fail", "uncertain"] %}
+                <li><strong>{{ requirement.requirement }}：{{ requirement.status }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
+              {% endif %}
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </article>
+    {% endif %}
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_performance_issues(reviews) -%}
+  {% for review in reviews|default([], true) %}
+    {% if review.execution_status|default("") == "failed" or review.status in ["fail", "uncertain"] %}
+      <article class="final-issue-card">
+        <div class="final-issue-heading">
+          <strong>{{ review.case_type|default(review.bid_module_name, true) }}</strong>
+          {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+          {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+          {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+        </div>
+        {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+        {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+        {% set framework = review.framework_contract|default({}, true) %}
+        {% if framework.status == "uncertain" %}
+          <p><strong>合同类型：待确认</strong>：{{ framework.reason|default("当前证据不足，无法可靠判断。", true) }}{% if framework.evidence_image_ids %}<br><small>证据图片：{{ framework.evidence_image_ids|join("、") }}</small>{% endif %}</p>
+        {% endif %}
+        {% if review.checks %}
+          <ul class="review-issue-list">
+            {% for check in review.checks %}
+              {% if check.status in ["fail", "uncertain"] %}
+                <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+              {% endif %}
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </article>
+    {% endif %}
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_file_requirement_reviews(reviews) -%}
+  {% for review in reviews|default([], true) %}
+    <article class="final-issue-card file-requirement-card">
+      <div class="final-issue-heading">
+        <strong>{{ review.name|default("文件自身要求", true) }}</strong>
+        {% if review.status == "pass" %}<span class="comparison-status comparison-status-pass">合规</span>
+        {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">不合规</span>
+        {% else %}<span class="comparison-status comparison-status-uncertain">无法自动检查</span>{% endif %}
+      </div>
+      <p><strong>招标要求：</strong>{{ review.requirement|default("未记录", true) }}</p>
+      <p><strong>实际情况：</strong>
+        {% if review.actual %}
+          文件名 {{ review.actual.filename|default("未获取", true) }}；
+          后缀 {{ review.actual.extension|default("无", true) }}；
+          大小 {{ review.actual.size_display|default("未获取", true) }}（{{ review.actual.size_bytes|default("未获取", true) }}）
+        {% else %}未获取原始文件元数据{% endif %}
+      </p>
+      <p><strong>判定：</strong>{{ review.status_label|default(review.status, true) }}。{{ review.message|default("", true) }}</p>
+      <details class="file-requirement-source">
+        <summary>招标文件原文依据</summary>
+        {% if review.source %}<p>{{ review.source.source_text|default("未记录", true) }}</p><small>章节：{{ review.source.section|default("未记录", true) }}；block：{{ review.source.block_ids|join("、") if review.source.block_ids else "未记录" }}</small>{% else %}<p>未记录来源文档块。</p>{% endif %}
+      </details>
+    </article>
+  {% else %}
+    <div class="card empty-card">未识别到当前单份投标文件自身的文件级要求。</div>
+  {% endfor %}
+{%- endmacro %}
+
 {% block title %}{{ task.bid_file.filename }} · 标书检查{% endblock %}
 
 {% block body_attributes %}data-task-id="{{ task.task_id }}" data-task-status="{{ task.status }}"{% endblock %}
@@ -74,7 +201,7 @@
       <div>
         <span class="eyebrow">任务已完成</span>
         <h1>标书合规性校验结果</h1>
-        <p>本次识别 {{ task.result.templates|length }} 个模板、{{ task.result.project_requirements|length }} 条项目专用编制要求和 {{ task.result.supplemental_materials|length }} 项补充证明材料</p>
+        <p>以下按模板规范、附件、业绩合同和文件自身四个检查范围展示合规性结果。</p>
       </div>
       <a class="button" href="/bid-check">创建新任务</a>
     </header>
@@ -82,27 +209,262 @@
     <div class="notice notice-info" role="note">
       <span class="notice-icon" aria-hidden="true">i</span>
       <div>
-        {% if task.result.review_result.mode|default("") in ["template_text", "template_text_and_attachments"] %}
-          {% set review_stats = task.result.review_result.stats|default({}, true) %}
-          {% set attachment_stats = task.result.review_result.attachment_stats|default({}, true) %}
-          {% if task.result.review_result.mode == "template_text_and_attachments" %}
-            <strong>已执行指定模板文本与附件检查</strong>
-          {% elif review_stats.llm_total_calls|default(0, true) > 0 %}
-            <strong>已执行明确匹配模板的文本对照检查</strong>
-          {% else %}
-            <strong>暂无可执行的模板文本检查</strong>
-          {% endif %}
-          {% if task.result.review_result.mode == "template_text_and_attachments" %}
-            <p>本轮保留原有模板文本检查，并对已匹配且明确存在普通证明材料要求的模板执行附件检查；业绩合同等复杂附件另行处理，不判断签字、盖章、材料真实性或外部状态。</p>
-          {% else %}
-            <p>本轮仅检查已明确匹配且存在可靠模块内容的模板文本；不判断签字、盖章、图片、附件真实性或外部状态。</p>
-          {% endif %}
-        {% else %}
-          <strong>当前版本仅展示招标模板与投标文件模块的匹配关系</strong>
-          <p>尚未执行真实内容对照或合规性判断，匹配状态不代表任何要求已经通过或未通过。</p>
-        {% endif %}
+        <strong>最终检查结果</strong>
+        <p>以下汇总模板规范、附件、业绩合同和文件自身检查结果；文件自身要求会展示实际原始文件元数据及招标原文依据。</p>
       </div>
     </div>
+
+    {% set review_result = task.result.review_result|default({}, true) %}
+    {% set text_reviews = review_result.template_text_reviews|default([], true) %}
+    {% set attachment_reviews = review_result.attachment_reviews|default([], true) %}
+    {% set performance_reviews = review_result.performance_reviews|default([], true) %}
+    {% set file_requirement_reviews = file_requirement_reviews|default(review_result.file_requirement_reviews, true) %}
+    {% set final_issue_counts = namespace(template=0, attachment=0, performance=0, file=0) %}
+    {% for comparison in template_comparisons|default([], true) %}
+      {% if comparison.status in ["unmatched", "ambiguous"] %}
+        {% set final_issue_counts.template = final_issue_counts.template + 1 %}
+      {% endif %}
+    {% endfor %}
+    {% for review in text_reviews %}
+      {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+        {% set final_issue_counts.template = final_issue_counts.template + 1 %}
+      {% endif %}
+    {% endfor %}
+    {% for review in attachment_reviews %}
+      {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+        {% set final_issue_counts.attachment = final_issue_counts.attachment + 1 %}
+      {% endif %}
+    {% endfor %}
+    {% for review in performance_reviews %}
+      {% if review.execution_status|default("") == "failed" or review.status in ["fail", "uncertain"] %}
+        {% set final_issue_counts.performance = final_issue_counts.performance + 1 %}
+      {% endif %}
+    {% endfor %}
+    {% for review in file_requirement_reviews %}
+      {% if review.status in ["fail", "not_supported"] %}
+        {% set final_issue_counts.file = final_issue_counts.file + 1 %}
+      {% endif %}
+    {% endfor %}
+
+    <div class="result-style-switcher" data-result-style-switcher role="tablist" aria-label="结果页风格切换">
+      <span class="result-style-label">展示风格</span>
+      <button type="button" role="tab" aria-selected="true" aria-pressed="true" data-result-style="workbench">A · 审阅工作台</button>
+      <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-style="dashboard">B · 风险驾驶舱</button>
+      <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-style="report">C · 结论报告页</button>
+    </div>
+
+    <div class="result-style-view result-style-workbench" data-result-style-view="workbench" data-active="true">
+    <section class="card result-summary-card final-result-summary" aria-label="问题汇总">
+      <div>
+        <span class="summary-label">投标文件</span>
+        <strong>{{ task.bid_file.filename }}</strong>
+      </div>
+      <div class="result-metrics">
+        <div><small>模板规范问题</small><strong>{{ final_issue_counts.template }}</strong></div>
+        <div><small>附件问题</small><strong>{{ final_issue_counts.attachment }}</strong></div>
+        <div><small>合同问题</small><strong>{{ final_issue_counts.performance }}</strong></div>
+        <div><small>文件自身问题</small><strong>{{ final_issue_counts.file }}</strong></div>
+      </div>
+    </section>
+
+    <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-template-issues-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">TEMPLATE COMPLIANCE</span>
+          <h2 id="final-template-issues-heading">模板规范检查</h2>
+        </div>
+        <span class="requirement-count">{{ final_issue_counts.template }} 项问题</span>
+      </div>
+      {% if final_issue_counts.template == 0 %}
+        <div class="card empty-card">未发现需处理的模板规范问题。</div>
+      {% else %}
+        <div class="final-issue-list">
+          {% for comparison in template_comparisons|default([], true) %}
+            {% if comparison.status in ["unmatched", "ambiguous"] %}
+              <article class="final-issue-card">
+                <div class="final-issue-heading">
+                  <strong>{{ comparison.tender.name }}</strong>
+                  {% if comparison.status == "unmatched" %}<span class="comparison-status comparison-status-fail">未匹配</span>{% else %}<span class="comparison-status comparison-status-uncertain">对应关系待确认</span>{% endif %}
+                </div>
+                <p>{{ comparison.match_basis }}</p>
+                {% if comparison.candidates %}<small>候选模块：{{ comparison.candidates|map(attribute="title")|join("、") }}</small>{% endif %}
+              </article>
+            {% endif %}
+          {% endfor %}
+          {% for review in text_reviews %}
+            {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+              <article class="final-issue-card">
+                <div class="final-issue-heading">
+                  <strong>{{ review.template_name }}</strong>
+                  {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+                  {% elif review.execution_status == "semantic_skipped" %}<span class="comparison-status comparison-status-uncertain">{% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义对应待确认{% endif %}</span>
+                  {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+                  {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+                </div>
+                <small>对应模块：{{ review.bid_module_name|default("未唯一匹配", true) }}</small>
+                {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+                {% if review.execution_status == "semantic_skipped" and review.semantic_match.reason %}<p>语义判断：{{ review.semantic_match.reason }}</p>{% endif %}
+                {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+                {% if review.issues %}
+                  <ul class="review-issue-list">
+                    {% for issue in review.issues %}
+                      <li><strong>{{ issue.type }}</strong>：{{ issue.reason }}{% if issue.requirement or issue.actual %}<br><small>要求：{{ issue.requirement|default("未记录", true) }}；实际：{{ issue.actual|default("未记录", true) }}</small>{% endif %}</li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+              </article>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-attachment-issues-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">ATTACHMENT COMPLIANCE</span>
+          <h2 id="final-attachment-issues-heading">附件检查</h2>
+        </div>
+        <span class="requirement-count">{{ final_issue_counts.attachment }} 项问题</span>
+      </div>
+      {% if final_issue_counts.attachment == 0 %}
+        <div class="card empty-card">未发现需处理的附件问题。</div>
+      {% else %}
+        <div class="final-issue-list">
+          {% for review in attachment_reviews %}
+            {% if review.execution_status|default("") in ["failed", "semantic_skipped"] or review.status in ["fail", "uncertain"] %}
+              <article class="final-issue-card">
+                <div class="final-issue-heading">
+                  <strong>{{ review.template_name }}</strong>
+                  {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+                  {% elif review.execution_status == "semantic_skipped" %}<span class="comparison-status comparison-status-uncertain">{% if review.semantic_match.status == "mismatched" %}语义不匹配{% else %}语义对应待确认{% endif %}</span>
+                  {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+                  {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+                </div>
+                <small>对应模块：{{ review.bid_module_name|default("未唯一匹配", true) }}</small>
+                <small>证据图片：{{ review.image_ids|length if review.image_ids else 0 }} 张{% if review.image_ids %}（{{ review.image_ids|join("、") }}）{% endif %}</small>
+                {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+                {% if review.execution_status == "semantic_skipped" and review.semantic_match.reason %}<p>语义判断：{{ review.semantic_match.reason }}</p>{% endif %}
+                {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+                {% if review.requirements %}
+                  <ul class="review-issue-list">
+                    {% for requirement in review.requirements %}
+                      {% if requirement.status in ["fail", "uncertain"] %}
+                        <li><strong>{{ requirement.requirement }}：{{ requirement.status }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
+                      {% endif %}
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+              </article>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-performance-issues-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">PERFORMANCE CONTRACT</span>
+          <h2 id="final-performance-issues-heading">业绩合同检查</h2>
+        </div>
+        <span class="requirement-count">{{ final_issue_counts.performance }} 项问题</span>
+      </div>
+      {% if final_issue_counts.performance == 0 %}
+        <div class="card empty-card">未发现需处理的业绩合同问题。</div>
+      {% else %}
+        <div class="final-issue-list">
+          {% for review in performance_reviews %}
+            {% if review.execution_status|default("") == "failed" or review.status in ["fail", "uncertain"] %}
+              <article class="final-issue-card">
+                <div class="final-issue-heading">
+                  <strong>{{ review.case_type|default(review.bid_module_name, true) }}</strong>
+                  {% if review.execution_status == "failed" %}<span class="comparison-status comparison-status-uncertain">调用失败</span>
+                  {% elif review.status == "fail" %}<span class="comparison-status comparison-status-fail">检查不通过</span>
+                  {% else %}<span class="comparison-status comparison-status-uncertain">待确认</span>{% endif %}
+                </div>
+                {% if review.summary %}<p>{{ review.summary }}</p>{% endif %}
+                {% if review.execution_status == "failed" and review.error_message %}<p>{{ review.error_type|default("检查失败", true) }}：{{ review.error_message }}</p>{% endif %}
+                {% set framework = review.framework_contract|default({}, true) %}
+                {% if framework.status == "uncertain" %}
+                  <p><strong>合同类型：待确认</strong>：{{ framework.reason|default("当前证据不足，无法可靠判断。", true) }}{% if framework.evidence_image_ids %}<br><small>证据图片：{{ framework.evidence_image_ids|join("、") }}</small>{% endif %}</p>
+                {% endif %}
+                {% if review.checks %}
+                  <ul class="review-issue-list">
+                    {% for check in review.checks %}
+                      {% if check.status in ["fail", "uncertain"] %}
+                        <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+                      {% endif %}
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+              </article>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-file-requirement-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">UPLOADED FILE METADATA</span>
+          <h2 id="final-file-requirement-heading">文件自身检查</h2>
+        </div>
+        <span class="requirement-count">{{ file_requirement_reviews|length }} 项要求</span>
+      </div>
+      <div class="file-requirement-metadata card">
+        <strong>实际检查文件：</strong>{{ file_requirement_original_file.filename|default(task.bid_file.filename, true) }}；
+        <strong>真实大小：</strong>{{ file_requirement_original_file.size_display|default("未获取", true) }}；
+        <strong>后缀：</strong>{{ file_requirement_original_file.extension|default("无", true) }}
+      </div>
+      <div class="final-issue-list">{{ render_file_requirement_reviews(file_requirement_reviews) }}</div>
+    </section>
+
+    </div>
+
+    <div class="result-style-view result-style-dashboard" data-result-style-view="dashboard" data-active="false">
+      <div class="result-dashboard-shell">
+        <aside class="result-dashboard-sidebar" aria-label="问题分类导航">
+          <span class="result-dashboard-kicker">BID CHECK</span>
+          <h2>合规审阅</h2>
+          <div class="result-dashboard-nav is-selected"><span aria-hidden="true">◈</span><strong>问题总览</strong><b>{{ final_issue_counts.template + final_issue_counts.attachment + final_issue_counts.performance + final_issue_counts.file }}</b></div>
+          <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>模板规范</strong><b>{{ final_issue_counts.template }}</b></div>
+          <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>附件材料</strong><b>{{ final_issue_counts.attachment }}</b></div>
+          <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>业绩合同</strong><b>{{ final_issue_counts.performance }}</b></div>
+          <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>文件自身</strong><b>{{ final_issue_counts.file }}</b></div>
+          <div class="result-dashboard-tip">通过项已从结果面板隐藏<br>展开问题查看证据定位</div>
+        </aside>
+        <main class="result-dashboard-main">
+          <div class="result-dashboard-breadcrumb">标书检查 / {{ task.bid_file.filename }}</div>
+          <div class="result-dashboard-heading"><div><span class="section-number">FINAL REVIEW</span><h2>问题总览</h2><p>审阅重点集中在需要人工关注的结论。</p></div><span class="result-dashboard-state">需处理</span></div>
+          <div class="result-dashboard-alert">优先复核业绩合同中的关键页证据，以及没有关联图片的附件材料。</div>
+          <div class="result-dashboard-metrics">
+            <div><span>模板规范</span><strong>{{ final_issue_counts.template }}</strong><small>未匹配或文本问题</small></div>
+            <div><span>附件材料</span><strong>{{ final_issue_counts.attachment }}</strong><small>材料缺失或证据不足</small></div>
+            <div><span>业绩合同</span><strong>{{ final_issue_counts.performance }}</strong><small>关键合同事实需复核</small></div>
+            <div><span>文件自身</span><strong>{{ final_issue_counts.file }}</strong><small>原始文件元数据要求</small></div>
+          </div>
+          <div class="result-dashboard-focus">
+            <section class="result-dashboard-panel result-dashboard-contracts"><div class="result-dashboard-panel-head"><h3>业绩合同</h3><span>{{ final_issue_counts.performance }} 项</span></div>{% if final_issue_counts.performance == 0 %}<div class="result-dashboard-empty">未发现需处理的问题</div>{% else %}{{ render_performance_issues(performance_reviews) }}{% endif %}</section>
+            <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>附件材料</h3><span>{{ final_issue_counts.attachment }} 项</span></div>{% if final_issue_counts.attachment == 0 %}<div class="result-dashboard-empty">未发现需处理的问题</div>{% else %}{{ render_attachment_issues(attachment_reviews) }}{% endif %}</section>
+            <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>模板规范</h3><span>{{ final_issue_counts.template }} 项</span></div>{% if final_issue_counts.template == 0 %}<div class="result-dashboard-empty">未发现需处理的问题</div>{% else %}{{ render_template_issues(template_comparisons, text_reviews) }}{% endif %}</section>
+            <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>文件自身</h3><span>{{ final_issue_counts.file }} 项</span></div>{% if final_issue_counts.file == 0 %}<div class="result-dashboard-empty">未发现需处理的问题</div>{% else %}{{ render_file_requirement_reviews(file_requirement_reviews) }}{% endif %}</section>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div class="result-style-view result-style-report" data-result-style-view="report" data-active="false">
+      <div class="result-report-paper">
+        <header class="result-report-head"><div><span class="section-number">COMPLIANCE REVIEW REPORT</span><h2>标书合规性校验</h2></div><div class="result-report-file">最终结果<br>{{ task.bid_file.filename }}</div></header>
+        <section class="result-report-lede"><div><h3>需要处理的问题</h3><p>本页汇总未通过、待确认及无法自动检查的检查结论，并保留文件自身检查的所有要求明细。</p></div><div class="result-report-stats"><div><strong>{{ final_issue_counts.template }}</strong><span>模板规范</span></div><div><strong>{{ final_issue_counts.attachment }}</strong><span>附件材料</span></div><div><strong>{{ final_issue_counts.performance }}</strong><span>业绩合同</span></div><div><strong>{{ final_issue_counts.file }}</strong><span>文件自身</span></div></div></section>
+        <div class="result-report-columns"><aside class="result-report-index"><h3>问题索引</h3><div><strong>模板规范</strong><span>{{ final_issue_counts.template }} 项</span></div><div><strong>附件材料</strong><span>{{ final_issue_counts.attachment }} 项</span></div><div><strong>业绩合同</strong><span>{{ final_issue_counts.performance }} 项</span></div><div><strong>文件自身</strong><span>{{ final_issue_counts.file }} 项</span></div><div><strong>优先复核</strong><span>原始文件元数据与招标原文</span></div></aside><main class="result-report-main"><section><div class="result-report-section-head"><h3>业绩合同</h3><span>{{ final_issue_counts.performance }} 项</span></div>{% if final_issue_counts.performance == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_performance_issues(performance_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>附件材料</h3><span>{{ final_issue_counts.attachment }} 项</span></div>{% if final_issue_counts.attachment == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_attachment_issues(attachment_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>模板规范</h3><span>{{ final_issue_counts.template }} 项</span></div>{% if final_issue_counts.template == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_template_issues(template_comparisons, text_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>文件自身</h3><span>{{ final_issue_counts.file }} 项</span></div>{{ render_file_requirement_reviews(file_requirement_reviews) }}</section></main></div>
+        <footer class="result-report-foot">说明：证据图片仅用于定位原始材料，不代表页面重新判断了图片真实性。</footer>
+      </div>
+    </div>
+
+    {% if false %}
 
     <section class="card result-summary-card" aria-label="投标文件解析摘要">
       {% set bid_parse_stats = task.result.bid_parse.stats|default(task.result.bid_parse, true) %}
@@ -444,6 +806,88 @@
         </div>
       </section>
     {% endif %}
+    {% set performance_reviews = task.result.review_result.performance_reviews|default([], true) %}
+    {% if performance_reviews %}
+      <section class="comparison-section review-results-section" aria-labelledby="performance-results-heading">
+        <div class="section-heading result-section-heading">
+          <div>
+            <span class="section-number">PERFORMANCE CONTRACT REVIEW</span>
+            <h2 id="performance-results-heading">业绩合同材料检查结果</h2>
+          </div>
+          <span class="requirement-count">{{ performance_reviews|length }} 项</span>
+        </div>
+        <p class="comparison-muted">本轮按 21.x 子章节独立检查；每个材料单元只能使用自己的文本、图片和附件，合同签署页还必须有可辨认的签署日期；无法可靠判断的内容标记为待确认。</p>
+        <div class="comparison-table-wrap">
+          <table class="comparison-table review-results-table">
+            <thead>
+              <tr>
+                <th scope="col">材料单元</th>
+                <th scope="col">总体状态</th>
+                <th scope="col">合同类型</th>
+                <th scope="col">识别材料</th>
+                <th scope="col">逐项检查与证据</th>
+                <th scope="col">LLM 耗时</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for review in performance_reviews %}
+                <tr>
+                  <td>
+                    <strong>{{ review.case_type|default(review.bid_module_name, true) }}</strong>
+                    <small>章节：{{ review.bid_section_id }}</small>
+                    <small>证据图片：{{ review.image_ids|join("、") if review.image_ids else "无" }}</small>
+                    <small>送模图片：{{ review.model_image_ids|join("、") if review.model_image_ids else "无" }}</small>
+                    {% set ocr_scan = review.ocr_scan|default({}, true) %}
+                    <small>OCR：{{ ocr_scan.available_image_count|default(0, true) }}/{{ ocr_scan.image_count|default(0, true) }} 张；缓存命中 {{ ocr_scan.cache_hit_count|default(0, true) }} 张</small>
+                  </td>
+                  <td>
+                    <span class="comparison-status comparison-status-{{ review.status }}">
+                      {% if review.execution_status == "failed" %}调用失败
+                      {% elif review.status == "pass" %}检查通过
+                      {% elif review.status == "fail" %}检查不通过
+                      {% else %}待确认{% endif %}
+                    </span>
+                    <small>{{ review.summary }}</small>
+                  </td>
+                  <td class="comparison-info-cell">
+                    {% set framework = review.framework_contract|default({}, true) %}
+                    {% if framework.status == "yes" %}合同类型：框架合同
+                    {% elif framework.status == "no" %}合同类型：非框架合同
+                    {% else %}合同类型：待确认{% endif %}
+                    {% if framework.reason %}<small>{{ framework.reason }}</small>{% endif %}
+                    {% if framework.evidence_image_ids %}<small>证据：{{ framework.evidence_image_ids|join("、") }}</small>{% endif %}
+                  </td>
+                  <td class="comparison-info-cell">
+                    {% if review.materials %}
+                      <ul class="review-issue-list">
+                        {% for material in review.materials %}
+                          <li><strong>{{ material.material_type }}</strong>（{{ material.role|default("other", true) }}；证据：{{ material.image_ids|join("、") if material.image_ids else "无" }}）</li>
+                        {% endfor %}
+                      </ul>
+                    {% else %}
+                      <span class="comparison-muted">未识别到可确认材料</span>
+                    {% endif %}
+                  </td>
+                  <td class="comparison-info-cell">
+                    {% if review.checks %}
+                      <ul class="review-issue-list">
+                        {% for check in review.checks %}
+                          <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+                        {% endfor %}
+                      </ul>
+                    {% else %}
+                      <span class="comparison-muted">未形成逐项检查结论</span>
+                    {% endif %}
+                  </td>
+                  <td>{{ review.llm_elapsed_ms|default("—", true) }}{% if review.llm_elapsed_ms is not none %} ms{% endif %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    {% endif %}
+    {% endif %}
     {% include "_back_to_top.html" %}
   {% else %}
     <header class="page-heading task-page-heading">
@@ -528,7 +972,43 @@
 {% endblock %}
 
 {% block scripts %}
-  {% if task.status in ["pending", "running"] %}
+  {% if task.status == "complete" %}
+    <script>
+      (() => {
+        const switcher = document.querySelector("[data-result-style-switcher]");
+        if (!switcher) return;
+        const buttons = [...switcher.querySelectorAll("[data-result-style]")];
+        const views = [...document.querySelectorAll("[data-result-style-view]")];
+        const styles = buttons.map((button) => button.dataset.resultStyle);
+        const storageKey = "bid-check-result-style";
+        let selected = "workbench";
+        try {
+          const stored = window.localStorage.getItem(storageKey);
+          if (styles.includes(stored)) selected = stored;
+        } catch (error) {
+          selected = "workbench";
+        }
+        const applyStyle = (style) => {
+          const activeStyle = styles.includes(style) ? style : "workbench";
+          buttons.forEach((button) => {
+            const active = button.dataset.resultStyle === activeStyle;
+            button.setAttribute("aria-selected", String(active));
+            button.setAttribute("aria-pressed", String(active));
+          });
+          views.forEach((view) => {
+            view.dataset.active = String(view.dataset.resultStyleView === activeStyle);
+          });
+          try {
+            window.localStorage.setItem(storageKey, activeStyle);
+          } catch (error) {
+            // Private browsing or disabled storage should not block switching.
+          }
+        };
+        buttons.forEach((button) => button.addEventListener("click", () => applyStyle(button.dataset.resultStyle)));
+        applyStyle(selected);
+      })();
+    </script>
+  {% elif task.status in ["pending", "running"] %}
     <script src="{{ url_for('static', path='task.js') }}" defer></script>
   {% endif %}
 {% endblock %}

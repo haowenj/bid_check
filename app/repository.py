@@ -160,6 +160,32 @@ class BidCheckRepository:
             ).fetchone()
         return int(row["count"])
 
+    def list_tasks(self) -> list[BidCheckTask]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM bid_check_tasks ORDER BY sequence DESC"
+            ).fetchall()
+        return [
+            task
+            for row in rows
+            if (task := self._record_from_row(row)) is not None
+        ]
+
+    def delete_task(self, task_id: str) -> BidCheckTask:
+        with self._write_lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM bid_check_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            task = self._record_from_row(row)
+            if task is None:
+                raise KeyError(task_id)
+            connection.execute(
+                "DELETE FROM bid_check_tasks WHERE task_id = ?",
+                (task_id,),
+            )
+        return task
+
     def update_stage(
         self,
         task_id: str,

@@ -46,10 +46,24 @@ class SupplementalMaterial(TypedDict):
     source: TenderSource
 
 
+class FileRequirement(TypedDict):
+    id: str
+    name: str
+    requirement: str
+    target: str
+    requirement_type: str
+    constraint_status: str
+    parameters: dict[str, Any]
+    auto_checkable: bool
+    support_reason: str
+    source: TenderSource
+
+
 class TenderExtractionResult(TypedDict):
     templates: list[TenderTemplate]
     project_requirements: list[ProjectRequirement]
     supplemental_materials: list[SupplementalMaterial]
+    file_requirements: list[FileRequirement]
 
 
 @dataclass(frozen=True)

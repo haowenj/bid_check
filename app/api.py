@@ -22,15 +22,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.bid_document import (
-    MinerUBidDocumentParser,
-    parse_bid_document as clean_bid_document,
-)
 from app.attachment_review import (
     DeterministicAttachmentReviewLLM,
     OpenAICompatibleAttachmentReviewLLM,
     run_compliance_review_with_attachments,
 )
+from app.bid_document import MinerUBidDocumentParser
+from app.bid_document import parse_bid_document as clean_bid_document
 from app.compliance_extraction import (
     DeterministicComplianceLLM,
     DocumentParser,
@@ -55,6 +53,17 @@ STAGE_LABELS = {
     "requirements": "提取招标文件检查对象",
     "bid_parse": "解析投标文件",
     "review": "执行合规性检查",
+}
+TASK_STATUS_LABELS = {
+    "pending": "未开始",
+    "running": "检查中",
+    "complete": "已完成",
+    "failed": "失败",
+}
+CHECK_MODE_LABELS = {
+    "compliance": "标书合规性校验",
+    "evaluation": "评标规则校验",
+    "full": "全面校验",
 }
 
 
@@ -239,6 +248,131 @@ def _attach_attachment_reviews(
     return comparisons
 
 
+def _count_problem_reviews(
+    reviews: Any,
+    *,
+    include_semantic_skipped: bool = False,
+    include_not_supported: bool = False,
+) -> int:
+    if not isinstance(reviews, list):
+        return 0
+    count = 0
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        execution_status = review.get("execution_status", "")
+        if execution_status == "failed":
+            count += 1
+        elif include_semantic_skipped and execution_status == "semantic_skipped":
+            count += 1
+        elif include_not_supported and review.get("status") == "not_supported":
+            count += 1
+        elif review.get("status") in {"fail", "uncertain"}:
+            count += 1
+    return count
+
+
+def _load_file_requirement_review_for_page(task: BidCheckTask) -> dict[str, Any]:
+    """Read the standalone file-review artifact before using stored fallback data."""
+
+    artifact_path = (
+        Path(task.tender_file.storage_path).parent
+        / "compliance_extraction"
+        / "10_file_requirement_reviews.json"
+    )
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        artifact = None
+    if isinstance(artifact, dict):
+        reviews = artifact.get("requirements", artifact.get("file_requirement_reviews", []))
+        return {
+            "source": "artifact",
+            "reviews": reviews if isinstance(reviews, list) else [],
+            "original_file": artifact.get("original_file", {}),
+            "stats": artifact.get("stats", {}),
+        }
+
+    result = task.result if isinstance(task.result, dict) else {}
+    review_result = result.get("review_result")
+    if not isinstance(review_result, dict):
+        review_result = {}
+    reviews = review_result.get("file_requirement_reviews", [])
+    return {
+        "source": "review_result",
+        "reviews": reviews if isinstance(reviews, list) else [],
+        "original_file": review_result.get("file_requirement_original_file", {}),
+        "stats": review_result.get("file_requirement_stats", {}),
+    }
+
+
+def _task_issue_counts(task: BidCheckTask) -> dict[str, int]:
+    """Build list-page counts using the same result sources as the detail page."""
+
+    result = task.result if isinstance(task.result, dict) else {}
+    review_result = result.get("review_result")
+    if not isinstance(review_result, dict):
+        review_result = {}
+
+    bid_document = _load_bid_document_for_page(task)
+    template_comparisons = build_template_comparisons(
+        result.get("templates", []),
+        bid_document.get("sections", []) if bid_document else [],
+    )
+    template_issues = sum(
+        comparison.get("status") in {"unmatched", "ambiguous"}
+        for comparison in template_comparisons
+        if isinstance(comparison, dict)
+    )
+    template_issues += _count_problem_reviews(
+        review_result.get("template_text_reviews"),
+        include_semantic_skipped=True,
+    )
+    attachment_issues = _count_problem_reviews(
+        review_result.get("attachment_reviews"),
+        include_semantic_skipped=True,
+    )
+    performance_issues = _count_problem_reviews(
+        review_result.get("performance_reviews")
+    )
+    file_requirement_data = _load_file_requirement_review_for_page(task)
+    file_requirement_issues = _count_problem_reviews(
+        file_requirement_data["reviews"],
+        include_not_supported=True,
+    )
+    return {
+        "template": int(template_issues),
+        "attachment": int(attachment_issues),
+        "performance": int(performance_issues),
+        "file": int(file_requirement_issues),
+    }
+
+
+def _build_task_list_rows(tasks: list[BidCheckTask]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        issue_counts = _task_issue_counts(task) if task.result else {
+            "template": 0,
+            "attachment": 0,
+            "performance": 0,
+            "file": 0,
+        }
+        rows.append(
+            {
+                "task": task,
+                "status_label": TASK_STATUS_LABELS.get(task.status, task.status),
+                "check_mode_label": CHECK_MODE_LABELS.get(
+                    task.check_mode, task.check_mode
+                ),
+                "created_at_display": task.created_at.replace("T", " ", 1)[:19],
+                "issue_counts": issue_counts,
+                "total_issue_count": sum(issue_counts.values()),
+                "has_result": isinstance(task.result, dict),
+            }
+        )
+    return rows
+
+
 def build_default_workflow(
     settings: Settings,
     repository: BidCheckRepository,
@@ -309,12 +443,14 @@ def build_default_workflow(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,
             attachment_review_llm=attachment_review_llm,
+            performance_text_llm=template_review_llm,
         ),
         extract_with_recorder=extract_requirements,
         review_with_recorder=partial(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,
             attachment_review_llm=attachment_review_llm,
+            performance_text_llm=template_review_llm,
         ),
     )
     return BidCheckWorkflow(repository, services)
@@ -362,6 +498,18 @@ def create_app(
             context={},
         )
 
+    @application.get("/bid-check/tasks", response_class=HTMLResponse)
+    def bid_check_tasks_page(request: Request):
+        task_rows = _build_task_list_rows(active_repository.list_tasks())
+        return templates.TemplateResponse(
+            request=request,
+            name="bid_check_tasks.html",
+            context={
+                "task_rows": task_rows,
+                "task_count": len(task_rows),
+            },
+        )
+
     @application.get(
         "/bid-check/tasks/{task_id}",
         response_class=HTMLResponse,
@@ -375,6 +523,7 @@ def create_app(
             )
         bid_document = _load_bid_document_for_page(task)
         result = task.result if isinstance(task.result, dict) else {}
+        file_requirement_data = _load_file_requirement_review_for_page(task)
         template_comparisons = build_template_comparisons(
             result.get("templates", []),
             bid_document.get("sections", []) if bid_document else [],
@@ -394,6 +543,9 @@ def create_app(
                 "task": task,
                 "bid_document": bid_document,
                 "template_comparisons": template_comparisons,
+                "file_requirement_reviews": file_requirement_data["reviews"],
+                "file_requirement_original_file": file_requirement_data["original_file"],
+                "file_requirement_stats": file_requirement_data["stats"],
                 "failed_stage_label": STAGE_LABELS.get(task.failed_stage),
             },
         )
@@ -465,6 +617,72 @@ def create_app(
                 status_code=404,
                 detail="标书检查任务不存在。",
             )
-        return task.to_dict()
+        payload = task.to_dict()
+        file_requirement_data = _load_file_requirement_review_for_page(task)
+        if (
+            file_requirement_data["source"] == "artifact"
+            or file_requirement_data["reviews"]
+        ):
+            review_result = payload.get("review_result")
+            review_result = dict(review_result) if isinstance(review_result, dict) else {}
+            review_result["file_requirement_reviews"] = file_requirement_data["reviews"]
+            review_result["file_requirement_stats"] = file_requirement_data["stats"]
+            review_result["file_requirement_original_file"] = file_requirement_data[
+                "original_file"
+            ]
+            payload["review_result"] = review_result
+        return payload
+
+    @application.delete("/api/bid-check/tasks/{task_id}")
+    def delete_bid_check_task(task_id: str):
+        task = active_repository.get(task_id)
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail="标书检查任务不存在。",
+            )
+        if task.status in {"pending", "running"}:
+            raise HTTPException(
+                status_code=409,
+                detail="任务正在执行，无法删除，请稍后重试。",
+            )
+
+        tasks_root = active_settings.tasks_dir.resolve()
+        task_dir_path = active_settings.tasks_dir / task_id
+        if task_dir_path.is_symlink():
+            logger.error("task.delete.invalid_path task_id=%s", task_id)
+            raise HTTPException(
+                status_code=500,
+                detail="任务产出目录不安全，未执行删除。",
+            )
+        task_dir = task_dir_path.resolve()
+        if task_dir.parent != tasks_root:
+            logger.error("task.delete.invalid_path task_id=%s", task_id)
+            raise HTTPException(
+                status_code=500,
+                detail="任务产出目录不安全，未执行删除。",
+            )
+        try:
+            if task_dir.exists():
+                if not task_dir.is_dir():
+                    raise OSError("任务产出路径不是目录")
+                shutil.rmtree(task_dir)
+            active_repository.delete_task(task_id)
+        except OSError as exc:
+            logger.exception(
+                "task.delete.filesystem_error task_id=%s error_type=%s",
+                task_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="任务产出数据删除失败，数据库记录未删除。",
+            ) from exc
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="标书检查任务不存在。",
+            ) from exc
+        return {"task_id": task_id, "deleted": True}
 
     return application

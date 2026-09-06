@@ -77,6 +77,70 @@ def test_functional_regions_are_semantic_and_stop_at_excluded_sections():
     assert "商务评分" not in "\n".join(region.text for region in regions)
 
 
+def test_file_requirement_candidates_keep_front_table_whole_and_exclude_irrelevant_regions():
+    blocks = [
+        block("b1", "heading", "第二章 投标人须知", "第二章 投标人须知", 1),
+        block(
+            "b2",
+            "heading",
+            "投标人须知前附表",
+            "第二章 投标人须知",
+            2,
+        ),
+        block(
+            "b3",
+            "table",
+            "电子投标文件格式 | PDF\n文件大小 | 不得超过 200MB\n文件名称 | 应包含项目名称和投标人名称",
+            "第二章 投标人须知",
+            3,
+        ),
+        block(
+            "b4",
+            "heading",
+            "投标文件递交",
+            "第二章 投标人须知",
+            4,
+        ),
+        block(
+            "b5",
+            "paragraph",
+            "电子投标文件采用 PDF 格式上传。",
+            "第二章 投标人须知",
+            5,
+        ),
+        block("b6", "heading", "第六章 投标文件格式", "第六章 投标文件格式", 6),
+        block("b7", "paragraph", "投标函模板字段和签章位置。", "第六章 投标文件格式", 7),
+        block("b8", "heading", "第三章 评标办法", "第三章 评标办法", 8),
+        block("b9", "paragraph", "商务评分满分 20 分。", "第三章 评标办法", 9),
+        block("b10", "heading", "合同条款", "合同条款", 10),
+        block("b11", "paragraph", "合同总价及付款方式。", "合同条款", 11),
+    ]
+
+    candidate_builder = getattr(
+        extraction_module,
+        "build_file_requirement_candidates",
+        None,
+    )
+    assert candidate_builder is not None
+
+    candidates = candidate_builder(blocks)
+    assert candidates
+    front_table_candidates = [
+        candidate
+        for candidate in candidates
+        if "投标人须知前附表" in candidate.text
+    ]
+    assert len(front_table_candidates) == 1
+    assert "不得超过 200MB" in front_table_candidates[0].text
+    assert "应包含项目名称和投标人名称" in front_table_candidates[0].text
+    assert any("电子投标文件采用 PDF 格式上传" in candidate.text for candidate in candidates)
+    assert all(candidate.kind == "file_requirements" for candidate in candidates)
+    candidate_text = "\n".join(candidate.text for candidate in candidates)
+    assert "商务评分满分" not in candidate_text
+    assert "合同总价及付款方式" not in candidate_text
+    assert "投标函模板字段" not in candidate_text
+
+
 def test_plain_paragraph_front_table_title_is_recognized_but_toc_entry_is_not():
     blocks = [
         block("b1", "heading", "第二章 投标人须知", "第二章 投标人须知", 1),
@@ -1608,7 +1672,7 @@ def test_openai_prompt_limits_llm_to_three_object_collections(monkeypatch):
     assert "name、rule、condition" not in prompt
 
 
-def test_main_extractor_returns_complete_three_collection_result_and_artifacts(tmp_path):
+def test_main_extractor_returns_complete_four_collection_result_and_artifacts(tmp_path):
     task_dir = tmp_path / "task-001"
     task_dir.mkdir()
     tender = task_dir / "tender.docx"
@@ -1634,7 +1698,12 @@ def test_main_extractor_returns_complete_three_collection_result_and_artifacts(t
         recorder=recorder,
     )
 
-    assert set(result) == {"templates", "project_requirements", "supplemental_materials"}
+    assert set(result) == {
+        "templates",
+        "project_requirements",
+        "supplemental_materials",
+        "file_requirements",
+    }
     assert "requirements" not in result
     assert [item["name"] for item in result["templates"]] == ["投标函"]
     assert result["templates"][0]["body"] == "投标函\n投标人名称：____"
@@ -1650,6 +1719,8 @@ def test_main_extractor_returns_complete_three_collection_result_and_artifacts(t
             "03_templates.json",
             "04_project_requirements.json",
             "05_supplemental_materials.json",
+            "08_file_requirement_candidates.json",
+            "09_file_requirements.json",
             "06_filter_report.json",
             "07_result.json",
             "summary.json",

@@ -53,6 +53,33 @@ def test_requirements_and_parse_enter_concurrently(task_repository):
     assert task.review_status == "complete"
 
 
+def test_workflow_passes_original_bid_file_metadata_into_review(task_repository):
+    observed: list[dict] = []
+
+    def review(requirements, parsed):
+        observed.append(parsed)
+        return {"mode": "mock"}
+
+    workflow = BidCheckWorkflow(
+        task_repository,
+        BidCheckServices(
+            extract=lambda file_metadata: empty_objects(),
+            parse=lambda file_metadata: {"status": "success"},
+            review=review,
+        ),
+    )
+    try:
+        workflow.run("task-001")
+    finally:
+        workflow.shutdown()
+
+    assert observed[0]["original_file_metadata"] == {
+        "filename": "投标文件.docx",
+        "size": len(b"docx-bid"),
+        "storage_path": observed[0]["original_file_metadata"]["storage_path"],
+    }
+
+
 def make_workflow(repository, extract, parse, review_calls):
     def review(requirements, parsed):
         review_calls.append((requirements, parsed))

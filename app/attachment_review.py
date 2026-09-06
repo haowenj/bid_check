@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.file_requirement_review import run_file_requirement_review
 from app.navigation_content import (
     filter_navigation_sections,
     filter_navigation_templates,
@@ -639,6 +640,11 @@ def _collect_section_images(
                 "source_type": image.get("source_type"),
                 "source_table_id": image.get("source_table_id"),
                 "source_table_block_id": image.get("source_table_block_id"),
+                "ocr_status": image.get("ocr_status"),
+                "ocr_source": image.get("ocr_source"),
+                "ocr_text": image.get("ocr_text"),
+                "ocr_blocks": copy.deepcopy(image.get("ocr_blocks", [])),
+                "ocr_text_block_count": image.get("ocr_text_block_count", 0),
             }
         )
 
@@ -1548,10 +1554,12 @@ def run_compliance_review_with_attachments(
     *,
     template_review_llm: Any,
     attachment_review_llm: AttachmentReviewLLM,
+    performance_text_llm: Any | None = None,
     recorder: ComplianceExtractionRecorder | None = None,
 ) -> dict[str, Any]:
     """Compose the stable text review with the scoped attachment review."""
 
+    from app.performance_review import run_performance_contract_review
     from app.template_text_review import run_template_text_review
 
     text_result = run_template_text_review(
@@ -1566,10 +1574,39 @@ def run_compliance_review_with_attachments(
         llm=attachment_review_llm,
         recorder=recorder,
     )
-    if not attachment_result["attachment_reviews"]:
+    performance_result = run_performance_contract_review(
+        extraction_result,
+        parsed_bid,
+        llm=attachment_review_llm,
+        text_llm=performance_text_llm,
+        recorder=recorder,
+    )
+    file_result = run_file_requirement_review(
+        extraction_result,
+        parsed_bid,
+        recorder=recorder,
+    )
+    has_attachments = bool(attachment_result["attachment_reviews"])
+    has_performance = bool(performance_result["performance_reviews"])
+    has_file_requirements = bool(file_result["file_requirement_reviews"])
+    if not has_attachments and not has_performance and not has_file_requirements:
         return text_result
     combined = dict(text_result)
-    combined["mode"] = "template_text_and_attachments"
-    combined["attachment_reviews"] = attachment_result["attachment_reviews"]
-    combined["attachment_stats"] = attachment_result["stats"]
+    mode_parts = ["template_text"]
+    if has_attachments:
+        mode_parts.append("attachments")
+    if has_performance:
+        mode_parts.append("performance")
+    if has_file_requirements:
+        mode_parts.append("file_requirements")
+    combined["mode"] = "_and_".join(mode_parts)
+    if has_attachments:
+        combined["attachment_reviews"] = attachment_result["attachment_reviews"]
+        combined["attachment_stats"] = attachment_result["stats"]
+    combined["performance_reviews"] = performance_result["performance_reviews"]
+    combined["performance_stats"] = performance_result["stats"]
+    if has_file_requirements:
+        combined["file_requirement_reviews"] = file_result["file_requirement_reviews"]
+        combined["file_requirement_stats"] = file_result["stats"]
+        combined["file_requirement_original_file"] = file_result["original_file"]
     return combined

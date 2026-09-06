@@ -13,13 +13,13 @@ import unicodedata
 import urllib.parse
 import zipfile
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
-
 
 _SOURCE_KEY = "_bid_source"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
@@ -29,6 +29,8 @@ SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
 DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 2.0
 DOCUMENT_SCHEMA_VERSION = "bid-document-v1"
+IMAGE_OCR_SCHEMA_VERSION = "bid-image-ocr-v1"
+IMAGE_OCR_MAX_WORKERS = 3
 _EDGE_RATIO = 0.2
 _COMPLETE_ENDINGS = frozenset("。！？.!?；;…")
 _CLOSING_CHARS = frozenset("\"'”’）)]】》」』")
@@ -60,7 +62,7 @@ def _payload_items(payload: Any) -> tuple[list[Any], list[int]]:
                 return value, []
         raise ValueError("MinerU 返回结果不是结构化内容列表。")
     if not isinstance(payload, list):
-        raise ValueError("MinerU 返回结果不是结构化内容列表。")
+        raise TypeError("MinerU 返回结果不是结构化内容列表。")
     if (
         len(payload) == 2
         and isinstance(payload[0], dict)
@@ -485,7 +487,7 @@ def merge_items(items: Sequence[Any]) -> tuple[list[Any], list[dict[str, Any]]]:
             next_index += 1
 
         merged_items.append(current)
-        index = next_index if next_index > index + 1 else index + 1
+        index = max(index + 1, next_index)
 
     return merged_items, logs
 
@@ -963,13 +965,16 @@ def structure_content_list(
             metadata["image_ids"] = table_image_ids
         elif kind == "image":
             caption = text if not text.startswith("[MinerU ") else ""
-            if register_image(
+            image_id = register_image(
                 raw.get("img_path"),
                 common=common,
                 caption=caption,
                 source_type="image",
-            ) is None:
+            )
+            if image_id is None:
                 append_unresolved_image(common=common, caption=caption)
+            else:
+                metadata["image_id"] = image_id
 
     block_dicts = [asdict(block) for block in blocks]
     page_indices = {
@@ -1020,6 +1025,66 @@ def structure_content_list(
             "unsupported_item_count": len(unsupported_items),
         },
     }
+
+
+def _resolve_image_asset_path(image: dict[str, Any], artifact_dir: Path) -> Path | None:
+    reference = image.get("img_path")
+    if not isinstance(reference, str) or not reference.strip():
+        return None
+    root = artifact_dir.expanduser().resolve()
+    raw_path = Path(reference)
+    candidates = (
+        [raw_path]
+        if raw_path.is_absolute()
+        else [root / raw_path, root / "images" / raw_path]
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved == root or root not in resolved.parents:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _image_ocr_source_blocks(payload: Any) -> list[dict[str, Any]]:
+    flattened = flatten_mineru_content_list(payload)
+    cleaned, _cleaning_log = clean_items(flattened)
+    merged, _merge_log = merge_items(cleaned)
+    document = structure_content_list(
+        merged,
+        source_filename="image-ocr",
+        parser_diagnostics={"parser": "mineru_image_ocr"},
+    )
+    source_blocks: list[dict[str, Any]] = []
+    for block in document.get("blocks", []):
+        if not isinstance(block, dict) or block.get("type") not in {
+            "heading",
+            "paragraph",
+        }:
+            continue
+        text = block.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        metadata = block.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        source_blocks.append(
+            {
+                "mineru_block_id": str(block.get("block_id")),
+                "text": text.strip(),
+                "type": str(block.get("type")),
+                "order": block.get("order", len(source_blocks) + 1),
+                "source_item_indices": copy.deepcopy(
+                    metadata.get("source_item_indices", [])
+                ),
+                "source_page_indices": copy.deepcopy(
+                    metadata.get("source_page_indices", [])
+                ),
+                "source_bboxes": copy.deepcopy(metadata.get("source_bboxes", [])),
+                "source_paths": copy.deepcopy(metadata.get("source_paths", [])),
+            }
+        )
+    return source_blocks
 
 
 class BidDocumentCleaningError(RuntimeError):
@@ -1089,6 +1154,19 @@ class MinerUBidDocumentParser:
         )
         diagnostics.update(asset_diagnostics)
         self._apply_asset_statuses(document, asset_statuses)
+        image_ocr_diagnostics = self._ocr_images(
+            document,
+            artifact_dir=artifact_dir,
+        )
+        diagnostics["image_ocr"] = image_ocr_diagnostics
+        document["stats"].update(
+            {
+                "image_ocr_available_count": image_ocr_diagnostics[
+                    "available_image_count"
+                ],
+                "image_ocr_failed_count": image_ocr_diagnostics["failed_count"],
+            }
+        )
         document["diagnostics"] = copy.deepcopy(diagnostics)
 
         artifacts = {
@@ -1147,6 +1225,237 @@ class MinerUBidDocumentParser:
             "artifacts": {key: str(value) for key, value in artifacts.items()},
             "stats": stats,
             "diagnostics": diagnostics,
+        }
+
+    def _ocr_images(
+        self,
+        document: dict[str, Any],
+        *,
+        artifact_dir: Path,
+    ) -> dict[str, Any]:
+        images = [
+            image
+            for image in document.get("images", [])
+            if isinstance(image, dict) and image.get("image_id")
+        ]
+        blocks_by_id = {
+            str(block.get("block_id")): block
+            for block in document.get("blocks", [])
+            if isinstance(block, dict) and block.get("block_id")
+        }
+        results: dict[str, dict[str, Any]] = {}
+        pending: list[tuple[dict[str, Any], Path]] = []
+        for image in images:
+            image_path = _resolve_image_asset_path(image, artifact_dir)
+            if image_path is None:
+                results[str(image["image_id"])] = {
+                    "status": "unavailable",
+                    "source": "asset_unavailable",
+                    "cache_hit": False,
+                    "blocks": [],
+                    "elapsed_ms": 0,
+                    "error_type": "ImageAssetUnavailable",
+                    "error_message": "图片资源未成功落盘，无法执行图片 OCR。",
+                }
+                continue
+            pending.append((image, image_path))
+
+        started_at = time.perf_counter()
+        if pending:
+            with ThreadPoolExecutor(
+                max_workers=min(IMAGE_OCR_MAX_WORKERS, len(pending))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._ocr_one_image,
+                        image,
+                        image_path,
+                        artifact_dir / "image_ocr",
+                    ): image
+                    for image, image_path in pending
+                }
+                for future in as_completed(futures):
+                    image = futures[future]
+                    image_id = str(image["image_id"])
+                    try:
+                        results[image_id] = future.result()
+                    except Exception as exc:  # noqa: BLE001 - preserve document output
+                        results[image_id] = {
+                            "status": "unavailable",
+                            "source": "mineru_image_ocr",
+                            "cache_hit": False,
+                            "blocks": [],
+                            "elapsed_ms": 0,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        }
+
+        ordered_results: list[dict[str, Any]] = []
+        for image in images:
+            image_id = str(image["image_id"])
+            result = results.get(
+                image_id,
+                {
+                    "status": "unavailable",
+                    "source": "not_processed",
+                    "cache_hit": False,
+                    "blocks": [],
+                    "elapsed_ms": 0,
+                    "error_type": "ImageOCRNotProcessed",
+                    "error_message": "图片 OCR 未执行。",
+                },
+            )
+            raw_blocks = result.get("blocks", [])
+            decorated_blocks = []
+            for index, raw_block in enumerate(raw_blocks, start=1):
+                if not isinstance(raw_block, dict):
+                    continue
+                mineru_block_id = str(
+                    raw_block.get("mineru_block_id") or raw_block.get("block_id")
+                    or f"b{index:04d}"
+                )
+                decorated_blocks.append(
+                    {
+                        **copy.deepcopy(raw_block),
+                        "block_id": f"ocr-{image_id}-{mineru_block_id}",
+                        "mineru_block_id": mineru_block_id,
+                        "image_id": image_id,
+                        "image_block_id": image.get("block_id"),
+                        "section_path": copy.deepcopy(image.get("section_path", [])),
+                    }
+                )
+            image["ocr_status"] = (
+                "available" if result.get("status") == "available" and decorated_blocks else "unavailable"
+            )
+            image["ocr_source"] = result.get("source", "unknown")
+            image["ocr_text"] = "\n".join(
+                block["text"] for block in decorated_blocks if block.get("text")
+            )
+            image["ocr_blocks"] = decorated_blocks
+            image["ocr_text_block_count"] = len(decorated_blocks)
+            image_ocr_metadata = {
+                "status": image["ocr_status"],
+                "source": image["ocr_source"],
+                "image_id": image_id,
+                "image_block_id": image.get("block_id"),
+                "section_path": copy.deepcopy(image.get("section_path", [])),
+                "text_block_ids": [
+                    block["block_id"] for block in decorated_blocks
+                ],
+            }
+            image_block = blocks_by_id.get(str(image.get("block_id")))
+            if image_block is not None:
+                metadata = image_block.setdefault("metadata", {})
+                if image_block.get("type") == "image":
+                    metadata["image_id"] = image_id
+                    metadata["image_ocr"] = image_ocr_metadata
+                else:
+                    metadata.setdefault("image_ocr_by_id", {})[image_id] = (
+                        image_ocr_metadata
+                    )
+            ordered_result = {
+                "image_id": image_id,
+                "status": image["ocr_status"],
+                "source": image["ocr_source"],
+                "cache_hit": bool(result.get("cache_hit")),
+                "text_block_count": len(decorated_blocks),
+                "text_length": len(image["ocr_text"]),
+                "elapsed_ms": result.get("elapsed_ms", 0),
+            }
+            if result.get("error_message"):
+                ordered_result.update(
+                    {
+                        "error_type": result.get("error_type", "ImageOCRUnavailable"),
+                        "error_message": result["error_message"],
+                    }
+                )
+            ordered_results.append(ordered_result)
+
+        available_count = sum(
+            result["status"] == "available" for result in ordered_results
+        )
+        return {
+            "schema_version": IMAGE_OCR_SCHEMA_VERSION,
+            "status": (
+                "complete"
+                if available_count == len(images)
+                else "partial"
+                if available_count
+                else "unavailable"
+            ),
+            "image_count": len(images),
+            "available_image_count": available_count,
+            "image_results": ordered_results,
+            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+            "engine_call_count": sum(
+                result["source"] == "mineru_image_ocr"
+                for result in ordered_results
+            ),
+            "processed_image_count": sum(
+                result["source"]
+                in {"mineru_image_ocr", "mineru_image_ocr_cache"}
+                for result in ordered_results
+            ),
+            "cache_hit_count": sum(
+                bool(result["cache_hit"]) for result in ordered_results
+            ),
+            "failed_count": sum(
+                int(result["status"] == "unavailable")
+                for result in ordered_results
+            ),
+        }
+
+    def _ocr_one_image(
+        self,
+        image: dict[str, Any],
+        image_path: Path,
+        cache_dir: Path,
+    ) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        image_sha256 = _sha256_file(image_path)
+        cache_path = cache_dir / f"{image_sha256}.json"
+        cache_payload: dict[str, Any] | None = None
+        if cache_path.is_file():
+            try:
+                candidate = json.loads(cache_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("schema_version") == IMAGE_OCR_SCHEMA_VERSION
+                    and candidate.get("image_sha256") == image_sha256
+                    and isinstance(candidate.get("blocks"), list)
+                ):
+                    cache_payload = candidate
+            except (OSError, json.JSONDecodeError):
+                cache_payload = None
+        if cache_payload is not None:
+            return {
+                "status": "available" if cache_payload["blocks"] else "unavailable",
+                "source": "mineru_image_ocr_cache",
+                "cache_hit": True,
+                "blocks": cache_payload["blocks"],
+                "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+            }
+
+        result_zip, _task_id = self._run_mineru_task(image_path)
+        payload, _raw_content_bytes, _content_member, _diagnostics = (
+            self._content_list_from_zip(result_zip)
+        )
+        blocks = _image_ocr_source_blocks(payload)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(
+            cache_path,
+            {
+                "schema_version": IMAGE_OCR_SCHEMA_VERSION,
+                "image_sha256": image_sha256,
+                "blocks": blocks,
+            },
+        )
+        return {
+            "status": "available" if blocks else "unavailable",
+            "source": "mineru_image_ocr",
+            "cache_hit": False,
+            "blocks": blocks,
+            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
         }
 
     def _run_mineru_task(self, path: Path) -> tuple[bytes, str]:

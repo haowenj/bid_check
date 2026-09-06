@@ -27,10 +27,12 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 - 招标文件要求提取只调用项目现有 MinerU `/tasks` 服务链路；MinerU 配置从环境变量读取，调用失败时任务明确失败；
 - 配置 `LLM_API_KEY` 后，招标对象提取仅在模板边界、模板命名或前附表行存在歧义时使用 OpenAI-compatible Chat Completions；模板文本检查对全部明确匹配且有可靠模块内容的模板各执行一次完整模块对照调用，并发数为 3；未配置时使用安全的 uncertain fallback；
 - MinerU/结构解析结果和各阶段提取结果分别按招标文件内容哈希缓存；
-- 结果页展示完整模板、项目专用编制要求和模板外补充证明材料；
+- 结果页展示完整模板、项目专用编制要求、模板外补充证明材料，以及当前单份投标文件自身的文件级要求；文件级检查仅使用用户原始上传文件的文件名、后缀和 `Path.stat().st_size`，不使用 MinerU 中间文件。
+- 文件级要求提取从结构化招标文件中保留投标人须知/前附表、投标文件编制制作递交、电子投标文件、上传加密解密等完整候选区域，专用 LLM 只返回明确约束当前单份文件的大小、格式、文件名等规则；文件数量、分别提交、备份、多格式组合、U 盘/光盘、纸质副本、密封包装和平台上传能力说明均不进入正式规则。
 - 投标文件清洗阶段已接入真实 MinerU `/tasks` 结果：保留原始 content list、清洗日志、跨页合并日志、章节结构、独立表格和独立图片索引；本阶段不执行模板匹配、附件/字段校验、RAG、LLM 判断、签字盖章识别或最终检查规则。
 - 当前模板文本检查以一个完整招标模板和一个已匹配投标文件模块为一次 LLM 调用；模型先在同一次调用中确认两者的语义、用途和核心内容是否对应，只有确认后才判断文本层面的填写、占位残留、正文遗漏、实质性修改和条件适用性。语义不匹配或不确定只记录为候选状态，不形成业务 fail；本阶段不判断签字、盖章、图片、附件真实性或外部状态。
 - 当前附件检查从完整模板正文中识别明确的普通证明材料要求，仅处理已经明确匹配且不属于 21/21.x 业绩合同内部审查范围的模板；每个模块将正文、表格和结构化关联图片提交给多模态模型，先在同一次调用中确认候选确实是投标时额外提供的独立证明材料，再保存视觉事实并形成附件要求结论。模板正文、表格填写、承诺函、普通签字盖章和未来履约义务不会仅因关键词命中而进入附件业务检查；不判断证件或银行账户真实性，也不处理业绩合同。
+- 21.x 业绩合同检查当前启用 `21.1`～`21.6`：DOCX 首次经过 MinerU 解析时同步对图片做 OCR，并将结果按 `image_id`、图片块和 `section_path` 写入 `structured_document`；检查阶段按每个 21.x 子章节独立收集全部图片及完整 OCR，按原始顺序一次提交给现有文本 LLM，由文本模型提取合同事实、证明材料和签署页候选，不再用关键词筛选结果删减合同正文。只有文本模型定位出的少量签署候选图片，以及 OCR unavailable 图片，交给现有视觉模型，不重复调用图片 OCR。金额、时间、甲乙方和服务内容等事实必须带有对应 `image_id` 及 OCR 原文证据；同时核对业绩情况表当前行与合同项目、合同相对方、金额和服务期限的一致性，不能以顺序对应代替事实一致。签字、盖章和签署日期仍由视觉模型确认。检查证明文件顺序、合同服务内容、实施时间、合同金额、合同签页、合同签署日期及框架合同条件性结算材料；不同 21.x 之间不共享证据。结果写入 `10_performance_reviews.json`，并与现有模板文本/普通附件检查结果汇合展示。
 
 ## 真实要求提取配置
 
@@ -54,7 +56,7 @@ MinerU 未配置、调用失败或结果无法解析时，任务会失败并保�
 - `raw_content_list.json`：从 MinerU ZIP 原样复制的 content list 字节；
 - `cleaned_content_list.json`、`cleaning_log.json`：仅移除确定性的页码、页眉、空白块和单标点噪声，并逐项记录来源；
 - `merged_content_list.json`、`merge_log.json`：只合并跨连续页、位于页边缘且正文未完结的相邻段落；保留参与合并的原始索引、页码、bbox 和 source path；
-- `structured_document.json`：包含 `blocks[]`、`sections[]`、`tables[]`、`images[]` 和 `unsupported_items[]`。表格不拍平为普通正文，图片保留 `img_path`、资源状态、章节路径和来源关系；
+- `structured_document.json`：包含 `blocks[]`、`sections[]`、`tables[]`、`images[]` 和 `unsupported_items[]`。表格不拍平为普通正文，图片保留 `img_path`、资源状态、章节路径和来源关系，并在 `images[]` 中保存一次性 MinerU OCR 的 `ocr_status`、`ocr_source`、`ocr_text`、`ocr_blocks[]` 及其图片块关联；
 - `cleaning_summary.json`：记录源文件 SHA-256、各阶段数量、页/章节/表格/图片统计和 artifact 路径。
 
 也可单独运行清洗器，便于人工检查数据质量：
@@ -69,9 +71,10 @@ uv run python -m app.bid_document \
 
 工作流和对象提取链路使用 Python `logging` 输出阶段日志。默认启动命令会在终端显示 `start`、`end`、`retry` 和 `error` 事件，包括文件名、实际解析器、是否调用 MinerU、对象数量、模型名和耗时；不会记录 API Key。重点事件前缀包括 `workflow.*`、`document.parse.*`、`functional.region.*`、`llm.call.*` 和 `compliance.extract.*`。
 
-每个任务的招标文件目录下会生成 `compliance_extraction/`：`execution.jsonl` 保存结构化执行事件，`01_parsed_blocks.json`、`02_functional_regions.json`、`03_templates.json`、`04_project_requirements.json`、`05_supplemental_materials.json`、`06_filter_report.json` 和 `07_result.json` 保存阶段产物，`08_template_text_reviews.json` 保存本轮全部明确匹配模板的文本检查结果，`09_attachment_reviews.json` 保存普通附件检查的视觉事实与要求结论，`llm/call_NNN_input.json` 和 `llm/call_NNN_output.json` 保存每次调用的脱敏请求、原始响应、解析结果、耗时、finish reason、usage 和错误信息，`semantic_match`、`business_status` 和 `execution_status` 区分候选语义状态与正式业务状态，`stats` 额外保存代码候选数、语义分类、无候选和无证据统计，`summary.json` 保存实际解析器、解析统计、模板/项目要求/补充材料数量及 LLM 调用统计，`workflow_summary.json` 保存并行解析、复核和整个任务耗时。阶段文件在成功后立即写入，后续失败不会清理已有文件。`data/mineru_cache/` 独立保存按解析器版本、MinerU 传输方式、服务地址、后端和文件内容哈希得到的结构解析结果，对象结果缓存也会区分解析器、LLM 模型和批次参数，避免旧结果遮蔽新的提取配置。
+每个任务的招标文件目录下会生成 `compliance_extraction/`：`execution.jsonl` 保存结构化执行事件，`01_parsed_blocks.json`、`02_functional_regions.json`、`03_templates.json`、`04_project_requirements.json`、`05_supplemental_materials.json`、`06_filter_report.json` 和 `07_result.json` 保存阶段产物，`08_file_requirement_candidates.json` 保存文件级 LLM 实际候选上下文及字符统计，`09_file_requirements.json` 保存过滤后的正式单文件要求，`09_file_requirement_filter_report.json` 仅保存被过滤数量和原因，`08_template_text_reviews.json` 保存本轮全部明确匹配模板的文本检查结果，`09_attachment_reviews.json` 保存普通附件检查的视觉事实与要求结论，`10_file_requirement_reviews.json` 保存原始投标文件元数据、每条文件自身要求、实际值、判定和招标原文依据，`10_performance_reviews.json` 保存业绩合同检查结果。`llm/call_NNN_input.json` 和 `llm/call_NNN_output.json` 保存每次调用的脱敏请求、原始响应、解析结果、耗时、finish reason、usage 和错误信息，`semantic_match`、`business_status` 和 `execution_status` 区分候选语义状态与正式业务状态，`stats` 额外保存代码候选数、语义分类、无候选和无证据统计，`summary.json` 保存实际解析器、解析统计、模板/项目要求/补充材料/文件级要求数量及 LLM 调用统计，`workflow_summary.json` 保存并行解析、复核和整个任务耗时。阶段文件在成功后立即写入，后续失败不会清理已有文件。`data/mineru_cache/` 独立保存按解析器版本、MinerU 传输方式、服务地址、后端和文件内容哈希得到的结构解析结果，对象结果缓存也会区分解析器、LLM 模型和批次参数，避免旧结果遮蔽新的提取配置。
 
-最终结果是三类对象：`templates[]` 保存完整模板名称、所属章节、连续 `block_ids`、模板正文、表格、填写项、附件说明和来源；`project_requirements[]` 保存直接影响投标文件组成、编制、容量、形式、有效期、保证金、备选方案和报价格式的项目专用要求及其具体值；`supplemental_materials[]` 保存模板之外明确要求随投标文件提交的证明材料。模板正文和来源原文直接来自 MinerU/DOCX 结构块，LLM 只辅助识别歧义边界、命名或筛选，不生成 `check_type`、`scope`、`evidence_type`、`checks` 等执行字段，也不把模板编译成自然语言规则。评标办法、评分、履约、终验、人员管理、知识产权归属和违约责任不会进入这三类核心结果；明确的项目专用条款优先过滤通用保证金或纸质递交模板。
+最终结果是四类对象：`templates[]` 保存完整模板名称、所属章节、连续 `block_ids`、模板正文、表格、填写项、附件说明和来源；`project_requirements[]` 保存直接影响投标文件组成、编制、容量、形式、有效期、保证金、备选方案和报价格式的项目专用要求及其具体值；`supplemental_materials[]` 保存模板之外明确要求随投标文件提交的证明材料；`file_requirements[]` 保存当前单份投标文件自身的文件级约束。模板正文和来源原文直接来自 MinerU/DOCX 结构块，LLM 只辅助识别歧义边界、命名或筛选，不生成 `check_type`、`scope`、`evidence_type`、`checks` 等执行字段，也不把模板编译成自然语言规则。评标办法、评分、履约、终验、人员管理、知识产权归属和违约责任不会进入这四类核心结果；明确的项目专用条款优先过滤通用保证金或纸质递交模板。
+最终结果另有 `file_requirements[]`：每项包含单份投标文件约束对象、大小/后缀/文件名结构化参数、自动检查能力、来源 block 和原文。文件名只有包含具体字面量时才自动检查；只有“项目名称”“投标人名称”等未提供具体值的泛化命名规则会保留为“无法自动检查”。
 
 ## 测试
 

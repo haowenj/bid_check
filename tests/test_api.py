@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -86,6 +88,46 @@ def test_get_unknown_task_returns_404(client):
     assert response.json()["detail"] == "标书检查任务不存在。"
 
 
+def test_delete_task_removes_database_record_and_task_artifacts(
+    client,
+    repository,
+    settings,
+    stored_task,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(stored_task.task_id, {})
+    task_dir = settings.tasks_dir / stored_task.task_id
+    artifact = task_dir / "structured_document.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    response = client.delete(f"/api/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "task_id": stored_task.task_id,
+        "deleted": True,
+    }
+    assert repository.get(stored_task.task_id) is None
+    assert not task_dir.exists()
+
+
+def test_delete_running_task_is_rejected_without_removing_data(
+    client,
+    repository,
+    settings,
+    stored_task,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "running")
+
+    response = client.delete(f"/api/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "任务正在执行，无法删除，请稍后重试。"
+    assert repository.get(stored_task.task_id) is not None
+    assert (settings.tasks_dir / stored_task.task_id).exists()
+
+
 def test_upload_write_failure_returns_500_without_task(
     client,
     repository,
@@ -168,3 +210,39 @@ def test_get_task_returns_stable_payload(client, stored_task):
         "created_at",
         "updated_at",
     }
+
+
+def test_get_task_reads_empty_file_review_artifact(client, stored_task):
+    artifact_dir = Path(stored_task.tender_file.storage_path).parent / "compliance_extraction"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "10_file_requirement_reviews.json").write_text(
+        json.dumps(
+            {
+                "mode": "file_requirements",
+                "source": "original_uploaded_file",
+                "original_file": {
+                    "filename": "投标文件.docx",
+                    "extension": ".docx",
+                    "size_bytes": 3,
+                    "size_display": "3 B",
+                },
+                "requirements": [],
+                "stats": {
+                    "requirement_count": 0,
+                    "pass_count": 0,
+                    "fail_count": 0,
+                    "not_supported_count": 0,
+                    "issue_count": 0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get(f"/api/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    review_result = response.json()["review_result"]
+    assert review_result["file_requirement_reviews"] == []
+    assert review_result["file_requirement_original_file"]["size_bytes"] == 3

@@ -41,6 +41,28 @@ def test_create_persists_required_task_fields(tmp_path):
     assert repository.get("task-001") == task
 
 
+def test_list_tasks_returns_newest_first(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "compliance")
+    repository.create("task-002", tender_file, bid_file, "compliance")
+
+    tasks = repository.list_tasks()
+
+    assert [task.task_id for task in tasks] == ["task-002", "task-001"]
+
+
+def test_delete_task_removes_task_record_and_returns_deleted_task(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    created = repository.create("task-001", tender_file, bid_file, "compliance")
+
+    deleted = repository.delete_task("task-001")
+
+    assert deleted == created
+    assert repository.get("task-001") is None
+
+
 def test_update_stage_preserves_other_stage_states(tmp_path):
     repository = make_repository(tmp_path)
     tender_file, bid_file = make_files()

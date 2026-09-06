@@ -23,6 +23,7 @@ def test_bid_check_page_has_two_docx_uploads_and_official_modes(client):
     assert "评分+废标检查" not in response.text
     assert 'id="start-check"' in response.text
     assert 'id="start-check" class="button primary" type="submit" disabled' in response.text
+    assert 'href="/bid-check/tasks"' in response.text
 
 
 def test_bid_check_page_contains_full_mode_descriptions(client):
@@ -33,6 +34,32 @@ def test_bid_check_page_contains_full_mode_descriptions(client):
     assert "评分项与否决投标风险" in response.text
     assert "根据招标文件中的评分办法、初步评审标准" in response.text
     assert "同时执行标书合规性校验和评标规则校验" in response.text
+
+
+def test_task_list_page_shows_tasks_and_links_to_results(
+    client,
+    repository,
+    stored_task,
+    mock_complete_result,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(stored_task.task_id, mock_complete_result)
+
+    response = client.get("/bid-check/tasks")
+
+    assert response.status_code == 200
+    assert "任务列表" in response.text
+    assert "投标文件.docx" in response.text
+    assert "已完成" in response.text
+    assert "模板规范" in response.text
+    assert "附件" in response.text
+    assert "业绩合同" in response.text
+    assert 'href="/bid-check/tasks/stored-task"' in response.text
+    assert "查看检查结果" in response.text
+    assert 'data-delete-task="stored-task"' in response.text
+    assert 'data-delete-dialog' in response.text
+    assert "确认删除任务" in response.text
 
 
 def test_running_task_page_shows_parallel_workflow(
@@ -85,18 +112,114 @@ def test_complete_page_renders_requirements_without_fake_verdict(
 
     assert response.status_code == 200
     assert "标书合规性校验结果" in response.text
-    assert "本次识别 0 个模板、0 条项目专用编制要求和 0 项补充证明材料" in response.text
-    assert "模板对比表" in response.text
-    assert "没有可展示的招标模板" in response.text
-    assert "当前版本仅展示招标模板与投标文件模块的匹配关系" in response.text
-    assert "尚未执行真实内容对照或合规性判断" in response.text
+    assert "以下按模板规范、附件、业绩合同和文件自身四个检查范围展示合规性结果。" in response.text
+    assert "模板规范检查" in response.text
+    assert "附件检查" in response.text
+    assert "业绩合同检查" in response.text
+    assert "未发现需处理的模板规范问题" in response.text
+    assert "未发现需处理的附件问题" in response.text
+    assert "未发现需处理的业绩合同问题" in response.text
+    assert "最终检查结果" in response.text
     assert "section_count" not in response.text
-    assert "章节数" in response.text
+    assert "解析摘要" not in response.text
     assert "检查通过" not in response.text
     assert "检查不通过" not in response.text
 
 
-def test_complete_page_renders_clean_bid_stats_from_nested_parser_result(
+def test_complete_page_reads_and_renders_file_requirement_artifact(
+    client,
+    repository,
+    stored_task,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(
+        stored_task.task_id,
+        {
+            "templates": [],
+            "project_requirements": [],
+            "supplemental_materials": [],
+            "bid_parse": {"status": "success"},
+            "review_result": {"mode": "template_text", "template_text_reviews": []},
+        },
+    )
+    artifact_dir = Path(stored_task.tender_file.storage_path).parent / "compliance_extraction"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "10_file_requirement_reviews.json").write_text(
+        json.dumps(
+            {
+                "source": "original_uploaded_file",
+                "original_file": {
+                    "filename": "投标文件.docx",
+                    "extension": ".docx",
+                    "size_bytes": 3,
+                    "size_display": "3 B",
+                },
+                "requirements": [
+                    {
+                        "name": "文件大小限制",
+                        "requirement": "电子投标文件不得超过 2B",
+                        "requirement_type": "size",
+                        "actual": {"size_bytes": 3, "size_display": "3 B"},
+                        "expected": {"max_bytes": 2, "max_display": "2 B"},
+                        "status": "fail",
+                        "status_label": "不合规",
+                        "message": "原始文件大小超过要求。",
+                        "source": {
+                            "section": "投标人须知前附表",
+                            "block_ids": ["t1"],
+                            "source_text": "电子投标文件不得超过 2B",
+                        },
+                    }
+                ],
+                "stats": {"requirement_count": 1, "fail_count": 1, "not_supported_count": 0},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert "文件自身检查" in response.text
+    assert "电子投标文件不得超过 2B" in response.text
+    assert "原始文件大小为" in response.text or "原始文件大小超过要求" in response.text
+    assert "不合规" in response.text
+    assert "投标人须知前附表" in response.text
+
+    list_response = client.get("/bid-check/tasks")
+    assert list_response.status_code == 200
+    assert "文件自身" in list_response.text
+
+
+def test_complete_page_offers_three_switchable_result_styles(
+    client,
+    repository,
+    stored_task,
+    mock_complete_result,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(stored_task.task_id, mock_complete_result)
+
+    response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert 'data-result-style-switcher' in response.text
+    assert 'A · 审阅工作台' in response.text
+    assert 'B · 风险驾驶舱' in response.text
+    assert 'C · 结论报告页' in response.text
+    assert 'data-result-style="workbench"' in response.text
+    assert 'data-result-style="dashboard"' in response.text
+    assert 'data-result-style="report"' in response.text
+    assert 'data-result-style-view="workbench"' in response.text
+    assert 'data-result-style-view="dashboard"' in response.text
+    assert 'data-result-style-view="report"' in response.text
+    assert 'localStorage' in response.text
+
+
+def test_complete_page_hides_debug_bid_parse_stats(
     client,
     repository,
     stored_task,
@@ -129,11 +252,11 @@ def test_complete_page_renders_clean_bid_stats_from_nested_parser_result(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "<small>章节数</small><strong>33</strong>" in response.text
-    assert "<small>内容块数</small><strong>452</strong>" in response.text
-    assert "<small>表格数</small><strong>11</strong>" in response.text
-    assert "<small>图片数</small><strong>69</strong>" in response.text
-    assert "实际模块内容在对比表的对应行内折叠查看" in response.text
+    assert "章节数" not in response.text
+    assert "内容块数" not in response.text
+    assert "表格数" not in response.text
+    assert "图片数" not in response.text
+    assert "实际模块内容在对比表的对应行内折叠查看" not in response.text
 
 
 def test_complete_page_renders_template_text_review_results(
@@ -179,11 +302,11 @@ def test_complete_page_renders_template_text_review_results(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "已执行明确匹配模板的文本对照检查" in response.text
-    assert "模板文本检查结果" in response.text
-    assert "投标函文本完整响应。" in response.text
-    assert "检查通过" in response.text
-    assert "321 ms" in response.text
+    assert "模板规范检查" in response.text
+    assert "未发现需处理的模板规范问题" in response.text
+    assert "投标函文本完整响应。" not in response.text
+    assert "检查通过" not in response.text
+    assert "321 ms" not in response.text
 
 
 def test_complete_page_merges_template_match_and_text_review_statuses(
@@ -313,18 +436,17 @@ def test_complete_page_merges_template_match_and_text_review_statuses(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "招标模板" in response.text
-    assert "对应投标文件模块" in response.text
-    assert "匹配状态" in response.text
-    assert "文本检查状态" in response.text
-    assert "检查通过" in response.text
+    assert "模板规范检查" in response.text
+    assert "对应模块：2 授权委托书" in response.text
+    assert "检查通过" not in response.text
     assert "检查不通过" in response.text
     assert "调用失败" in response.text
-    assert response.text.count("未执行") >= 2
-    assert "存在候选但不能确定" in response.text
+    assert "对应关系待确认" in response.text
     assert "未匹配" in response.text
     assert "模板正文未保留。" in response.text
     assert "模拟请求失败" in response.text
+    assert "查看招标模板原文" not in response.text
+    assert "查看投标模块内容" not in response.text
 
 
 def test_complete_page_separates_template_semantic_skip_from_business_fail(
@@ -407,7 +529,7 @@ def test_complete_page_separates_template_semantic_skip_from_business_fail(
     assert response.status_code == 200
     assert "语义不匹配" in response.text
     assert "标题相似，但文件用途和核心内容不一致。" in response.text
-    assert "未执行业务检查" in response.text
+    assert "未执行业务检查" not in response.text
     assert "检查不通过" not in response.text
 
 
@@ -431,7 +553,7 @@ def test_complete_page_includes_contract_style_back_to_top_control(
     assert "prefers-reduced-motion" in response.text
 
 
-def test_complete_page_renders_template_comparison_rows_collapsed_by_default(
+def test_complete_page_hides_template_comparison_debug_details(
     client,
     repository,
     stored_task,
@@ -481,15 +603,16 @@ def test_complete_page_renders_template_comparison_rows_collapsed_by_default(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert response.text.count('class="comparison-detail"') == 1
+    assert 'class="comparison-detail"' not in response.text
     assert "<details open" not in response.text
-    assert "模板对比表" in response.text
-    assert "投标函" in response.text
-    assert "存在候选但不能确定" not in response.text
+    assert "模板对比表" not in response.text
+    assert "模板规范检查" in response.text
     assert "未匹配" in response.text
+    assert "存在候选但不能确定" not in response.text
+    assert "查看招标模板原文" not in response.text
 
 
-def test_complete_page_renders_collapsed_bid_document_sections(
+def test_complete_page_hides_collapsed_bid_document_debug_sections(
     client,
     repository,
     stored_task,
@@ -580,22 +703,21 @@ def test_complete_page_renders_collapsed_bid_document_sections(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "模板对比表" in response.text
-    assert 'data-comparison-status="matched"' in response.text
-    assert "1 投标函" in response.text
-    assert "查看招标模板原文" in response.text
-    assert "查看投标模块内容" in response.text
-    assert "投标函模板原文" in response.text
-    assert "投标函\n投标人名称：____" in response.text
-    assert "投标人名称：示例公司" in response.text
-    assert "联系人" in response.text
-    assert "张三" in response.text
-    assert "4 个内容块" in response.text
-    assert "1 个表格" in response.text
-    assert "0 张图片" in response.text
-    assert "1 个子章节" in response.text
-    assert "1.1 投标函附表" in response.text
-    assert "附表内容" in response.text
+    assert "模板对比表" not in response.text
+    assert 'data-comparison-status="matched"' not in response.text
+    assert "查看招标模板原文" not in response.text
+    assert "查看投标模块内容" not in response.text
+    assert "投标函模板原文" not in response.text
+    assert "投标函\n投标人名称：____" not in response.text
+    assert "投标人名称：示例公司" not in response.text
+    assert "联系人" not in response.text
+    assert "张三" not in response.text
+    assert "4 个内容块" not in response.text
+    assert "1 个表格" not in response.text
+    assert "0 张图片" not in response.text
+    assert "1 个子章节" not in response.text
+    assert "1.1 投标函附表" not in response.text
+    assert "附表内容" not in response.text
 
 
 def test_unknown_task_page_returns_404(client):
@@ -682,6 +804,98 @@ def test_complete_page_renders_generic_attachment_status_and_evidence_count(
     assert "营业执照材料" in response.text
     assert "检查不通过" in response.text
     assert "证据图片：0 张" in response.text
-    assert "仅对已匹配且明确存在普通证明材料要求的模板执行附件检查" in response.text
+    assert "附件检查" in response.text
+    assert "应提供营业执照复印件。" in response.text
     assert "只检查法定代表人/负责人身份证明、授权委托书和基本开户银行情况" not in response.text
     assert "调用失败" not in response.text
+
+
+def test_complete_page_renders_performance_contract_review_results(
+    client,
+    repository,
+    stored_task,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(
+        stored_task.task_id,
+        {
+            "templates": [],
+            "project_requirements": [],
+            "supplemental_materials": [],
+            "bid_parse": {
+                "status": "success",
+                "stats": {
+                    "section_count": 33,
+                    "structured_block_count": 452,
+                    "table_count": 11,
+                    "image_count": 70,
+                },
+            },
+            "review_result": {
+                "mode": "template_text_and_performance",
+                "template_text_reviews": [],
+                "performance_reviews": [
+                    {
+                        "case_type": "21.1 信达旺大厦云平台运营及维护服务",
+                        "template_id": "tender_template_021",
+                        "template_name": "业绩情况表",
+                        "bid_module_name": "21.1 信达旺大厦云平台运营及维护服务",
+                        "bid_section_id": "s0027",
+                        "image_ids": ["i0009", "i0021"],
+                        "status": "uncertain",
+                        "summary": "合同金额证据不清晰。",
+                        "framework_contract": {
+                            "status": "uncertain",
+                            "reason": "无法可靠确认合同类型。",
+                            "evidence_image_ids": [],
+                        },
+                        "materials": [
+                            {
+                                "material_type": "服务合同",
+                                "image_ids": ["i0009", "i0021"],
+                                "facts": [],
+                            }
+                        ],
+                        "checks": [
+                            {
+                                "key": "contract_amount",
+                                "requirement": "合同金额",
+                                "status": "uncertain",
+                                "reason": "图片文字无法可靠识别。",
+                                "evidence_image_ids": [],
+                            },
+                            {
+                                "key": "signature_date",
+                                "requirement": "合同签署日期",
+                                "status": "fail",
+                                "reason": "签署页日期栏为空。",
+                                "evidence_image_ids": ["i0021"],
+                            },
+                        ],
+                        "llm_elapsed_ms": 100,
+                    }
+                ],
+                "performance_stats": {
+                    "selected_case_count": 1,
+                    "image_count": 13,
+                    "llm_total_calls": 1,
+                    "llm_elapsed_ms": 100,
+                },
+                "stats": {"llm_total_calls": 1, "llm_elapsed_ms": 100},
+            },
+        },
+    )
+
+    response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert "业绩合同检查" in response.text
+    assert "21.1 信达旺大厦云平台运营及维护服务" in response.text
+    assert "合同类型：待确认" in response.text
+    assert "合同金额" in response.text
+    assert "合同签署日期" in response.text
+    assert "证据图片：i0021" in response.text
+    assert "送模图片" not in response.text
+    assert "OCR：" not in response.text
+    assert "100 ms" not in response.text

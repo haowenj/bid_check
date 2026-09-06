@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import io
 import json
 import zipfile
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -636,6 +636,119 @@ def test_mineru_bid_parser_extracts_table_embedded_images_once_and_marks_asset_r
     assert structured["tables"][0]["image_ids"] == ["i0001", "i0002"]
     assert [image["asset_status"] for image in structured["images"]] == ["ready", "ready"]
     assert structured["images"][0]["source_table_id"] == "t0001"
+
+
+def test_mineru_bid_parser_ocr_images_once_and_embeds_image_provenance(tmp_path):
+    from app.bid_document import MinerUBidDocumentParser
+
+    bid_path = tmp_path / "bid.docx"
+    bid_path.write_bytes(b"fixture bid")
+    document_payload = [
+        {
+            "type": "title",
+            "page_idx": 2,
+            "content": {
+                "level": 1,
+                "title_content": [{"type": "text", "content": "业绩材料"}],
+            },
+        },
+        {
+            "type": "image",
+            "page_idx": 2,
+            "bbox": [10, 100, 500, 700],
+            "content": {"img_path": "images/contract-page.png"},
+        },
+    ]
+    image_ocr_payload = [
+        {
+            "type": "paragraph",
+            "page_idx": 0,
+            "content": {
+                "paragraph_content": [
+                    {"type": "text", "content": "合同金额：人民币96万元。"}
+                ]
+            },
+        }
+    ]
+
+    def zip_result(payload, *, image_bytes=None):
+        content_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("results/content_list.json", content_bytes)
+            if image_bytes is not None:
+                archive.writestr("results/images/contract-page.png", image_bytes)
+        return buffer.getvalue()
+
+    document_zip = zip_result(document_payload, image_bytes=b"contract-page")
+    image_ocr_zip = zip_result(image_ocr_payload)
+    submitted_tasks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tasks":
+            task_id = f"task-{len(submitted_tasks) + 1}"
+            submitted_tasks.append(task_id)
+            return httpx.Response(
+                202,
+                json={
+                    "task_id": task_id,
+                    "status_url": f"/tasks/{task_id}",
+                    "result_url": f"/tasks/{task_id}/result",
+                },
+            )
+        if request.url.path.startswith("/tasks/") and request.url.path.count("/") == 2:
+            return httpx.Response(200, json={"status": "completed"})
+        if request.url.path.endswith("/result"):
+            task_id = request.url.path.split("/")[-2]
+            return httpx.Response(
+                200,
+                content=(
+                    document_zip
+                    if int(task_id.rsplit("-", 1)[-1]) % 2 == 1
+                    else image_ocr_zip
+                ),
+                )
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://mineru.example",
+        trust_env=False,
+    )
+    output_dir = tmp_path / "bid_document_cleaning"
+    parser = MinerUBidDocumentParser(
+        "https://mineru.example",
+        poll_interval_seconds=0,
+        http_client=client,
+    )
+
+    first_result = parser.parse(bid_path, output_dir=output_dir)
+    structured = json.loads((output_dir / "structured_document.json").read_text())
+
+    assert submitted_tasks == ["task-1", "task-2"]
+    image = structured["images"][0]
+    assert image["ocr_status"] == "available"
+    assert image["ocr_source"] == "mineru_image_ocr"
+    assert image["ocr_text"] == "合同金额：人民币96万元。"
+    assert image["ocr_blocks"][0]["block_id"] == "ocr-i0001-b0001"
+    assert image["ocr_blocks"][0]["image_id"] == "i0001"
+    assert image["ocr_blocks"][0]["image_block_id"] == image["block_id"]
+    assert image["ocr_blocks"][0]["section_path"] == ["业绩材料"]
+    image_block = next(
+        block for block in structured["blocks"] if block["block_id"] == image["block_id"]
+    )
+    assert image_block["metadata"]["image_id"] == "i0001"
+    assert image_block["metadata"]["image_ocr"]["text_block_ids"] == [
+        "ocr-i0001-b0001"
+    ]
+    assert first_result["diagnostics"]["image_ocr"]["engine_call_count"] == 1
+    assert first_result["diagnostics"]["image_ocr"]["available_image_count"] == 1
+
+    second_result = parser.parse(bid_path, output_dir=output_dir)
+
+    assert submitted_tasks == ["task-1", "task-2", "task-3"]
+    assert second_result["diagnostics"]["image_ocr"]["engine_call_count"] == 0
+    assert second_result["diagnostics"]["image_ocr"]["cache_hit_count"] == 1
 
 
 def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
