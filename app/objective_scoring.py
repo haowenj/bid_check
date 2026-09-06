@@ -182,7 +182,17 @@ def _document_text(document: Mapping[str, Any] | None) -> str:
     return f"{section_text}\n{block_text}".strip()
 
 
+def _section_titles(document: Mapping[str, Any] | None) -> str:
+    return "\n".join(
+        _as_text(section.get("title"))
+        for section in _document_sections(document)
+    )
+
+
 def _has_scope(document: Mapping[str, Any] | None, filename: str, terms: tuple[str, ...]) -> bool:
+    titles = _section_titles(document)
+    if any(term in titles for term in terms):
+        return True
     text = _document_text(document)
     if any(term in text for term in terms):
         return True
@@ -192,11 +202,25 @@ def _has_scope(document: Mapping[str, Any] | None, filename: str, terms: tuple[s
     return any(term.lower() in normalized for term in terms)
 
 
+def _has_section_scope(
+    document: Mapping[str, Any] | None,
+    filename: str,
+    terms: tuple[str, ...],
+) -> bool:
+    titles = _section_titles(document)
+    if any(term in titles for term in terms):
+        return True
+    return any(term.lower() in filename.lower() for term in terms)
+
+
 def _is_business_only(document: Mapping[str, Any] | None, filename: str) -> bool:
-    text = _document_text(document)
-    if "商务" not in filename and "商务" not in text:
+    titles = _section_titles(document)
+    if "商务" not in filename and "商务" not in titles:
         return False
-    return not any(term in text for term in ("技术标", "技术规范书", "技术响应", "报价文件", "投标一览表"))
+    return not any(
+        term in titles
+        for term in ("技术标", "技术规范书", "技术响应", "报价文件", "投标一览表")
+    )
 
 
 def _category_map(evaluation_rules: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -521,7 +545,7 @@ def _team_handler(
         verified_count = int(match.group(1))
     if verified_count is None:
         has_team_content = any(
-            term in text for term in ("团队成员", "人员名单", "身份证", "社保", "缴费单位")
+            term in text for term in ("团队成员", "团队人数", "人员名单", "项目团队")
         )
         status = (
             "evidence_insufficient"
@@ -573,6 +597,12 @@ def _project_manager_handler(
     artifacts: Mapping[str, Any],
 ) -> dict[str, Any]:
     text = _document_text(bid_document)
+    has_project_manager_content = "项目经理" in text or bool(
+        re.search(
+            r"项目负责人(?:姓名|[：:]|证书|简历|资质|学历|专业|工作年限|社保)",
+            text,
+        )
+    )
     relevant = [
         entry
         for name, key in (
@@ -582,8 +612,18 @@ def _project_manager_handler(
         for entry in _review_entries(artifacts, name, key)
         if any(term in json.dumps(entry, ensure_ascii=False) for term in ("项目经理", "项目负责人"))
     ]
-    if not relevant and not any(term in text for term in ("项目经理", "项目负责人")):
-        status = "file_scope_missing" if _is_business_only(bid_document, filename) else "evidence_insufficient"
+    if not relevant and not _has_section_scope(
+        bid_document,
+        filename,
+        ("项目经理", "项目负责人"),
+    ):
+        status = (
+            "evidence_insufficient"
+            if has_project_manager_content
+            else "file_scope_missing"
+            if _is_business_only(bid_document, filename)
+            else "evidence_insufficient"
+        )
         return _status_result(
             result,
             status=status,
@@ -823,9 +863,6 @@ def run_objective_scoring(
     statuses = {status: 0 for status in sorted(OBJECTIVE_STATUSES)}
     for item in score_items:
         statuses[item["status"]] = statuses.get(item["status"], 0) + 1
-    all_auto_scored = bool(score_items) and all(
-        item["status"] == "auto_scored" for item in score_items
-    )
     source = {
         "evaluation_rules_artifact": "11_evaluation_rules.json",
         "bid_filename": bid_file.filename,
@@ -856,11 +893,8 @@ def run_objective_scoring(
             "veto_rule_count": len(evaluation_rules.get("veto_rules", []))
             if isinstance(evaluation_rules.get("veto_rules", []), list)
             else 0,
-            "score_sum": (
-                sum(float(item["score"]) for item in score_items)
-                if all_auto_scored
-                else None
-            ),
+            "score_sum": None,
+            "auto_score_sum_computed": False,
             "total_score_computed": False,
             "llm_total_calls": 0,
             "bid_parse_reused": not bid_parse_fallback_used,

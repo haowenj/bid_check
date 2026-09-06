@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import FileMetadata
 from app.objective_scoring import run_objective_scoring
 
@@ -348,6 +349,8 @@ def test_team_scoring_calculates_the_verified_member_bracket(tmp_path):
     assert item["status"] == "auto_scored"
     assert item["score"] == 3
     assert item["calculation"]["matched_bracket"] == {"min": 25, "max": 34, "score": 3}
+    assert result["stats"]["score_sum"] is None
+    assert result["stats"]["total_score_computed"] is False
 
 
 def test_performance_scoring_excludes_qualification_case_and_requires_valid_extra_cases(tmp_path):
@@ -459,3 +462,18 @@ def test_external_and_unsupported_rules_are_explicitly_not_scored(tmp_path):
         "unsupported",
     ]
     assert all(item["score"] is None for item in result["score_items"])
+
+
+def test_recorder_writes_an_independent_objective_score_artifact(tmp_path):
+    task_dir = tmp_path / "task"
+    recorder = ComplianceExtractionRecorder(task_dir)
+
+    result = run_objective_scoring(
+        make_price_rule(),
+        _bid_file(tmp_path),
+        recorder=recorder,
+    )
+
+    artifact = task_dir / "compliance_extraction" / "objective_scores.json"
+    assert artifact.is_file()
+    assert json.loads(artifact.read_text(encoding="utf-8")) == result
