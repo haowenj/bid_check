@@ -533,6 +533,88 @@ def _quality_issue_entries(
     return issues
 
 
+def _quality_issue_category(value: Mapping[str, Any]) -> str | None:
+    """Map one upstream issue to at most one writing-quality deduction."""
+    issue_type = _normalized(
+        value.get("type") or value.get("issue_type") or value.get("category")
+    )
+    typed_categories = (
+        (
+            "readability",
+            ("reading_difficulty", "readability", "阅读困难", "无法阅读"),
+        ),
+        ("clarity", ("blur", "模糊", "不清", "ocr_failed", "清晰度")),
+        (
+            "material",
+            (
+                "missing_attachment",
+                "missing_material",
+                "missing_content",
+                "material_missing",
+                "材料缺失",
+                "附件缺失",
+                "未提供",
+            ),
+        ),
+        (
+            "content",
+            (
+                "missing_fill",
+                "placeholder",
+                "content_error",
+                "content_mismatch",
+                "wrong_value",
+                "invalid_value",
+                "semantic_error",
+                "内容错误",
+                "内容不一致",
+                "占位符",
+                "提示文字",
+            ),
+        ),
+        (
+            "format",
+            (
+                "format_error",
+                "format_mismatch",
+                "production_rule",
+                "文件格式",
+                "格式错误",
+                "排版错误",
+                "未按规定制作",
+                "制作规范",
+                "装订",
+                "页码顺序",
+                "签章格式",
+            ),
+        ),
+    )
+    for category, terms in typed_categories:
+        if any(term in issue_type for term in terms):
+            return category
+
+    semantic_text = _normalized(
+        " ".join(
+            _quality_value_text(value.get(key))
+            for key in (
+                "type",
+                "issue_type",
+                "category",
+                "name",
+                "title",
+                "description",
+                "message",
+                "reason",
+                "requirement",
+            )
+        )
+    )
+    for category, terms in typed_categories:
+        if any(term in semantic_text for term in terms):
+            return category
+    return None
+
+
 def _quality_value_text(value: Any) -> str:
     if isinstance(value, Mapping):
         return json.dumps(value, ensure_ascii=False)
@@ -820,26 +902,22 @@ def _score_item_001_facts(
             fact["auxiliary_evidence"] = [dict(item) for item in attestation_evidence]
         return fact
 
-    format_bad = [
-        entry
-        for entry in template_entries
-        if _quality_review_status(entry) == "fail"
+    format_issue_refs = [
+        (template_name, issue)
+        for issue in template_issues
+        if _quality_issue_category(issue) == "format"
     ]
-    format_bad.extend(
-        entry
+    format_issue_refs.extend(
+        (file_name, entry)
         for entry in file_entries
-        if _quality_review_status(entry) == "fail"
+        if _quality_issue_category(entry) == "format"
     )
     format_evidence = [
         reference
-        for entry in format_bad[:5]
-        for reference in _quality_artifact_evidence(
-            template_name if entry in template_entries else file_name,
-            entry,
-            document,
-        )
+        for artifact_name, issue in format_issue_refs[:5]
+        for reference in _quality_artifact_evidence(artifact_name, issue, document)
     ]
-    if format_bad:
+    if format_issue_refs:
         format_fact = fallback_fact(
             _SCORE_ITEM_001_DEDUCTIONS[0],
             confirmed_exists=True,
@@ -870,24 +948,8 @@ def _score_item_001_facts(
             source_artifacts=[template_name, file_name],
         )
 
-    content_issue_types = (
-        "content_error",
-        "content_mismatch",
-        "wrong_value",
-        "invalid_value",
-        "semantic_error",
-        "事实错误",
-        "内容错误",
-        "内容不一致",
-    )
     content_issues = [
-        issue
-        for issue in template_issues
-        if any(
-            term in _normalized(_quality_value_text(issue.get("type")))
-            or term in _normalized(json.dumps(issue, ensure_ascii=False))
-            for term in content_issue_types
-        )
+        issue for issue in template_issues if _quality_issue_category(issue) == "content"
     ]
     if content_issues:
         content_fact = fallback_fact(
@@ -932,23 +994,25 @@ def _score_item_001_facts(
             source_artifacts=[template_name],
         )
 
-    clarity_terms = ("模糊", "不清", "unreadable", "blur", "ocr_failed")
-    clarity_issues = [
-        issue
-        for issue in [*template_issues, *attachment_issues]
-        if any(term in _normalized(json.dumps(issue, ensure_ascii=False)) for term in clarity_terms)
+    clarity_issue_refs = [
+        (template_name, issue)
+        for issue in template_issues
+        if _quality_issue_category(issue) == "clarity"
     ]
-    if clarity_issues:
+    clarity_issue_refs.extend(
+        (attachment_name, issue)
+        for issue in attachment_issues
+        if _quality_issue_category(issue) == "clarity"
+    )
+    if clarity_issue_refs:
         clarity_fact = fallback_fact(
             _SCORE_ITEM_001_DEDUCTIONS[2],
             confirmed_exists=True,
             reason="现有检查明确记录了内容模糊或不可清晰识别的问题。",
             evidence=[
                 reference
-                for issue in clarity_issues[:5]
-                for reference in _quality_artifact_evidence(
-                    template_name, issue, document
-                )
+                for artifact_name, issue in clarity_issue_refs[:5]
+                for reference in _quality_artifact_evidence(artifact_name, issue, document)
             ],
             source_artifacts=[template_name, attachment_name],
         )
@@ -969,21 +1033,10 @@ def _score_item_001_facts(
             source_artifacts=["structured_document.json"],
         )
 
-    missing_issue_types = (
-        "missing_content",
-        "missing_attachment",
-        "missing_material",
-        "材料缺失",
-        "未提供",
-    )
     missing_issues = [
         issue
         for issue in [*template_issues, *attachment_issues]
-        if any(
-            term in _normalized(_quality_value_text(issue.get("type")))
-            or term in _normalized(json.dumps(issue, ensure_ascii=False))
-            for term in missing_issue_types
-        )
+        if _quality_issue_category(issue) == "material"
     ]
     file_material_issues = [
         entry
@@ -1051,23 +1104,25 @@ def _score_item_001_facts(
             source_artifacts=[template_name, attachment_name, file_name],
         )
 
-    readability_terms = ("阅读困难", "readability", "unreadable", "无法阅读")
-    readability_issues = [
-        issue
-        for issue in [*template_issues, *attachment_issues]
-        if any(term in _normalized(json.dumps(issue, ensure_ascii=False)) for term in readability_terms)
+    readability_issue_refs = [
+        (template_name, issue)
+        for issue in template_issues
+        if _quality_issue_category(issue) == "readability"
     ]
-    if readability_issues:
+    readability_issue_refs.extend(
+        (attachment_name, issue)
+        for issue in attachment_issues
+        if _quality_issue_category(issue) == "readability"
+    )
+    if readability_issue_refs:
         readability_fact = fallback_fact(
             _SCORE_ITEM_001_DEDUCTIONS[4],
             confirmed_exists=True,
             reason="现有检查明确记录了标书阅读困难问题。",
             evidence=[
                 reference
-                for issue in readability_issues[:5]
-                for reference in _quality_artifact_evidence(
-                    template_name, issue, document
-                )
+                for artifact_name, issue in readability_issue_refs[:5]
+                for reference in _quality_artifact_evidence(artifact_name, issue, document)
             ],
             source_artifacts=[template_name, "structured_document.json"],
         )

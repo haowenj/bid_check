@@ -418,7 +418,7 @@ def test_score_item_001_applies_one_point_deduction_from_confirmed_fact(tmp_path
     assert checks["文件内容错误"]["evidence"]
 
 
-def test_score_item_001_keeps_missing_fill_in_format_and_links_evidence_to_block(
+def test_score_item_001_maps_missing_fill_to_content_once_and_links_block(
     tmp_path,
 ):
     actual_text = "投标文件编写质量的情况：残留模板提示文字"
@@ -458,12 +458,45 @@ def test_score_item_001_keeps_missing_fill_in_format_and_links_evidence_to_block
 
     item = result["score_items"][0]
     checks = {check["deduction_item"]: check for check in item["deduction_checks"]}
-    assert checks["未按规定制作投标文件"]["confirmed_exists"] is True
+    assert checks["未按规定制作投标文件"]["status"] == "insufficient"
+    assert checks["文件内容错误"]["confirmed_exists"] is True
     assert any(
         "b-format" in evidence.get("block_ids", [])
-        for evidence in checks["未按规定制作投标文件"]["evidence"]
+        for evidence in checks["文件内容错误"]["evidence"]
     )
     assert checks["材料缺失"]["status"] == "insufficient"
+
+
+def test_score_item_001_does_not_map_generic_template_failure_to_format(tmp_path):
+    bid_path, document = _hash_matched_bid(
+        tmp_path,
+        [
+            {
+                "block_id": "b-uncertain",
+                "type": "paragraph",
+                "section": "13.5 评审要求承诺函",
+                "text": "投标文件编写质量的情况待进一步核验。",
+                "order": 1,
+            }
+        ],
+    )
+    artifacts = _complete_quality_artifacts()
+    artifacts["08_template_text_reviews.json"]["template_text_reviews"][0].update(
+        {"status": "fail", "final_status": "fail", "issues": []}
+    )
+    result = run_subjective_scoring(
+        _quality_score_item_001_rules(),
+        FileMetadata("商务投标文件部分.docx", bid_path.stat().st_size, str(bid_path)),
+        subjective_llm=RecordingSubjectiveLLM({}),
+        bid_document=document,
+        existing_artifacts=artifacts,
+    )
+
+    checks = {
+        check["deduction_item"]: check
+        for check in result["score_items"][0]["deduction_checks"]
+    }
+    assert checks["未按规定制作投标文件"]["status"] == "insufficient"
 
 
 def test_run_subjective_scoring_rejects_out_of_band_or_untrusted_evidence(tmp_path):
