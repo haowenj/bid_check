@@ -32,7 +32,7 @@
   `run_objective_scoring(evaluation_rules: Mapping[str, Any], bid_file: FileMetadata, *, bid_document: Mapping[str, Any] | None = None, artifact_dir: Path | None = None, recorder: ComplianceExtractionRecorder | None = None) -> dict[str, Any]`.
 - The result contains `score_items`, `stats`, and each score item has `status`, `score`, `calculation`, `facts`, `evidence`, `related_artifacts`, and `tender_rule_source`.
 
-- [ ] **Step 1: Write failing unit tests for objective-item selection and safe status handling**
+- [x] **Step 1: Write failing unit tests for objective-item selection and safe status handling**
 
 ```python
 def test_objective_scoring_excludes_subjective_items_and_veto_rules(tmp_path):
@@ -58,13 +58,13 @@ def test_missing_evidence_is_not_converted_to_zero(tmp_path):
     assert item["reason"]
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail because the module/function is absent**
+- [x] **Step 2: Run the focused tests and verify they fail because the module/function is absent**
 
 Run: `pytest -q tests/test_objective_scoring.py`
 
 Expected: FAIL with an import or missing-function error for `app.objective_scoring.run_objective_scoring`.
 
-- [ ] **Step 3: Commit the red tests**
+- [x] **Step 3: Commit the red tests**
 
 ```bash
 git add tests/test_objective_scoring.py
@@ -82,7 +82,7 @@ git commit -m "test: define objective scoring safety contract"
 - `load_reusable_bid_evidence(bid_file: FileMetadata, *, artifact_dir: Path | None = None) -> dict[str, Any]` resolves symlinks, loads `bid_document_cleaning/structured_document.json` and sibling compliance artifacts, and records missing artifacts without treating them as failures.
 - `run_objective_scoring` accepts an optional already-loaded `bid_document` and `artifact_dir` so the API can reuse a parser result without parsing twice.
 
-- [ ] **Step 1: Add failing tests for source/hash-checked artifact reuse and output provenance**
+- [x] **Step 1: Add failing tests for source/hash-checked artifact reuse and output provenance**
 
 ```python
 def test_reuses_resolved_bid_artifact_and_records_related_artifacts(tmp_path):
@@ -105,13 +105,13 @@ def test_reuses_resolved_bid_artifact_and_records_related_artifacts(tmp_path):
     assert result["score_items"][0]["tender_rule_source"]["block_ids"] == ["b0277"]
 ```
 
-- [ ] **Step 2: Run the new tests to verify the expected failure**
+- [x] **Step 2: Run the new tests to verify the expected failure**
 
 Run: `pytest -q tests/test_objective_scoring.py::test_reuses_resolved_bid_artifact_and_records_related_artifacts`
 
 Expected: FAIL because evidence loading and the objective scoring module are not implemented.
 
-- [ ] **Step 3: Implement the minimal core module**
+- [x] **Step 3: Implement the minimal core module**
 
 Implement these concrete behaviors in `app/objective_scoring.py`:
 
@@ -144,13 +144,13 @@ The loader must compare `structured_document.source.sha256` with the actual bid 
 
 The common item shape must include the original rule fields and use `score=None` for every non-`auto_scored` status. The output stats must include objective item count, per-status counts, `llm_total_calls=0`, `duplicate_parse=False`, and `score_sum=None` when any objective item is not automatically scored. It must not expose a final total score.
 
-- [ ] **Step 4: Run focused tests and then the full unit test file**
+- [x] **Step 4: Run focused tests and then the full unit test file**
 
 Run: `pytest -q tests/test_objective_scoring.py`
 
 Expected: PASS for selection, provenance, and safe missing-evidence behavior.
 
-- [ ] **Step 5: Commit the core module**
+- [x] **Step 5: Commit the core module**
 
 ```bash
 git add app/objective_scoring.py tests/test_objective_scoring.py
@@ -167,7 +167,7 @@ git commit -m "feat: add objective scoring artifact core"
 - Rule dispatch is based on stable score-item IDs when present (`score_item_002`, `007`, `008`, `010`, `011`, `012`, `013`, `014`) and falls back to normalized names only for fixture/backward compatibility.
 - Each handler returns a common partial result with `status`, `score`, `facts`, `calculation`, `evidence`, `related_artifacts`, and `reason`.
 
-- [ ] **Step 1: Write failing tests for the business-critical rules**
+- [x] **Step 1: Write failing tests for the business-critical rules**
 
 ```python
 def test_team_scoring_uses_verified_member_count_not_roster_count(tmp_path):
@@ -231,13 +231,13 @@ def test_technical_deviation_does_not_assume_business_file_is_technical_file(tmp
     assert result["score_items"][0]["score"] is None
 ```
 
-- [ ] **Step 2: Run the tests and confirm each fails before adding handlers**
+- [x] **Step 2: Run the tests and confirm each fails before adding handlers**
 
 Run: `pytest -q tests/test_objective_scoring.py -k "team or performance or price or project_manager or technical"`
 
 Expected: FAIL with missing handler behavior or incorrect placeholder statuses.
 
-- [ ] **Step 3: Implement the minimal deterministic handlers**
+- [x] **Step 3: Implement the minimal deterministic handlers**
 
 Implement:
 
@@ -252,13 +252,13 @@ Implement:
 
 The current real business bid does not contain technical, project-manager, team, stability, or price evidence. Those items must remain unavailable for their specific status reasons. Existing performance evidence must be attached to items 010 and 011 without summing uncertain/failing contracts.
 
-- [ ] **Step 4: Run focused tests and all tests for the module**
+- [x] **Step 4: Run focused tests and all tests for the module**
 
 Run: `pytest -q tests/test_objective_scoring.py`
 
 Expected: PASS, including the assertions that evidence insufficiency never becomes zero and the qualification-performance mapping is retained.
 
-- [ ] **Step 5: Commit the deterministic handlers**
+- [x] **Step 5: Commit the deterministic handlers**
 
 ```bash
 git add app/objective_scoring.py tests/test_objective_scoring.py
@@ -278,7 +278,7 @@ git commit -m "feat: execute objective evaluation rules safely"
 - The callback signature is `callback(tender_file, bid_file, evaluation_result, recorder=recorder) -> dict[str, Any]`.
 - Evaluation mode calls the callback after successful or cached rule extraction, then completes the repository with both `evaluation_rules` and `objective_scores`.
 
-- [ ] **Step 1: Write a failing workflow test**
+- [x] **Step 1: Write a failing workflow test**
 
 ```python
 def test_evaluation_workflow_runs_objective_scoring_after_rule_extraction(
@@ -319,13 +319,13 @@ def test_evaluation_workflow_runs_objective_scoring_after_rule_extraction(
     ]
 ```
 
-- [ ] **Step 2: Run the workflow test and verify it fails because no scoring callback is invoked**
+- [x] **Step 2: Run the workflow test and verify it fails because no scoring callback is invoked**
 
 Run: `pytest -q tests/test_workflow.py::test_evaluation_workflow_runs_objective_scoring_after_rule_extraction`
 
 Expected: FAIL because `objective_scores` is absent and the score callback is not called.
 
-- [ ] **Step 3: Implement workflow and API wiring**
+- [x] **Step 3: Implement workflow and API wiring**
 
 In `app/workflow.py`, invoke the optional scorer after rule extraction and record a dedicated `objective_scoring` stage event. Keep old evaluation-only test behavior when the callback is not configured by storing no fabricated score result. When configured, include the result in `repository.complete` and record elapsed milliseconds in workflow stats.
 
@@ -338,13 +338,13 @@ In `app/api.py`, wire a callback that:
 
 Do not modify page templates or the rule extraction prompt/schema. The scorer records `duplicate_parse=False` when it reused the existing artifact and records a parser fallback only when it was genuinely required.
 
-- [ ] **Step 4: Run workflow/API regression tests**
+- [x] **Step 4: Run workflow/API regression tests**
 
 Run: `pytest -q tests/test_workflow.py tests/test_api.py tests/test_objective_scoring.py`
 
 Expected: PASS, including the pre-existing assertion that evaluation mode does not parse the bid when no objective scorer is configured.
 
-- [ ] **Step 5: Commit workflow integration**
+- [x] **Step 5: Commit workflow integration**
 
 ```bash
 git add app/workflow.py app/api.py tests/test_workflow.py tests/test_api.py
@@ -361,21 +361,21 @@ git commit -m "feat: integrate objective scoring into evaluation workflow"
 - Use the current real tender and bid task files and their resolved existing compliance artifacts.
 - Read `objective_scores.json`, `workflow_summary.json`, and `execution.jsonl` as the acceptance evidence.
 
-- [ ] **Step 1: Run all automated tests**
+- [x] **Step 1: Run all automated tests**
 
 Run: `pytest -q`
 
 Expected: PASS with no regressions in extraction, artifact recording, workflow, API, template, attachment, performance, and bid parsing tests.
 
-- [ ] **Step 2: Run the evaluation workflow on the same real tender and bid**
+- [x] **Step 2: Run the evaluation workflow on the same real tender and bid**
 
 Use the existing task files under the current task data directory, preserving the file-hash-linked `structured_document.json` and compliance artifacts. Do not delete or overwrite unrelated artifacts. Confirm the evaluation rules cache may be hit but the objective scorer still executes.
 
-- [ ] **Step 3: Verify the objective artifact**
+- [x] **Step 3: Verify the objective artifact**
 
 Check that `objective_scores.json` contains exactly 8 objective items, category/name/full-score fields, original rules, explicit statuses, facts, calculations, evidence, related artifacts, and `b0277` rule source blocks where present. Check that no subjective score or veto execution result was added.
 
-- [ ] **Step 4: Verify business-critical acceptance conditions**
+- [x] **Step 4: Verify business-critical acceptance conditions**
 
 Confirm from the artifact and logs:
 
@@ -387,7 +387,6 @@ Confirm from the artifact and logs:
 - evidence insufficiency is not written as 0;
 - no extra LLM call or duplicate MinerU parse occurred.
 
-- [ ] **Step 5: Record the final evidence in the completion response**
+- [x] **Step 5: Record the final evidence in the completion response**
 
 Report the 8 item names and statuses, any safely calculated scores, exact reasons for unavailable scores, reused artifacts, LLM call count, duplicate-parse result, test command/result, and the absolute path to the complete `objective_scores.json`.
-
