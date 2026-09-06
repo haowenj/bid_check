@@ -5,6 +5,7 @@ import json
 import re
 import time
 from collections.abc import Mapping
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +32,12 @@ _REUSABLE_ARTIFACT_NAMES = (
 )
 _MONEY_RE = re.compile(
     r"(?<![\d.])([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
-    r"\s*(?:万元|万|元)"
+    r"\s*[】\]）)]?\s*(?:万元|万|元)"
 )
 _PERCENT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%")
+_DATE_RE = re.compile(
+    r"(?<!\d)(\d{4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -53,6 +57,85 @@ def _read_json(path: Path) -> Any | None:
 
 def _resolved_bid_path(bid_file: FileMetadata) -> Path:
     return Path(bid_file.storage_path).expanduser().resolve()
+
+
+def _resolved_tender_path(tender_file: FileMetadata) -> Path:
+    return Path(tender_file.storage_path).expanduser().resolve()
+
+
+def _parse_date(value: str) -> date | None:
+    match = _DATE_RE.search(value)
+    if not match:
+        return None
+    try:
+        return date(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
+    except ValueError:
+        return None
+
+
+def load_reusable_tender_evidence(
+    tender_file: FileMetadata,
+    *,
+    existing_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load the announcement-date fact from the existing tender parse.
+
+    Objective scoring only needs a small, deterministic fact from the tender
+    document.  This function deliberately reads the already-produced
+    ``01_parsed_blocks.json`` artifact and never starts MinerU or an LLM.
+    """
+
+    if isinstance(existing_evidence, Mapping):
+        return dict(existing_evidence)
+
+    tender_path = _resolved_tender_path(tender_file)
+    artifact_path = tender_path.parent / "compliance_extraction" / "01_parsed_blocks.json"
+    payload = _read_json(artifact_path)
+    if not isinstance(payload, Mapping):
+        return {
+            "artifact_path": str(artifact_path),
+            "announcement_date": None,
+            "announcement_date_source": None,
+        }
+
+    candidates: list[dict[str, str]] = []
+    blocks = payload.get("blocks", [])
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, Mapping) or "招标公告" not in _as_text(block.get("section")):
+                continue
+            text = _as_text(block.get("text")).strip()
+            parsed = _parse_date(text)
+            if parsed is not None and _DATE_RE.fullmatch(text):
+                candidates.append(
+                    {
+                        "block_id": _as_text(block.get("block_id")),
+                        "text": text,
+                        "date": parsed.isoformat(),
+                    }
+                )
+
+    unique_dates = {candidate["date"] for candidate in candidates}
+    source = None
+    announcement_date = None
+    if len(unique_dates) == 1:
+        announcement_date = next(iter(unique_dates))
+        source_candidate = next(
+            candidate for candidate in candidates if candidate["date"] == announcement_date
+        )
+        source = {
+            "block_id": source_candidate["block_id"],
+            "text": source_candidate["text"],
+        }
+    return {
+        "artifact_path": str(artifact_path),
+        "announcement_date": announcement_date,
+        "announcement_date_source": source,
+    }
 
 
 def _artifact_path_for_bid(
@@ -353,6 +436,245 @@ def _compact_check(check: Any) -> dict[str, Any]:
     }
 
 
+def _fact_entries(review: Mapping[str, Any], key: str) -> list[dict[str, Any]]:
+    ocr_facts = review.get("ocr_facts")
+    if isinstance(ocr_facts, Mapping) and isinstance(ocr_facts.get(key), list):
+        return [dict(entry) for entry in ocr_facts[key] if isinstance(entry, Mapping)]
+    extraction = review.get("text_model_extraction")
+    if isinstance(extraction, Mapping):
+        text_facts = extraction.get("facts")
+        if isinstance(text_facts, Mapping) and isinstance(text_facts.get(key), list):
+            return [dict(entry) for entry in text_facts[key] if isinstance(entry, Mapping)]
+    return []
+
+
+def _fact_evidence_texts(fact: Mapping[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for key in ("value", "reason"):
+        value = _as_text(fact.get(key)).strip()
+        if value and value not in texts:
+            texts.append(value)
+    evidence = fact.get("evidence")
+    if isinstance(evidence, list):
+        for entry in evidence:
+            if not isinstance(entry, Mapping):
+                continue
+            for key in ("evidence_text", "ocr_text", "description", "value"):
+                value = _as_text(entry.get(key)).strip()
+                if value and value not in texts:
+                    texts.append(value)
+    return texts
+
+
+def _compact_fact(fact: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = fact.get("evidence")
+    evidence_texts = _fact_evidence_texts(fact)
+    image_ids = fact.get("evidence_image_ids")
+    if not isinstance(image_ids, list):
+        image_ids = []
+    if fact.get("image_id") and fact["image_id"] not in image_ids:
+        image_ids = [fact["image_id"], *image_ids]
+    return {
+        "field": _as_text(fact.get("field")),
+        "status": _as_text(fact.get("status")) or "uncertain",
+        "value": fact.get("value"),
+        "image_id": fact.get("image_id"),
+        "evidence_image_ids": [str(value) for value in image_ids],
+        "evidence_texts": evidence_texts,
+        "reason": _as_text(fact.get("reason")),
+        "evidence": [dict(entry) for entry in evidence if isinstance(entry, Mapping)]
+        if isinstance(evidence, list)
+        else [],
+    }
+
+
+def _check_status(fact: Mapping[str, Any], key: str) -> str:
+    checks = fact.get("checks")
+    check = checks.get(key) if isinstance(checks, Mapping) else None
+    return _as_text(check.get("status")) if isinstance(check, Mapping) else "uncertain"
+
+
+def _signature_date_evidence(review: Mapping[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    sources: list[dict[str, Any]] = []
+    extraction = review.get("text_model_extraction")
+    candidates = extraction.get("signature_date_candidates") if isinstance(extraction, Mapping) else None
+    if isinstance(candidates, list):
+        sources.extend(
+            {"source": "signature_date_candidates", **dict(candidate)}
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+        )
+    checks = review.get("checks_by_key")
+    signature_check = checks.get("signature_date") if isinstance(checks, Mapping) else None
+    if isinstance(signature_check, Mapping):
+        sources.append({"source": "signature_date_check", **dict(signature_check)})
+
+    dates: list[str] = []
+    for source in sources:
+        texts = _fact_evidence_texts(source)
+        for text in texts:
+            for match in _DATE_RE.finditer(text):
+                parsed = _parse_date(match.group(0))
+                if parsed is not None and parsed.isoformat() not in dates:
+                    dates.append(parsed.isoformat())
+    return dates, sources
+
+
+def _source_ids(review: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    block_ids: list[str] = []
+    image_ids: list[str] = []
+
+    def add_evidence(value: Any) -> None:
+        if not isinstance(value, Mapping):
+            return
+        block_id = value.get("block_id")
+        if block_id and str(block_id) not in block_ids:
+            block_ids.append(str(block_id))
+        image_id = value.get("image_id")
+        if image_id and str(image_id) not in image_ids:
+            image_ids.append(str(image_id))
+
+    checks = review.get("checks_by_key")
+    if isinstance(checks, Mapping):
+        for check in checks.values():
+            if not isinstance(check, Mapping):
+                continue
+            for evidence in check.get("evidence", []):
+                add_evidence(evidence)
+
+    for key in ("service_content", "contract_amount", "implementation_time"):
+        for fact in _fact_entries(review, key):
+            add_evidence(fact)
+            for evidence in fact.get("evidence", []):
+                add_evidence(evidence)
+
+    extraction = review.get("text_model_extraction")
+    if isinstance(extraction, Mapping):
+        for candidate_key in ("signature_page_candidates", "signature_date_candidates"):
+            for candidate in extraction.get(candidate_key, []):
+                if not isinstance(candidate, Mapping):
+                    continue
+                add_evidence(candidate)
+                for evidence in candidate.get("evidence", []):
+                    add_evidence(evidence)
+    return block_ids, image_ids
+
+
+def _normalize_contract_amount(facts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Normalize the contract fact without using the self-reported table amount."""
+
+    candidates: list[dict[str, Any]] = []
+    for fact_index, fact in enumerate(facts):
+        if fact.get("status") not in {"present", "pass"}:
+            continue
+        texts = _fact_evidence_texts(fact)
+        for text in texts:
+            for match in _MONEY_RE.finditer(text):
+                raw = match.group(1).replace(",", "")
+                suffix_match = re.search(r"[】\]）)]?\s*(万元|万|元)\s*(/\s*[^\s，。；;）)]*)?", match.group(0))
+                raw_unit = suffix_match.group(1) if suffix_match else "元"
+                suffix = suffix_match.group(2) if suffix_match and suffix_match.group(2) else ""
+                end_context = text[match.end(): match.end() + 20]
+                trailing_suffix = re.match(r"\s*(/\s*[^\s，。；;）)]*)", end_context)
+                suffix = suffix or (trailing_suffix.group(1) if trailing_suffix else "")
+                try:
+                    numeric = float(raw)
+                except ValueError:
+                    continue
+                unit_value = numeric if raw_unit in {"万元", "万"} else numeric / 10000
+                context = text[max(0, match.start() - 80): min(len(text), match.end() + 80)]
+                total_context = any(term in context for term in ("合同金额", "合同总金额", "总金额", "总费用", "合同价"))
+                formula_context = any(
+                    term in context
+                    for term in ("费率", "单价", "按", "实际装机", "*", "×", "%", "/瓦", "/枪")
+                )
+                annual = "/年" in suffix and "/月" not in suffix
+                candidates.append(
+                    {
+                        "value": unit_value,
+                        "unit": f"万元{suffix}" if raw_unit in {"万元", "万"} else f"万元{suffix}",
+                        "raw_value": numeric,
+                        "raw_unit": raw_unit,
+                        "suffix": suffix,
+                        "fact_index": fact_index,
+                        "source_text": text,
+                        "image_id": fact.get("image_id"),
+                        "total_context": total_context,
+                        "formula_context": formula_context,
+                        "annual": annual,
+                    }
+                )
+
+    if not candidates:
+        source_text = next(
+            (
+                text
+                for fact in facts
+                for text in fact.get("evidence_texts", [])
+                if _as_text(text).strip()
+            ),
+            None,
+        )
+        return {
+            "value": None,
+            "unit": None,
+            "basis": "contract_fact",
+            "confirmation": "uncertain",
+            "cumulative_value": None,
+            "reason": "现有业绩事实中没有可识别的合同金额。",
+            "source_text": source_text,
+        }
+
+    total_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["total_context"] and not candidate["annual"]
+    ]
+    fixed_candidates = [
+        candidate
+        for candidate in candidates
+        if not candidate["formula_context"] and not candidate["annual"]
+    ]
+    annual_candidates = [candidate for candidate in candidates if candidate["annual"]]
+    chosen = (total_candidates or fixed_candidates or annual_candidates or candidates)[-1]
+    if chosen["formula_context"] and not chosen["total_context"]:
+        return {
+            "value": None,
+            "unit": chosen["unit"],
+            "basis": "contract_fact",
+            "confirmation": "uncertain",
+            "cumulative_value": None,
+            "reason": "合同事实为费率、单价或按数量/期限计费，无法直接确认累计合同金额。",
+            "observed_value": chosen["raw_value"],
+            "source_text": chosen["source_text"],
+            "source_fact_index": chosen["fact_index"],
+            "image_id": chosen["image_id"],
+        }
+    if chosen["annual"]:
+        return {
+            "value": chosen["value"],
+            "unit": chosen["unit"] or "万元/年",
+            "basis": "contract_fact",
+            "confirmation": "confirmed",
+            "cumulative_value": None,
+            "reason": "已确认年度合同金额，但招标规则要求累计金额，不能直接换算为累计金额。",
+            "source_text": chosen["source_text"],
+            "source_fact_index": chosen["fact_index"],
+            "image_id": chosen["image_id"],
+        }
+    return {
+        "value": chosen["value"],
+        "unit": chosen["unit"],
+        "basis": "contract_fact",
+        "confirmation": "confirmed",
+        "cumulative_value": chosen["value"],
+        "reason": "已从合同金额事实标准化为万元，可用于累计金额评分。",
+        "source_text": chosen["source_text"],
+        "source_fact_index": chosen["fact_index"],
+        "image_id": chosen["image_id"],
+    }
+
+
 def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
     reviews = _review_entries(artifacts, "10_performance_reviews.json", "performance_reviews")
     facts: list[dict[str, Any]] = []
@@ -369,14 +691,11 @@ def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
         )
         checks = review.get("checks_by_key")
         checks = checks if isinstance(checks, Mapping) else {}
-        amount_check = checks.get("contract_amount")
-        amount = None
-        if isinstance(amount_check, Mapping):
-            for key in ("amount_value", "amount", "value"):
-                raw_amount = amount_check.get(key)
-                if isinstance(raw_amount, (int, float)):
-                    amount = float(raw_amount)
-                    break
+        service_content_facts = [_compact_fact(fact) for fact in _fact_entries(review, "service_content")]
+        contract_amount_facts = [_compact_fact(fact) for fact in _fact_entries(review, "contract_amount")]
+        implementation_time_facts = [_compact_fact(fact) for fact in _fact_entries(review, "implementation_time")]
+        signature_dates, signature_date_evidence = _signature_date_evidence(review)
+        source_blocks, source_images = _source_ids(review)
         facts.append(
             {
                 "entry_index": index,
@@ -386,7 +705,20 @@ def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "role_label": remark,
                 "overall_status": _as_text(review.get("status")) or "uncertain",
                 "table_row": row,
-                "amount": amount,
+                "service_content_facts": service_content_facts,
+                "contract_amount_facts": contract_amount_facts,
+                "implementation_time_facts": implementation_time_facts,
+                "signature_dates": signature_dates,
+                "signature_date_evidence": signature_date_evidence,
+                "framework_contract": dict(review.get("framework_contract"))
+                if isinstance(review.get("framework_contract"), Mapping)
+                else {"status": "uncertain", "reason": "未找到框架合同判断事实。"},
+                "materials": [dict(material) for material in review.get("materials", []) if isinstance(material, Mapping)]
+                if isinstance(review.get("materials"), list)
+                else [],
+                "amount": _normalize_contract_amount(contract_amount_facts),
+                "source_blocks": source_blocks,
+                "source_images": source_images,
                 "checks": {
                     str(key): _compact_check(value)
                     for key, value in checks.items()
@@ -407,6 +739,8 @@ def _performance_evidence(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "case_number": fact["case_number"],
                 "role": fact["role"],
                 "overall_status": fact["overall_status"],
+                "source_blocks": fact.get("source_blocks", []),
+                "source_images": fact.get("source_images", []),
             }
         )
     return evidence
@@ -421,9 +755,191 @@ def _performance_common_reason(facts: list[dict[str, Any]]) -> str | None:
         return "业绩表未可靠标识资格要求业绩，无法确定评分业绩的排除范围。"
     if unknown:
         return "存在未标识为资格要求业绩或评分业绩的业绩，无法可靠确定排除范围。"
-    if any(fact["overall_status"] != "pass" for fact in qualification):
-        return "资格要求业绩的既有检查结果不是全部通过，无法可靠建立资格业绩排除关系。"
     return None
+
+
+def _condition_result(status: str, reason: str, **details: Any) -> dict[str, Any]:
+    return {"status": status, "reason": reason, **details}
+
+
+def _service_condition(fact: Mapping[str, Any]) -> dict[str, Any]:
+    entries = fact.get("service_content_facts", [])
+    if not isinstance(entries, list) or not entries:
+        return _condition_result("uncertain", "未找到合同服务内容事实，无法确认是否属于同类型技术服务。")
+    statuses = [_as_text(entry.get("status")) for entry in entries if isinstance(entry, Mapping)]
+    text = " ".join(
+        " ".join(_as_text(value) for value in (entry.get("value"), *entry.get("evidence_texts", [])))
+        for entry in entries
+        if isinstance(entry, Mapping)
+    )
+    if "fail" in statuses:
+        return _condition_result("invalid", "现有业绩事实明确未满足同类型服务内容要求。", evidence_text=text)
+    if not text or any(status not in {"present", "pass"} for status in statuses):
+        return _condition_result("uncertain", "合同服务内容事实不完整，无法确认同类型技术服务属性。", evidence_text=text)
+    service_signal = any(term in text for term in ("服务", "运维", "运营", "维护", "巡检"))
+    technical_signal = any(
+        term in text
+        for term in ("技术", "平台", "系统", "运维", "维护", "巡检", "调试", "监控", "设备")
+    )
+    if service_signal and technical_signal:
+        return _condition_result("pass", "合同服务内容包含技术平台、系统或设备运维/维护等技术服务事实。", evidence_text=text)
+    return _condition_result("uncertain", "合同服务内容已提取，但缺少足以确认同类型技术服务的事实。", evidence_text=text)
+
+
+def _proof_condition(fact: Mapping[str, Any], *, require_cumulative_amount: bool) -> dict[str, Any]:
+    materials = fact.get("materials", [])
+    has_contract_material = any(
+        "合同" in _as_text(material.get("material_type"))
+        or _as_text(material.get("role")).lower() == "contract"
+        for material in materials
+        if isinstance(material, Mapping)
+    )
+    if not has_contract_material:
+        return _condition_result("uncertain", "未找到合同关键页或合同材料事实。")
+    service = _service_condition(fact)
+    if service["status"] != "pass":
+        return _condition_result("uncertain", "合同材料存在，但服务内容事实不足以确认当前评分所需证明材料。")
+    amount_facts = fact.get("contract_amount_facts", [])
+    has_amount_fact = any(
+        isinstance(entry, Mapping) and entry.get("status") in {"present", "pass"}
+        for entry in amount_facts
+    ) if isinstance(amount_facts, list) else False
+    amount = fact.get("amount")
+    if not has_amount_fact:
+        return _condition_result("uncertain", "未找到合同金额页事实。")
+    if require_cumulative_amount and amount.get("cumulative_value") is None:
+        return _condition_result("uncertain", "合同金额事实不是可直接累计的固定金额。")
+    framework = fact.get("framework_contract")
+    framework_status = _as_text(framework.get("status")) if isinstance(framework, Mapping) else "uncertain"
+    if framework_status in {"yes", "uncertain"}:
+        supporting_material = any(
+            any(term in json.dumps(material, ensure_ascii=False) for term in ("采购订单", "结算", "发票", "甲方确认"))
+            for material in materials
+            if isinstance(material, Mapping)
+        )
+        if not supporting_material:
+            return _condition_result("uncertain", "可能属于框架合同，但未找到采购订单、结算或甲方确认材料。")
+    return _condition_result("pass", "已找到合同关键页及当前评分所需的服务、金额和合同材料事实。")
+
+
+def _signature_page_condition(fact: Mapping[str, Any]) -> dict[str, Any]:
+    status = _check_status(fact, "signature_page")
+    if status == "fail":
+        return _condition_result("invalid", "现有检查明确未确认合同签字盖章页。")
+    if status == "pass":
+        return _condition_result("pass", "现有检查确认合同签字盖章页存在。")
+    return _condition_result("uncertain", "未能确认合同签字盖章页。")
+
+
+def _signature_date_condition(
+    fact: Mapping[str, Any],
+    *,
+    announcement_date: str | None,
+) -> dict[str, Any]:
+    dates = fact.get("signature_dates", [])
+    if not isinstance(dates, list) or not dates:
+        if _check_status(fact, "signature_date") == "fail":
+            return _condition_result("invalid", "现有检查确认合同签署日期栏为空或不满足要求。")
+        return _condition_result("uncertain", "未能从现有事实中确认合同签署日期。")
+    if len(set(dates)) != 1:
+        return _condition_result("uncertain", "合同签署日期存在多个相互冲突的事实，无法确定用于评分的签署日期。", dates=dates)
+    if announcement_date is None:
+        return _condition_result("uncertain", "缺少招标公告发布日期，无法判断签署日期是否早于公告发布前一日。", dates=dates)
+    signing_date = _parse_date(dates[0])
+    announcement = _parse_date(announcement_date)
+    if signing_date is None or announcement is None:
+        return _condition_result("uncertain", "签署日期或公告发布日期格式无法可靠解析。", dates=dates)
+    lower = date(2023, 1, 1)
+    if not lower <= signing_date < announcement:
+        return _condition_result(
+            "invalid",
+            "合同签署日期不在2023年1月1日至公告发布前一日范围内。",
+            signing_date=signing_date.isoformat(),
+            announcement_date=announcement.isoformat(),
+        )
+    return _condition_result(
+        "pass",
+        "合同签署日期处于招标文件要求的时间范围内。",
+        signing_date=signing_date.isoformat(),
+        announcement_date=announcement.isoformat(),
+    )
+
+
+def _performance_rule_case_evaluation(
+    fact: Mapping[str, Any],
+    *,
+    item_number: str,
+    announcement_date: str | None,
+) -> dict[str, Any]:
+    role = _as_text(fact.get("role")) or "unknown"
+    overall_status = _as_text(fact.get("overall_status")) or "uncertain"
+    base = {
+        "entry_index": fact.get("entry_index"),
+        "case_number": fact.get("case_number"),
+        "project_name": fact.get("project_name"),
+        "role": role,
+        "overall_status": overall_status,
+        "overall_status_ignored": True,
+        "amount": fact.get("amount"),
+        "source_blocks": fact.get("source_blocks", []),
+        "conditions": {},
+        "included_in_scoring": False,
+    }
+    if role == "qualification":
+        base.update(
+            {
+                "current_rule_status": "excluded_by_role",
+                "reason": "该业绩在业绩表中明确标记为资格要求业绩，按当前评分规则排除；不使用其overall_status判断排除关系。",
+            }
+        )
+        base["conditions"] = {"role": _condition_result("pass", "业绩角色明确为资格要求业绩。")}
+        return base
+    if role != "scoring":
+        base.update(
+            {
+                "current_rule_status": "uncertain",
+                "reason": "业绩表未明确标记为资格要求业绩或评分业绩，无法建立当前评分项的排除关系。",
+            }
+        )
+        base["conditions"] = {"role": _condition_result("uncertain", "角色标识缺失或无法识别。")}
+        return base
+
+    conditions = {
+        "role": _condition_result("pass", "业绩表角色明确为评分业绩。"),
+        "contract_signing_date": _signature_date_condition(
+            fact,
+            announcement_date=announcement_date,
+        ),
+        "same_type_technical_service": _service_condition(fact),
+        "signature_page": _signature_page_condition(fact),
+        "proof_material": _proof_condition(
+            fact,
+            require_cumulative_amount=item_number == "011",
+        ),
+    }
+    statuses = [condition["status"] for condition in conditions.values()]
+    if "invalid" in statuses:
+        current_status = "invalid"
+        reason = "；".join(
+            condition["reason"] for condition in conditions.values() if condition["status"] == "invalid"
+        )
+    elif "uncertain" in statuses:
+        current_status = "uncertain"
+        reason = "；".join(
+            condition["reason"] for condition in conditions.values() if condition["status"] == "uncertain"
+        )
+    else:
+        current_status = "valid"
+        reason = "已满足当前评分项要求的角色、签署日期、同类型技术服务及证明材料条件。"
+    base.update(
+        {
+            "current_rule_status": current_status,
+            "reason": reason,
+            "conditions": conditions,
+            "included_in_scoring": current_status == "valid",
+        }
+    )
+    return base
 
 
 def _performance_handler(
@@ -431,6 +947,7 @@ def _performance_handler(
     *,
     item_number: str,
     artifacts: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     facts = _performance_facts(artifacts)
     evidence = _performance_evidence(facts)
@@ -446,16 +963,74 @@ def _performance_handler(
             related_artifacts=related,
         )
 
-    extra = [fact for fact in facts if fact["role"] == "scoring"]
-    valid_extra = [fact for fact in extra if fact["overall_status"] == "pass"]
-    unresolved = [fact for fact in extra if fact["overall_status"] not in {"pass", "fail"}]
-    invalid = [fact for fact in extra if fact["overall_status"] == "fail"]
+    announcement_date = (
+        _as_text(tender_evidence.get("announcement_date"))
+        if isinstance(tender_evidence, Mapping)
+        else None
+    ) or None
+    case_evaluations = [
+        _performance_rule_case_evaluation(
+            fact,
+            item_number=item_number,
+            announcement_date=announcement_date,
+        )
+        for fact in facts
+    ]
+    extra = [case for case in case_evaluations if case["role"] == "scoring"]
+    valid_extra = [case for case in extra if case["current_rule_status"] == "valid"]
+    unresolved = [case for case in extra if case["current_rule_status"] == "uncertain"]
+    invalid = [case for case in extra if case["current_rule_status"] == "invalid"]
+    qualified_excluded_amount = sum(
+        float(case["amount"]["cumulative_value"])
+        for case in case_evaluations
+        if case["current_rule_status"] == "excluded_by_role"
+        and isinstance(case.get("amount"), Mapping)
+        and isinstance(case["amount"].get("cumulative_value"), (int, float))
+    )
+    common_facts = {
+        "performance_cases": facts,
+        "case_evaluations": case_evaluations,
+        "valid_extra_case_count": len(valid_extra),
+        "uncertain_extra_case_count": len(unresolved),
+        "invalid_extra_case_count": len(invalid),
+        "excluded_qualification_case_numbers": [
+            case["case_number"] for case in case_evaluations if case["current_rule_status"] == "excluded_by_role"
+        ],
+        "excluded_qualification_amount": qualified_excluded_amount,
+        "announcement_date": announcement_date,
+        "announcement_date_source": tender_evidence.get("announcement_date_source")
+        if isinstance(tender_evidence, Mapping)
+        else None,
+    }
     if unresolved:
+        if item_number == "010":
+            reason = "存在评分业绩无法依据当前评分规则确认是否有效，无法可靠确定新增业绩数量。"
+            calculation = {
+                "formula": "min(当前评分规则下有效新增评分业绩数量 × 1, 5)",
+                "confirmed_score_lower_bound": min(5, len(valid_extra)),
+                "potential_score_upper_bound": min(5, len(valid_extra) + len(unresolved)),
+                "unresolved_case_numbers": [case["case_number"] for case in unresolved],
+            }
+        else:
+            confirmed_amount = sum(
+                float(case["amount"]["cumulative_value"])
+                for case in valid_extra
+                if isinstance(case.get("amount"), Mapping)
+                and isinstance(case["amount"].get("cumulative_value"), (int, float))
+            )
+            reason = "存在评分业绩的当前评分条件或累计金额无法确认，无法可靠确定金额分档。"
+            calculation = {
+                "formula": "剔除资格要求业绩后累计当前评分规则确认的合同金额，并按1900/1500/1000万元档位计分",
+                "qualified_excluded_amount": qualified_excluded_amount,
+                "confirmed_cumulative_amount": confirmed_amount,
+                "unresolved_case_numbers": [case["case_number"] for case in unresolved],
+            }
         return _status_result(
             result,
             status="evidence_insufficient",
-            reason="存在评分业绩检查结果为不确定，无法确认其是否属于可计分的有效新增业绩。",
-            facts={"performance_cases": facts, "valid_extra_case_count": len(valid_extra)},
+            reason=reason,
+            facts=common_facts,
+            calculation=calculation,
             evidence=evidence,
             related_artifacts=related,
         )
@@ -464,27 +1039,27 @@ def _performance_handler(
         calculation = {
             "formula": "min(有效新增评分业绩数量 × 1, 5)",
             "valid_extra_case_count": len(valid_extra),
-            "excluded_qualification_case_numbers": [
-                fact["case_number"]
-                for fact in facts
-                if fact["role"] == "qualification"
-            ],
+            "excluded_qualification_case_numbers": common_facts["excluded_qualification_case_numbers"],
         }
     else:
-        if any(fact.get("amount") is None for fact in valid_extra):
+        if any(
+            not isinstance(case.get("amount"), Mapping)
+            or case["amount"].get("cumulative_value") is None
+            for case in valid_extra
+        ):
             return _status_result(
                 result,
                 status="evidence_insufficient",
                 reason="有效新增评分业绩缺少可用于累计的固定合同金额，无法执行剔除资格业绩后的金额评分。",
-                facts={"performance_cases": facts, "valid_extra_case_count": len(valid_extra)},
+                facts=common_facts,
                 evidence=evidence,
                 related_artifacts=related,
             )
-        amount_total = sum(float(fact["amount"]) for fact in valid_extra)
+        amount_total = sum(float(case["amount"]["cumulative_value"]) for case in valid_extra)
         score = 5 if amount_total >= 1900 else 3 if amount_total >= 1500 else 1 if amount_total >= 1000 else 0
         calculation = {
             "formula": "剔除资格要求业绩金额后累计评分业绩金额，并按 1900/1500/1000 万元档位计分",
-            "qualified_excluded_amount": 0,
+            "qualified_excluded_amount": qualified_excluded_amount,
             "scoring_amount": amount_total,
             "valid_extra_case_count": len(valid_extra),
         }
@@ -492,12 +1067,8 @@ def _performance_handler(
         result,
         status="auto_scored",
         score=score,
-        reason="已依据业绩表角色标识和既有业绩合同检查结果完成资格业绩排除后的确定性计算。",
-        facts={
-            "performance_cases": facts,
-            "valid_extra_case_count": len(valid_extra),
-            "invalid_extra_case_count": len(invalid),
-        },
+        reason="已依据业绩表角色标识和当前评分规则下确认的业绩事实完成资格业绩排除后的确定性计算。",
+        facts=common_facts,
         calculation=calculation,
         evidence=evidence,
         related_artifacts=related,
@@ -759,6 +1330,7 @@ def _dispatch_item(
     *,
     evidence: Mapping[str, Any],
     bid_file: FileMetadata,
+    tender_evidence: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     item_id = _as_text(item.get("id"))
     name = _as_text(item.get("name"))
@@ -790,9 +1362,19 @@ def _dispatch_item(
             artifacts=artifacts,
         )
     if "score_item_010" in normalized or "类似案例1" in name:
-        return _performance_handler(result, item_number="010", artifacts=artifacts)
+        return _performance_handler(
+            result,
+            item_number="010",
+            artifacts=artifacts,
+            tender_evidence=tender_evidence,
+        )
     if "score_item_011" in normalized or "类似案例2" in name:
-        return _performance_handler(result, item_number="011", artifacts=artifacts)
+        return _performance_handler(
+            result,
+            item_number="011",
+            artifacts=artifacts,
+            tender_evidence=tender_evidence,
+        )
     if "score_item_012" in normalized or "人员稳定性" in name:
         return _stability_handler(
             result,
@@ -827,6 +1409,7 @@ def run_objective_scoring(
     bid_document: Mapping[str, Any] | None = None,
     artifact_dir: Path | None = None,
     existing_artifacts: Mapping[str, Any] | None = None,
+    tender_evidence: Mapping[str, Any] | None = None,
     recorder: ComplianceExtractionRecorder | None = None,
     bid_parse_fallback_used: bool = False,
 ) -> dict[str, Any]:
@@ -857,6 +1440,7 @@ def run_objective_scoring(
                 score_item,
                 evidence=evidence,
                 bid_file=bid_file,
+                tender_evidence=tender_evidence,
             )
         )
 
@@ -874,6 +1458,10 @@ def run_objective_scoring(
         ),
         "missing_artifacts": sorted(evidence["missing_artifacts"]),
     }
+    if isinstance(tender_evidence, Mapping):
+        source["tender_parsed_blocks_artifact"] = tender_evidence.get("artifact_path")
+        source["announcement_date"] = tender_evidence.get("announcement_date")
+        source["announcement_date_source"] = tender_evidence.get("announcement_date_source")
     payload: dict[str, Any] = {
         "schema_version": "objective-score-v1",
         "source": source,

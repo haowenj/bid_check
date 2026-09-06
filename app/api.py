@@ -45,6 +45,7 @@ from app.evaluation_rule_extraction import (
 )
 from app.objective_scoring import (
     load_reusable_bid_evidence,
+    load_reusable_tender_evidence,
     run_objective_scoring,
 )
 from app.config import Settings, load_settings
@@ -568,7 +569,7 @@ def build_default_workflow(
         evaluation_result: dict[str, Any],
         recorder=None,
     ) -> dict[str, Any]:
-        del tender_file
+        tender_evidence = load_reusable_tender_evidence(tender_file)
         evidence = load_reusable_bid_evidence(bid_file)
         parser_fallback_used = False
         if evidence["bid_document"] is None:
@@ -589,6 +590,7 @@ def build_default_workflow(
                 if evidence["bid_document_artifact"]
                 else None
             ),
+            tender_evidence=tender_evidence,
             recorder=recorder,
             bid_parse_fallback_used=parser_fallback_used,
         )

@@ -200,6 +200,110 @@ def make_performance_reviews(
     return {"performance_reviews": reviews, "stats": {}}
 
 
+def make_rule_item(item_id: str, name: str, original_rule: str) -> dict[str, Any]:
+    return _named_item(item_id, name, original_rule)
+
+
+def make_tender_evidence() -> dict[str, Any]:
+    return {
+        "artifact_path": "/tmp/01_parsed_blocks.json",
+        "announcement_date": "2026-03-30",
+        "announcement_date_source": {"block_id": "b0072", "text": "2026年03月30日"},
+    }
+
+
+def make_rule_with_performance_item(item_id: str, name: str) -> dict[str, Any]:
+    return _single_item_rules(
+        make_rule_item(item_id, name, "2023年1月1日至公告发布前一日的同类型技术服务业绩。")
+    )
+
+
+def make_rule_relevant_performance_review(
+    *,
+    role: str,
+    overall_status: str,
+    amount_text: str,
+    signed_date_text: str,
+    table_time_status: str = "pass",
+) -> dict[str, Any]:
+    remark = "资格要求业绩" if role == "qualification" else "评分业绩"
+    row = {
+        "序号": "1" if role == "qualification" else "2",
+        "项目名称": "云平台技术运维服务项目",
+        "备注": remark,
+    }
+    evidence = [{"kind": "ocr_text", "image_id": "i1", "ocr_text": amount_text}]
+    checks = {
+        "service_content": {
+            "status": "pass",
+            "reason": "包含云平台技术支持、系统运维和巡检服务。",
+            "evidence": evidence,
+        },
+        "implementation_time": {
+            "status": "pass",
+            "reason": "服务期限已提取。",
+            "evidence": evidence,
+        },
+        "contract_amount": {
+            "status": "pass",
+            "reason": "合同金额事实已提取。",
+            "evidence": evidence,
+        },
+        "signature_page": {
+            "status": "pass",
+            "reason": "合同关键页已提供。",
+            "evidence": evidence,
+        },
+        "signature_date": {
+            "status": "pass",
+            "reason": "签署日期已提取。",
+            "evidence": evidence,
+        },
+        "table_time_consistency": {
+            "status": table_time_status,
+            "reason": "表格服务期限与合同期限不一致。"
+            if table_time_status != "pass"
+            else "一致。",
+            "evidence": evidence,
+        },
+    }
+    return {
+        "status": overall_status,
+        "table_row": row,
+        "checks_by_key": checks,
+        "ocr_facts": {
+            "service_content": [
+                {
+                    "field": "service_content",
+                    "status": "present",
+                    "value": "云平台技术支持、系统调试、平台运行维护和设备巡检服务",
+                    "image_id": "i1",
+                    "evidence": [{"evidence_text": "云平台技术支持、系统运维和巡检服务"}],
+                }
+            ],
+            "contract_amount": [
+                {
+                    "field": "contract_amount",
+                    "status": "present",
+                    "value": amount_text,
+                    "image_id": "i1",
+                    "evidence": [{"evidence_text": amount_text}],
+                }
+            ],
+        },
+        "materials": [{"material_type": "服务合同", "role": "contract", "image_ids": ["i1"]}],
+        "framework_contract": {"status": "no", "evidence": []},
+        "text_model_extraction": {
+            "signature_date_candidates": [
+                {
+                    "image_id": "i1",
+                    "evidence": [{"evidence_text": signed_date_text}],
+                }
+            ],
+        },
+    }
+
+
 def make_price_rule() -> dict[str, Any]:
     return _single_item_rules(
         _named_item(
@@ -368,21 +472,41 @@ def test_performance_scoring_excludes_qualification_case_and_requires_valid_extr
     for item in result["score_items"]:
         assert item["status"] == "evidence_insufficient"
         assert item["score"] is None
-        assert "资格" in item["reason"]
+        assert "评分业绩" in item["reason"]
+        assert item["facts"]["case_evaluations"][0]["current_rule_status"] == "excluded_by_role"
 
 
 def test_performance_scoring_counts_only_valid_extra_cases_and_excludes_qualification(tmp_path):
     rules = make_performance_rules()
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="pass",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    scoring_1 = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年2月10日",
+    )
+    scoring_2 = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="uncertain",
+        amount_text="2000000元",
+        signed_date_text="2025年3月10日",
+    )
     artifacts = {
-        "10_performance_reviews.json": make_performance_reviews(
-            qualification_case_status="pass",
-            scoring_case_statuses=["pass", "pass"],
-        )
+        "10_performance_reviews.json": {
+            "performance_reviews": [qualification, scoring_1, scoring_2],
+            "stats": {},
+        }
     }
 
     result = run_objective_scoring(
         rules,
         _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
         existing_artifacts=artifacts,
     )
 
@@ -394,18 +518,35 @@ def test_performance_scoring_counts_only_valid_extra_cases_and_excludes_qualific
 
 
 def test_performance_amount_scoring_uses_only_extra_case_amounts(tmp_path):
-    reviews = make_performance_reviews(
-        qualification_case_status="pass",
-        scoring_case_statuses=["pass", "pass"],
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="pass",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
     )
-    reviews["performance_reviews"][1]["checks_by_key"]["contract_amount"]["amount_value"] = 1000
-    reviews["performance_reviews"][2]["checks_by_key"]["contract_amount"]["amount_value"] = 600
+    scoring_1 = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="pass",
+        amount_text="10000000元",
+        signed_date_text="2025年2月10日",
+    )
+    scoring_2 = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="pass",
+        amount_text="6000000元",
+        signed_date_text="2025年3月10日",
+    )
+    reviews = {
+        "performance_reviews": [qualification, scoring_1, scoring_2],
+        "stats": {},
+    }
 
     result = run_objective_scoring(
         _single_item_rules(
             _named_item("score_item_011", "类似案例2", "剔除资格要求业绩金额后累计金额评分。")
         ),
         _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
         existing_artifacts={"10_performance_reviews.json": reviews},
     )
 
@@ -477,3 +618,72 @@ def test_recorder_writes_an_independent_objective_score_artifact(tmp_path):
     artifact = task_dir / "compliance_extraction" / "objective_scores.json"
     assert artifact.is_file()
     assert json.loads(artifact.read_text(encoding="utf-8")) == result
+
+
+def test_performance_scoring_ignores_qualification_overall_status(tmp_path):
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    scoring = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="fail",
+        amount_text="2000000元",
+        signed_date_text="2025年2月10日",
+        table_time_status="fail",
+    )
+    result = run_objective_scoring(
+        make_rule_with_performance_item("score_item_010", "类似案例1"),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts={
+            "10_performance_reviews.json": {
+                "performance_reviews": [qualification, scoring],
+                "stats": {},
+            }
+        },
+    )
+
+    item = result["score_items"][0]
+    assert item["status"] == "auto_scored"
+    assert item["score"] == 1
+    assert item["facts"]["case_evaluations"][0]["current_rule_status"] == "excluded_by_role"
+    assert item["facts"]["case_evaluations"][1]["current_rule_status"] == "valid"
+    assert item["facts"]["case_evaluations"][1]["overall_status_ignored"] is True
+
+
+def test_performance_amount_is_normalized_from_ocr_facts_not_table_value(tmp_path):
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    scoring = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="fail",
+        amount_text="36400000元",
+        signed_date_text="2025年2月10日",
+    )
+    scoring["table_row"]["销售金额（万元）"] = "1"
+    result = run_objective_scoring(
+        make_rule_with_performance_item("score_item_011", "类似案例2"),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts={
+            "10_performance_reviews.json": {
+                "performance_reviews": [qualification, scoring],
+                "stats": {},
+            }
+        },
+    )
+
+    item = result["score_items"][0]
+    assert item["status"] == "auto_scored"
+    assert item["score"] == 5
+    case = item["facts"]["case_evaluations"][1]
+    assert case["amount"]["value"] == 3640
+    assert case["amount"]["unit"] == "万元"
+    assert case["amount"]["basis"] == "contract_fact"
