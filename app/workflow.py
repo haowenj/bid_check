@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -38,6 +39,7 @@ class BidCheckServices:
     extract_with_recorder: Callable[..., dict[str, Any]] | None = None
     extract_evaluation_with_recorder: Callable[..., dict[str, Any]] | None = None
     score_objective_with_recorder: Callable[..., dict[str, Any]] | None = None
+    score_subjective_with_recorder: Callable[..., dict[str, Any]] | None = None
     execute_veto_with_recorder: Callable[..., dict[str, Any]] | None = None
     review_with_recorder: Callable[..., dict[str, Any]] | None = None
 
@@ -551,6 +553,88 @@ class BidCheckWorkflow:
                 task_id,
                 _elapsed_ms(started_at),
             )
+
+    def run_subjective(self, task_id: str) -> None:
+        started_at = time.perf_counter()
+        task = self.repository.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.check_mode != "evaluation":
+            raise ValueError("主观评分仅支持评标任务。")
+        if self.services.score_subjective_with_recorder is None:
+            raise RuntimeError("subjective scoring service not configured")
+
+        recorder: ComplianceExtractionRecorder | None = None
+        try:
+            recorder = ComplianceExtractionRecorder.from_tender_path(
+                Path(task.tender_file.storage_path)
+            )
+        except OSError as recorder_error:
+            logger.warning(
+                "subjective.score.recorder.init.error task_id=%s error_type=%s",
+                task_id,
+                type(recorder_error).__name__,
+            )
+
+        evaluation_rules: dict[str, Any] | None = None
+        stored_result = task.result if isinstance(task.result, dict) else {}
+        stored_rules = stored_result.get("evaluation_rules")
+        if isinstance(stored_rules, dict):
+            evaluation_rules = dict(stored_rules)
+        else:
+            artifact_path = (
+                Path(task.tender_file.storage_path).parent
+                / "compliance_extraction"
+                / "11_evaluation_rules.json"
+            )
+            try:
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as artifact_error:
+                raise RuntimeError("11_evaluation_rules.json not available") from artifact_error
+            if not isinstance(artifact, dict):
+                raise TypeError("11_evaluation_rules.json must contain an object")
+            evaluation_rules = artifact
+
+        if recorder is not None:
+            recorder.event("subjective.score.execution.start", task_id=task_id)
+        logger.info("subjective.score.execution.start task_id=%s", task_id)
+        try:
+            result = self.services.score_subjective_with_recorder(
+                task.tender_file,
+                task.bid_file,
+                evaluation_rules,
+                recorder=recorder,
+            )
+            self.repository.update_result(task_id, {"subjective_scores": result})
+            elapsed_ms = _elapsed_ms(started_at)
+            if recorder is not None:
+                recorder.event(
+                    "subjective.score.execution.persisted",
+                    task_id=task_id,
+                    elapsed_ms=elapsed_ms,
+                )
+            logger.info(
+                "subjective.score.execution.end task_id=%s elapsed_ms=%d",
+                task_id,
+                elapsed_ms,
+            )
+        except Exception as exc:
+            elapsed_ms = _elapsed_ms(started_at)
+            if recorder is not None:
+                recorder.event(
+                    "subjective.score.execution.error",
+                    task_id=task_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    elapsed_ms=elapsed_ms,
+                )
+            logger.error(
+                "subjective.score.execution.error task_id=%s error_type=%s elapsed_ms=%d",
+                task_id,
+                type(exc).__name__,
+                elapsed_ms,
+            )
+            raise
 
     def shutdown(self, wait: bool = True) -> None:
         if self._owns_executor:

@@ -7,8 +7,8 @@ from threading import Barrier
 
 import pytest
 
-from app.workflow import BidCheckServices, BidCheckWorkflow
 from app.models import FileMetadata
+from app.workflow import BidCheckServices, BidCheckWorkflow
 
 
 def empty_objects():
@@ -419,3 +419,42 @@ def test_evaluation_workflow_runs_veto_execution_after_objective_scoring(
     assert completed is not None
     assert completed.result["veto_rule_reviews"] == veto
     assert calls == ["evaluate", "objective", "veto"]
+
+
+def test_run_subjective_does_not_call_other_evaluation_stages(
+    task_repository, tmp_path
+):
+    calls = []
+    task = create_evaluation_task(task_repository, tmp_path)
+    artifact_dir = Path(task.tender_file.storage_path).parent / "compliance_extraction"
+    artifact_dir.mkdir(parents=True)
+    rules = evaluation_result()
+    (artifact_dir / "11_evaluation_rules.json").write_text(
+        json.dumps(rules),
+        encoding="utf-8",
+    )
+
+    def score_subjective(tender_file, bid_file, evaluation_rules, recorder=None):
+        del tender_file, bid_file, recorder
+        calls.append("subjective")
+        assert evaluation_rules == rules
+        return {"score_items": [], "stats": {"subjective_item_count": 0}}
+
+    services = BidCheckServices(
+        extract=lambda _: calls.append("extract"),
+        parse=lambda _: calls.append("parse"),
+        review=lambda *_: calls.append("review"),
+        score_objective_with_recorder=lambda *args, **kwargs: calls.append("objective"),
+        execute_veto_with_recorder=lambda *args, **kwargs: calls.append("veto"),
+        score_subjective_with_recorder=score_subjective,
+    )
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run_subjective(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    completed = task_repository.get(task.task_id)
+    assert calls == ["subjective"]
+    assert completed is not None
+    assert completed.result["subjective_scores"]["score_items"] == []

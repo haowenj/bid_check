@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -14,7 +15,6 @@ from app.models import (
     StageName,
     TaskStatus,
 )
-
 
 TASK_STATUSES = frozenset({"pending", "running", "complete", "failed"})
 CHECK_MODES = frozenset({"compliance", "evaluation", "full"})
@@ -227,6 +227,38 @@ class BidCheckRepository:
             )
             if cursor.rowcount != 1:
                 raise KeyError(task_id)
+        return self._get_required(task_id)
+
+    def update_result(
+        self,
+        task_id: str,
+        result_patch: Mapping[str, Any],
+    ) -> BidCheckTask:
+        if not isinstance(result_patch, Mapping):
+            raise TypeError("result patch must be a mapping")
+        with self._write_lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM bid_check_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            existing = json.loads(row["result_json"]) if row["result_json"] else {}
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(dict(result_patch))
+            connection.execute(
+                """
+                UPDATE bid_check_tasks
+                SET result_json = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    json.dumps(existing, ensure_ascii=False),
+                    self._now(),
+                    task_id,
+                ),
+            )
         return self._get_required(task_id)
 
     def fail(

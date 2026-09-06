@@ -112,3 +112,20 @@ def test_fail_records_failed_stage_and_message(tmp_path):
     assert failed.bid_parse_status == "failed"
     assert failed.failed_stage == "bid_parse"
     assert failed.error_message == "模拟投标文件解析失败"
+
+
+def test_update_result_merges_subjective_scores_without_changing_stage_states(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    created = repository.create("task-001", tender_file, bid_file, "evaluation")
+
+    updated = repository.update_result(
+        "task-001",
+        {"subjective_scores": {"score_items": []}},
+    )
+
+    assert updated.result == {"subjective_scores": {"score_items": []}}
+    assert updated.status == created.status
+    assert updated.requirements_status == created.requirements_status
+    assert updated.bid_parse_status == created.bid_parse_status
+    assert updated.review_status == created.review_status
