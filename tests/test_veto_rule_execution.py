@@ -413,7 +413,7 @@ def test_veto_009_executes_all_sixteen_subconditions_and_aggregates_dependencies
     assert by_index[1]["status"] == "external_data_required"
     assert by_index[2]["status"] == "manual_review_required"
     assert by_index[4]["status"] == "not_applicable"
-    assert by_index[6]["status"] == "other_bidder_data_required"
+    assert by_index[6]["status"] == "file_scope_missing"
     assert by_index[7]["status"] == "manual_review_required"
     assert {branch["status"] for branch in by_index[7]["branches"]} == {
         "not_applicable",
@@ -516,6 +516,85 @@ def test_veto_009_does_not_promote_unmatched_material_failure_to_subcondition_tr
     subcondition = next(item for item in review["sub_conditions"] if item["index"] == 3)
     assert subcondition["status"] != "triggered"
     assert review["status"] != "triggered"
+
+
+def test_veto_009_signature_subcondition_does_not_use_identity_attachment_pass(
+    tmp_path,
+):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "semantic_match": {"status": "matched"},
+                    "status": "pass",
+                    "execution_status": "completed",
+                    "requirements": [
+                        {
+                            "requirement": "法定代表人/负责人的合法有效身份证明复印件或扫描件",
+                            "status": "pass",
+                            "reason": "已提供身份证明材料",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[veto_009_rule()]),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    subcondition = next(item for item in review["sub_conditions"] if item["index"] == 3)
+    assert subcondition["status"] == "evidence_insufficient"
+    assert subcondition["triggered"] is False
+    assert "身份证" not in " ".join(subcondition["facts_required"])
+
+
+def test_veto_009_submission_count_uses_current_bid_scope_not_other_bidder_data(
+    tmp_path,
+):
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[veto_009_rule()]),
+        bid_file(tmp_path, name="商务投标文件.docx"),
+        bid_document=business_only_document(),
+    )
+
+    review = result["veto_rule_reviews"][0]
+    subcondition = next(item for item in review["sub_conditions"] if item["index"] == 6)
+    assert subcondition["status"] == "file_scope_missing"
+    assert subcondition["dependencies"]["other_bidder_data_required"] is False
+
+
+def test_veto_006_reason_only_references_submission_process_facts(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_006",
+                    "逾期送达或未按要求密封",
+                    "出现下列情形之一：1.逾期送达或者未送达指定地点的；2.未按照招标文件要求密封的；"
+                    "3.未通过资格预审的申请人递交的；4.未按照第一章“招标公告”或者投标邀请书要求获得本项目招标文件的。",
+                    original="4.1.5出现下列情形之一时，招标人/招标代理机构不予接收投标文件：",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] == "manual_review_required"
+    assert "递交" in review["reason"]
+    assert "签收" in review["reason"]
+    assert "密封" in review["reason"]
+    assert "资格预审" in review["reason"]
+    assert "招标文件" in review["reason"]
+    assert "算术修正" not in review["reason"]
+    assert "评标委员会认定" not in review["reason"]
 
 
 def test_low_price_requires_evaluation_process_and_is_not_auto_triggered(tmp_path):

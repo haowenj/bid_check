@@ -509,6 +509,100 @@ def test_normalizer_rebinds_low_cost_rule_to_its_actual_source_block():
     )
 
 
+def test_normalizer_expands_delivery_rule_source_to_all_four_trigger_blocks():
+    from app.evaluation_rule_extraction import (
+        _coerce_evaluation_output,
+        _normalize_evaluation_sources,
+    )
+
+    candidate = _candidate(
+        "b0196",
+        "4.1投标文件的递交",
+        "4.1.5出现下列情形之一时，招标人/招标代理机构不予接收投标文件：",
+    )
+    candidate = candidate.__class__(
+        **{
+            **candidate.__dict__,
+            "block_ids": ["b0196", "b0197", "b0198", "b0199", "b0200"],
+            "text": "\n".join(
+                [
+                    "4.1.5出现下列情形之一时，招标人/招标代理机构不予接收投标文件：",
+                    "1. 逾期送达或者未送达指定地点的；",
+                    "2. 未按照招标文件要求密封的；",
+                    "3. 未通过资格预审的申请人递交的；",
+                    "4. 未按照第一章“招标公告”或者投标邀请书要求获得本项目招标文件的。",
+                ]
+            ),
+            "blocks": [
+                _block(
+                    "b0196",
+                    "paragraph",
+                    "4.1.5出现下列情形之一时，招标人/招标代理机构不予接收投标文件：",
+                    "4.1投标文件的递交",
+                    196,
+                ),
+                _block(
+                    "b0197",
+                    "paragraph",
+                    "1. 逾期送达或者未送达指定地点的；",
+                    "4.1投标文件的递交",
+                    197,
+                ),
+                _block(
+                    "b0198",
+                    "paragraph",
+                    "2. 未按照招标文件要求密封的；",
+                    "4.1投标文件的递交",
+                    198,
+                ),
+                _block(
+                    "b0199",
+                    "paragraph",
+                    "3. 未通过资格预审的申请人递交的；",
+                    "4.1投标文件的递交",
+                    199,
+                ),
+                _block(
+                    "b0200",
+                    "paragraph",
+                    "4. 未按照第一章“招标公告”或者投标邀请书要求获得本项目招标文件的。",
+                    "4.1投标文件的递交",
+                    200,
+                ),
+            ],
+        }
+    )
+    output = _coerce_evaluation_output(
+        {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [
+                {
+                    "name": "逾期送达或未按要求密封",
+                    "trigger_condition": (
+                        "出现下列情形之一：1.逾期送达或者未送达指定地点的；"
+                        "2.未按照招标文件要求密封的；3.未通过资格预审的申请人递交的；"
+                        "4.未按照第一章“招标公告”或者投标邀请书要求获得本项目招标文件的。"
+                    ),
+                    "consequence": "不予接收投标文件",
+                    "evidence_requirements": [],
+                    "original_rule": "4.1.5出现下列情形之一时，招标人/招标代理机构不予接收投标文件：...",
+                    "source_block_ids": ["b0196"],
+                }
+            ],
+            "uncertain_rules": [],
+        }
+    )
+
+    normalized = _normalize_evaluation_sources(output, [candidate])
+    source = normalized["veto_rules"][0]["source"]
+    assert source["block_ids"] == ["b0196", "b0197", "b0198", "b0199", "b0200"]
+    assert "逾期送达或者未送达指定地点" in source["source_text"]
+    assert "未按照招标文件要求密封" in source["source_text"]
+    assert "未通过资格预审" in source["source_text"]
+    assert "获得本项目招标文件" in source["source_text"]
+
+
 def test_normalizer_rebinds_whole_candidate_hint_and_keeps_unexplicit_veto_uncertain():
     from app.evaluation_rule_extraction import (
         _coerce_evaluation_output,

@@ -700,6 +700,29 @@ def _rule_source_ids(
     hinted_source = "\n".join(
         block.text for block in candidate.blocks if block.block_id in hinted_set
     )
+    rule_key = _compact_rule_text(rule)
+    distinctive_clauses = _distinctive_rule_clauses(rule)
+    clause_match_ids = {
+        block.block_id
+        for block in candidate.blocks
+        if any(
+            clause in _compact_rule_text(block.text)
+            for clause in distinctive_clauses
+        )
+    }
+    numbered_condition_count = len(
+        re.findall(r"(?:^|[：:；，。])\s*[1-9]\s*[.、）)]", rule)
+    )
+    if len(clause_match_ids) >= 2 and numbered_condition_count >= 2:
+        # Numbered trigger conditions are often split across consecutive
+        # blocks. Keep the hinted heading and every block carrying a distinct
+        # condition so the source remains auditable as one rule.
+        source_ids = clause_match_ids | hinted_set
+        return [
+            block.block_id
+            for block in candidate.blocks
+            if block.block_id in source_ids
+        ]
     # A model occasionally returns every block in a candidate. Preserve a
     # deliberately small set (for example, a table row plus its evidence
     # paragraph), but rebind a whole-candidate hint to the block containing
@@ -716,7 +739,6 @@ def _rule_source_ids(
         for clause in _distinctive_rule_clauses(rule)
     ):
         return list(hinted_ids)
-    rule_key = _compact_rule_text(rule)
     clauses = [
         _compact_rule_text(clause)
         for clause in re.split(r"[，。；、：:,.!?！？…]+", rule)
@@ -731,7 +753,6 @@ def _rule_source_ids(
     ]
     if exact_matches:
         return exact_matches[:1]
-    distinctive_clauses = _distinctive_rule_clauses(rule)
     scored_matches = []
     for block in candidate.blocks:
         block_key = _compact_rule_text(block.text)
@@ -758,6 +779,19 @@ def _source_for_rule_ids(
     if resolved_ids == list(hinted_ids):
         return _source_for_ids(hinted_ids, candidates)
     return _source_for_ids(resolved_ids, [candidate])
+
+
+def _source_reference_rule(item: Mapping[str, Any]) -> str:
+    original_rule = str(item.get("original_rule", ""))
+    trigger_condition = str(item.get("trigger_condition", ""))
+    if (
+        trigger_condition
+        and ("..." in original_rule or "…" in original_rule)
+        and len(_compact_rule_text(trigger_condition))
+        > len(_compact_rule_text(original_rule))
+    ):
+        return trigger_condition
+    return original_rule
 
 
 def _procurement_mode_scores(text: str) -> dict[str, int]:
@@ -974,10 +1008,11 @@ def _normalize_evaluation_sources(
         item_names.append(raw_item["name"])
 
     for index, raw_item in enumerate(output["veto_rules"], start=1):
+        source_rule = _source_reference_rule(raw_item)
         candidate, source_ids, source_text = _source_for_rule_ids(
-            raw_item["original_rule"], raw_item["source_block_ids"], candidates
+            source_rule, raw_item["source_block_ids"], candidates
         )
-        if not _source_supports_rule(raw_item["original_rule"], source_text):
+        if not _source_supports_rule(source_rule, source_text):
             normalized["uncertain_rules"].append(
                 _uncertain_from_item(
                     raw_item,

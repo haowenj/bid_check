@@ -220,6 +220,22 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
 
 
+def _is_signature_seal_requirement(text: str) -> bool:
+    """Return whether an attachment requirement can prove file signing/sealing."""
+    if _contains_any(text, ("身份证", "身份证明", "营业执照")):
+        return False
+    has_signature_fact = _contains_any(
+        text,
+        ("签字", "盖章", "签章", "电子签章", "数字签名", "CA签章", "CA签名"),
+    )
+    if not has_signature_fact:
+        return False
+    return _contains_any(
+        text,
+        ("投标文件", "投标函", "电子投标文件", "电子文件", "文件"),
+    ) or _contains_any(text, ("电子签章", "数字签名", "CA签章", "CA签名"))
+
+
 def _parse_threshold(text: str) -> int | None:
     match = re.search(r"超过\s*([0-9]{1,4}|[一二两三四五六七八九十百]+)\s*(?:项|条|个)?", text)
     if match is None:
@@ -1167,6 +1183,7 @@ def _direct_material_review(
     evidence: Mapping[str, Any],
     requirement_terms: tuple[str, ...] = (),
     require_semantic_match: bool = False,
+    signature_seal_only: bool = False,
 ) -> dict[str, Any]:
     rule_text = _rule_text(rule)
     matched_uncertain: list[dict[str, Any]] = []
@@ -1191,6 +1208,10 @@ def _direct_material_review(
             if requirement_terms and not _contains_any(
                 requirement_text,
                 requirement_terms,
+            ):
+                continue
+            if signature_seal_only and not _is_signature_seal_requirement(
+                requirement_text
             ):
                 continue
             anchor = _shared_anchor(rule_text, requirement_text)
@@ -1264,6 +1285,14 @@ def _direct_material_review(
             confirmed_facts=matched_uncertain,
             related_artifacts=["09_attachment_reviews.json"],
         )
+    if signature_seal_only:
+        return _finish_review(
+            review,
+            status="evidence_insufficient",
+            reason="现有材料未提供投标文件已签字、盖章或完成 CA 签章的直接事实，身份证明附件不能证明投标文件已完成签章。",
+            facts_required=["投标文件已完成签字、盖章或 CA 签章的直接证据"],
+            related_artifacts=["09_attachment_reviews.json"],
+        )
     return _default_review(
         review,
         ordinary_fail_present=_has_ordinary_fail(evidence),
@@ -1317,6 +1346,7 @@ def _execute_veto_009_subconditions(
                 rule=child,
                 evidence=evidence,
                 require_semantic_match=True,
+                signature_seal_only=True,
             )
         elif index == 4:
             applicability = _joint_venture_applicability(
@@ -1345,9 +1375,9 @@ def _execute_veto_009_subconditions(
         elif index == 6:
             child = _finish_review(
                 child,
-                status="other_bidder_data_required",
-                reason="该子条件需要核验当前投标人是否提交多份投标文件或报价，当前数据范围只有单份商务投标文件。",
-                facts_required=["全部递交文件和报价的清单及相互比较结果"],
+                status="file_scope_missing",
+                reason="当前缺少当前投标人的完整递交记录、全部投标文件及报价清单，不能判断是否重复递交。",
+                facts_required=["当前投标人的完整递交记录、全部投标文件及报价清单"],
             )
         elif index == 7:
             low_cost = _subcondition_base(
@@ -1691,8 +1721,11 @@ def _dispatch_rule(
         return _finish_review(
             review,
             status="manual_review_required",
-            reason="该规则依赖投标递交状态、评标过程中的说明、算术修正接受情况或评标委员会认定，静态投标文件不能完成判断。",
-            facts_required=["后续评标过程事实和评标委员会认定"],
+            reason="该规则依赖投标文件递交、签收、密封、资格预审及招标文件获取等过程事实，静态投标文件不能完成判断。",
+            facts_required=[
+                "投标文件递交、签收及密封检查记录",
+                "资格预审结果及招标文件获取记录",
+            ],
         )
     if _is_preliminary_aggregate_text(text):
         reason = "该规则是正式评审结果的汇总规则，当前没有可追溯的正式子评审项触发事实。"
