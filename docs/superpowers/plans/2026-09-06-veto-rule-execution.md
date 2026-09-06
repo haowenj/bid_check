@@ -34,7 +34,7 @@
 - The result has `schema_version`, `source`, `veto_rule_reviews`, and `stats`.
 - Each review has original rule fields, `tender_rule_source`, `status`, `triggered`, `facts_required`, `confirmed_facts`, `reason`, `evidence`, `bid_evidence`, `related_artifacts`, `dependencies`, `parent_rule_ids`, and `triggered_by`.
 
-- [ ] **Step 1: Write the failing tests for one-record-per-formal-rule and safe defaults**
+- [x] **Step 1: Write the failing tests for one-record-per-formal-rule and safe defaults**
 
 ```python
 def test_veto_execution_keeps_each_formal_rule_and_excludes_uncertain_rules(tmp_path):
@@ -71,13 +71,13 @@ def test_ordinary_fail_is_not_automatically_a_veto(tmp_path):
     assert "普通" in review["reason"] or "正式" in review["reason"]
 ```
 
-- [ ] **Step 2: Run the focused tests and verify the failure is due to the missing module/function**
+- [x] **Step 2: Run the focused tests and verify the failure is due to the missing module/function**
 
 Run: `pytest -q tests/test_veto_rule_execution.py`
 
 Expected: FAIL with an import or missing-function error for `app.veto_rule_execution.run_veto_rule_execution`.
 
-- [ ] **Step 3: Add fixture helpers that model only real structured evidence**
+- [x] **Step 3: Add fixture helpers that model only real structured evidence**
 
 In `tests/test_veto_rule_execution.py`, define helpers with these exact shapes:
 
@@ -106,7 +106,7 @@ def make_rules(*, veto_rules: list[dict[str, Any]], uncertain_rules: list[dict[s
     }
 ```
 
-- [ ] **Step 4: Commit the red tests**
+- [x] **Step 4: Commit the red tests**
 
 ```bash
 git add tests/test_veto_rule_execution.py
@@ -124,7 +124,7 @@ git commit -m "test: define veto rule execution safety contract"
 - Define `VETO_RULE_REVIEW_ARTIFACT = "veto_rule_reviews.json"` and `VETO_STATUSES` containing exactly `triggered`, `not_triggered`, `evidence_insufficient`, `file_scope_missing`, `external_data_required`, `other_bidder_data_required`, and `manual_review_required`.
 - `run_veto_rule_execution` never invokes a parser, LLM, OCR engine, network client, or `overall_status` aggregator.
 
-- [ ] **Step 1: Add failing tests for artifact reuse and audit fields**
+- [x] **Step 1: Add failing tests for artifact reuse and audit fields**
 
 ```python
 def test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_json(tmp_path):
@@ -154,13 +154,13 @@ def test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_js
     assert "related_artifacts" in review
 ```
 
-- [ ] **Step 2: Run the test and confirm it fails before implementation**
+- [x] **Step 2: Run the test and confirm it fails before implementation**
 
 Run: `pytest -q tests/test_veto_rule_execution.py::test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_json`
 
 Expected: FAIL because the executor and artifact schema do not exist.
 
-- [ ] **Step 3: Implement the minimal common result and source loader**
+- [x] **Step 3: Implement the minimal common result and source loader**
 
 Implement `_review_base(rule)` to copy every extracted rule field and initialize:
 
@@ -186,13 +186,13 @@ Implement `_review_base(rule)` to copy every extracted rule field and initialize
 
 Normalize source values through a helper that always returns `section`, `block_ids`, and `source_text`. Build top-level `source` from the evidence loader, include `objective_scores_artifact` only when objective results were supplied, and include missing artifact names. Set `stats` with formal count, triggered count, status counts, `llm_total_calls=0`, `ocr_reused=True` when evidence was loaded from an existing artifact, `duplicate_parse=False`, and elapsed time.
 
-- [ ] **Step 4: Run the focused test and the whole new test file**
+- [x] **Step 4: Run the focused test and the whole new test file**
 
 Run: `pytest -q tests/test_veto_rule_execution.py`
 
 Expected: PASS for rule preservation, ordinary-fail safety, provenance, and independent artifact writing.
 
-- [ ] **Step 5: Commit the artifact core**
+- [x] **Step 5: Commit the artifact core**
 
 ```bash
 git add app/veto_rule_execution.py tests/test_veto_rule_execution.py
@@ -210,7 +210,7 @@ git commit -m "feat: add veto rule review artifact core"
 - Helpers return `(status, reason, facts, evidence, related_artifacts, dependency_flags)` and never infer a fail from missing data.
 - A `triggered` result must have at least one concrete confirmed fact, one related artifact, one tender source block, and one bid evidence block or image reference; otherwise downgrade to `evidence_insufficient`.
 
-- [ ] **Step 1: Write failing tests for every high-risk status boundary**
+- [x] **Step 1: Write failing tests for every high-risk status boundary**
 
 ```python
 def test_business_only_file_does_not_trigger_star_rule(tmp_path):
@@ -282,13 +282,13 @@ def test_non_substantive_threshold_counts_only_explicit_failures(tmp_path):
     assert review["confirmed_facts"][0]["counted_failure_count"] == 1
 ```
 
-- [ ] **Step 2: Run these tests and confirm they fail for missing classification/predicate behavior**
+- [x] **Step 2: Run these tests and confirm they fail for missing classification/predicate behavior**
 
 Run: `pytest -q tests/test_veto_rule_execution.py -k "star or low_price or collusion or external or fraud or threshold"`
 
 Expected: FAIL with conservative default results rather than the required specific statuses or facts.
 
-- [ ] **Step 3: Implement text-signaled dependency classification**
+- [x] **Step 3: Implement text-signaled dependency classification**
 
 Check explicit signals in the combined rule text in this order:
 
@@ -302,7 +302,7 @@ Check explicit signals in the combined rule text in this order:
 
 The classifier must not treat a generic `fail`, `不一致`, `未找到`, or `可能` as a direct veto signal.
 
-- [ ] **Step 4: Implement the specific safe predicates**
+- [x] **Step 4: Implement the specific safe predicates**
 
 Implement these concrete results:
 
@@ -314,11 +314,11 @@ Implement these concrete results:
 - False-material rules treat inconsistency as a fact only; absent a direct explicit false-material finding with traceable evidence, return `evidence_insufficient` or `manual_review_required`.
 - Generic direct material/signature/qualification rules can trigger only when the rule text names the same material/condition and an existing attachment or file-requirement entry has a matching explicit `fail` with evidence.
 
-- [ ] **Step 5: Implement preliminary aggregate and duplicate-safe relation logic**
+- [x] **Step 5: Implement preliminary aggregate and duplicate-safe relation logic**
 
 Build a stable relation map from rule text/source section. A rule is a child candidate when its condition names a concrete preliminary-review item; an aggregate rule is a parent candidate when it says any/one preliminary item fails. Populate `parent_rule_ids` and `triggered_by` only for high-confidence textual matches. The parent can be `triggered` only when a child review is already `triggered`; if any required formal review area is uncovered, keep `evidence_insufficient`; never produce a second independent evidence cause.
 
-- [ ] **Step 6: Add the audit-chain invariant and run the focused suite**
+- [x] **Step 6: Add the audit-chain invariant and run the focused suite**
 
 Before returning each review, enforce:
 
@@ -334,7 +334,7 @@ If an invariant is not met, return `evidence_insufficient` with an explicit audi
 
 Expected: PASS for all status boundaries, no false fraud/low-price/collusion/star triggers, threshold counting, and parent-child relation fields.
 
-- [ ] **Step 7: Commit deterministic rule execution**
+- [x] **Step 7: Commit deterministic rule execution**
 
 ```bash
 git add app/veto_rule_execution.py tests/test_veto_rule_execution.py
@@ -354,7 +354,7 @@ git commit -m "feat: execute veto rules conservatively"
 - Callback signature: `callback(tender_file, bid_file, evaluation_result, objective_scores=None, recorder=recorder) -> dict[str, Any]`.
 - Evaluation-mode completion includes `evaluation_rules`, optional `objective_scores`, and optional `veto_rule_reviews`.
 
-- [ ] **Step 1: Write a failing workflow test for ordering and persistence**
+- [x] **Step 1: Write a failing workflow test for ordering and persistence**
 
 ```python
 def test_evaluation_workflow_runs_veto_execution_after_objective_scoring(
@@ -399,17 +399,17 @@ def test_evaluation_workflow_runs_veto_execution_after_objective_scoring(
     assert calls == ["evaluate", "objective", "veto"]
 ```
 
-- [ ] **Step 2: Run the test and verify it fails because the callback is not wired**
+- [x] **Step 2: Run the test and verify it fails because the callback is not wired**
 
 Run: `pytest -q tests/test_workflow.py::test_evaluation_workflow_runs_veto_execution_after_objective_scoring`
 
 Expected: FAIL because the service field and workflow invocation do not exist.
 
-- [ ] **Step 3: Implement workflow invocation and stats/events**
+- [x] **Step 3: Implement workflow invocation and stats/events**
 
 In evaluation mode, after the optional objective callback succeeds, invoke the optional veto callback with the objective result. Record `workflow.stage.start/end` using `stage="veto_rule_execution"`, store `veto_rule_execution_elapsed_ms`, and include `veto_rule_reviews` in `repository.complete`. Preserve current behavior when the callback is absent. On callback failure, fail the task at the review stage and write the workflow summary.
 
-- [ ] **Step 4: Add the default API callback without duplicate parsing**
+- [x] **Step 4: Add the default API callback without duplicate parsing**
 
 In `app/api.py`, import `run_veto_rule_execution`. Add a callback that:
 
@@ -421,13 +421,13 @@ In `app/api.py`, import `run_veto_rule_execution`. Add a callback that:
 
 Do not modify `app/templates/bid_check_task.html` or CSS in this task.
 
-- [ ] **Step 5: Run workflow/API regression tests**
+- [x] **Step 5: Run workflow/API regression tests**
 
 Run: `pytest -q tests/test_workflow.py tests/test_api.py tests/test_veto_rule_execution.py tests/test_objective_scoring.py`
 
 Expected: PASS, including the old evaluation test where no scorer/callback is configured, objective scoring ordering, veto artifact persistence, and no duplicate parse when artifacts exist.
 
-- [ ] **Step 6: Commit workflow integration**
+- [x] **Step 6: Commit workflow integration**
 
 ```bash
 git add app/workflow.py app/api.py tests/test_workflow.py tests/test_api.py
@@ -444,21 +444,21 @@ git commit -m "feat: integrate veto rule execution into evaluation workflow"
 - The final independent artifact is `compliance_extraction/veto_rule_reviews.json` beside `11_evaluation_rules.json` and `objective_scores.json`.
 - No page/UI files are changed in this phase.
 
-- [ ] **Step 1: Run the complete test suite**
+- [x] **Step 1: Run the complete test suite**
 
 Run: `pytest -q`
 
 Expected: exit code 0 and zero failures.
 
-- [ ] **Step 2: Locate the existing real tender/bid artifacts without changing files**
+- [x] **Step 2: Locate the existing real tender/bid artifacts without changing files**
 
 Search only known task/data locations for `11_evaluation_rules.json`, `structured_document.json`, `08_template_text_reviews.json`, `09_attachment_reviews.json`, `10_file_requirement_reviews.json`, and `10_performance_reviews.json`. Do not create a synthetic “real” task if the current real task artifacts are unavailable.
 
-- [ ] **Step 3: Execute the same real tender and business bid through the existing evaluation workflow**
+- [x] **Step 3: Execute the same real tender and business bid through the existing evaluation workflow**
 
 Confirm the artifact contains exactly the 12 formal rules, one review per rule, explicit status distribution, and no page changes. Capture for each `triggered` item the full tender-rule → fact → upstream artifact → block/image chain.
 
-- [ ] **Step 4: Verify the acceptance checklist from the request**
+- [x] **Step 4: Verify the acceptance checklist from the request**
 
 Check and report:
 
@@ -476,9 +476,8 @@ preliminary aggregate relation is explicit and not double-counted
 reused artifacts, new LLM calls, OCR calls, and parse calls
 ```
 
-- [ ] **Step 5: Run final diff and status checks before claiming completion**
+- [x] **Step 5: Run final diff and status checks before claiming completion**
 
 Run: `git diff --check && git status --short && git log -5 --oneline`
 
 Expected: no whitespace errors; only the intended implementation, tests, plan, and prior design commit are present; no branch/worktree/subagent artifacts were created.
-
