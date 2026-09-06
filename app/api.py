@@ -38,24 +38,29 @@ from app.compliance_extraction import (
     OpenAICompatibleLLM,
     extract_tender_compliance_objects,
 )
+from app.config import Settings, load_settings
 from app.evaluation_rule_extraction import (
     DeterministicEvaluationRuleLLM,
     OpenAICompatibleEvaluationRuleLLM,
     extract_tender_evaluation_rules,
 )
+from app.models import BidCheckTask, FileMetadata
 from app.objective_scoring import (
     load_reusable_bid_evidence,
     load_reusable_tender_evidence,
     run_objective_scoring,
 )
-from app.veto_rule_execution import run_veto_rule_execution
-from app.config import Settings, load_settings
-from app.models import BidCheckTask, FileMetadata
 from app.repository import BidCheckRepository
+from app.subjective_scoring import (
+    DeterministicSubjectiveScoreLLM,
+    OpenAICompatibleSubjectiveScoreLLM,
+    run_subjective_scoring,
+)
 from app.template_matching import build_template_comparisons
 from app.template_text_review import (
     DeterministicTemplateTextReviewLLM,
 )
+from app.veto_rule_execution import run_veto_rule_execution
 from app.workflow import BidCheckServices, BidCheckWorkflow
 
 CheckModeInput = Literal["compliance", "evaluation", "full"]
@@ -317,6 +322,21 @@ def _load_file_requirement_review_for_page(task: BidCheckTask) -> dict[str, Any]
     }
 
 
+def _load_subjective_scores_for_page(task: BidCheckTask) -> dict[str, Any] | None:
+    """Read the independent subjective-score artifact for API consumers."""
+
+    artifact_path = (
+        Path(task.tender_file.storage_path).parent
+        / "compliance_extraction"
+        / "subjective_scores.json"
+    )
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return artifact if isinstance(artifact, dict) else None
+
+
 def _format_score_for_page(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "未记录"
@@ -536,6 +556,17 @@ def build_default_workflow(
         attachment_review_llm = DeterministicAttachmentReviewLLM()
         evaluation_llm = DeterministicEvaluationRuleLLM()
 
+    if settings.llm_api_key:
+        subjective_llm = OpenAICompatibleSubjectiveScoreLLM(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            model=settings.llm_model,
+            max_tokens=settings.llm_max_tokens,
+            timeout_seconds=max(settings.llm_timeout_seconds, 180.0),
+        )
+    else:
+        subjective_llm = DeterministicSubjectiveScoreLLM()
+
     def extract_requirements(
         file_metadata: FileMetadata,
         recorder=None,
@@ -596,6 +627,22 @@ def build_default_workflow(
             bid_parse_fallback_used=parser_fallback_used,
         )
 
+    def score_subjective(
+        tender_file: FileMetadata,
+        bid_file: FileMetadata,
+        evaluation_result: dict[str, Any],
+        recorder=None,
+    ) -> dict[str, Any]:
+        del tender_file
+        # The subjective runner loads the existing structured bid artifact once
+        # and never falls back to MinerU/OCR/full-document parsing.
+        return run_subjective_scoring(
+            evaluation_result,
+            bid_file,
+            subjective_llm=subjective_llm,
+            recorder=recorder,
+        )
+
     def execute_veto(
         tender_file: FileMetadata,
         bid_file: FileMetadata,
@@ -643,6 +690,7 @@ def build_default_workflow(
         extract_with_recorder=extract_requirements,
         extract_evaluation_with_recorder=extract_evaluation,
         score_objective_with_recorder=score_objective,
+        score_subjective_with_recorder=score_subjective,
         execute_veto_with_recorder=execute_veto,
         review_with_recorder=partial(
             run_compliance_review_with_attachments,
@@ -830,7 +878,32 @@ def create_app(
                 "original_file"
             ]
             payload["review_result"] = review_result
+        subjective_scores = _load_subjective_scores_for_page(task)
+        if subjective_scores is not None:
+            payload["subjective_scores"] = subjective_scores
         return payload
+
+    @application.post(
+        "/api/bid-check/tasks/{task_id}/subjective-score",
+        status_code=202,
+    )
+    def run_subjective_score(
+        task_id: str,
+        background_tasks: BackgroundTasks,
+    ):
+        task = active_repository.get(task_id)
+        if task is None:
+            raise HTTPException(
+                status_code=404,
+                detail="标书检查任务不存在。",
+            )
+        if task.check_mode != "evaluation":
+            raise HTTPException(
+                status_code=409,
+                detail="主观评分仅支持评标任务。",
+            )
+        background_tasks.add_task(active_workflow.run_subjective, task_id)
+        return {"task_id": task_id, "status": "accepted"}
 
     @application.delete("/api/bid-check/tasks/{task_id}")
     def delete_bid_check_task(task_id: str):

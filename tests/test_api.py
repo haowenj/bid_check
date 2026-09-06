@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
@@ -116,6 +115,37 @@ def test_get_unknown_task_returns_404(client):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "标书检查任务不存在。"
+
+
+def test_subjective_score_endpoint_rejects_non_evaluation_task(client, stored_task):
+    response = client.post(
+        f"/api/bid-check/tasks/{stored_task.task_id}/subjective-score"
+    )
+
+    assert response.status_code == 409
+    assert "评标" in response.json()["detail"]
+
+
+def test_get_task_includes_subjective_artifact(client, stored_task):
+    artifact_dir = (
+        Path(stored_task.tender_file.storage_path).parent / "compliance_extraction"
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "subjective_scores.json").write_text(
+        json.dumps(
+            {"schema_version": "subjective-score-v1", "score_items": []},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get(f"/api/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert response.json()["subjective_scores"]["schema_version"] == (
+        "subjective-score-v1"
+    )
+    assert response.json()["subjective_scores"]["score_items"] == []
 
 
 def test_delete_task_removes_database_record_and_task_artifacts(

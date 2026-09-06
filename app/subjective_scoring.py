@@ -424,7 +424,7 @@ def _base_result(
 
 def _normalize_evidence(
     value: Any,
-    allowed_block_ids: set[str],
+    allowed_blocks: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, str]]:
     if not isinstance(value, list) or not value:
         raise SubjectiveScoringError("模型未返回可追溯的 evidence 列表")
@@ -435,12 +435,17 @@ def _normalize_evidence(
         block_id = _as_text(entry.get("block_id"))
         quote = _as_text(entry.get("quote")).strip()
         relation = _as_text(entry.get("relation")).strip()
-        if block_id not in allowed_block_ids:
+        if block_id not in allowed_blocks:
             raise SubjectiveScoringError(
                 f"模型 evidence 引用了未送模 block_id: {block_id or '<empty>'}"
             )
         if not quote or not relation:
             raise SubjectiveScoringError("模型 evidence 缺少 quote 或 relation")
+        source_text = _as_text(allowed_blocks[block_id].get("text"))
+        if _normalized(quote) not in _normalized(source_text):
+            raise SubjectiveScoringError(
+                f"模型 evidence quote 不在 block_id {block_id} 的投标原文中"
+            )
         evidence.append(
             {"block_id": block_id, "quote": quote, "relation": relation}
         )
@@ -477,12 +482,12 @@ def _validate_llm_result(
     reason = _as_text(raw_result.get("reason")).strip()
     if not reason:
         raise SubjectiveScoringError("模型未返回评分理由")
-    block_ids = {
-        _as_text(block.get("block_id"))
+    blocks_by_id = {
+        _as_text(block.get("block_id")): block
         for block in matched_blocks
         if _as_text(block.get("block_id"))
     }
-    evidence = _normalize_evidence(raw_result.get("evidence"), block_ids)
+    evidence = _normalize_evidence(raw_result.get("evidence"), blocks_by_id)
     return {
         "score_item_id": _as_text(item.get("id")),
         "rule_name": _as_text(item.get("name")),
@@ -493,7 +498,7 @@ def _validate_llm_result(
         "reason": reason,
         "matched_bid_content": [dict(block) for block in matched_blocks],
         "evidence": evidence,
-        "block_ids": sorted(block_ids),
+        "block_ids": sorted(blocks_by_id),
         "uncertainty": _uncertainty(raw_result.get("uncertainty")),
     }
 
@@ -727,18 +732,17 @@ def _execute_subjective_item(
                     elapsed_ms=elapsed_ms,
                 )
             else:
-                recorder.complete_llm_call(
+                recorder.fail_llm_call(
                     call_id,
-                    raw_response=dict(raw_result),
-                    parsed_objects=dict(raw_result),
-                    usage=getattr(subjective_llm, "last_usage", None),
-                    schema_valid=False,
+                    error_type=type(exc).__name__,
+                    error_message=message,
                     elapsed_ms=elapsed_ms,
+                    raw_response=dict(raw_result),
                 )
         return (
             _llm_error_result(item, matched_blocks, message),
             True,
-            raw_result is not None,
+            False,
             elapsed_ms,
         )
     finally:
@@ -855,8 +859,8 @@ def run_subjective_scoring(
     llm_failed_calls = llm_total_calls - llm_completed_calls
     call_elapsed = [
         elapsed_ms
-        for index, (_, _, elapsed_ms) in sorted(call_stats.items())
-        if elapsed_ms
+        for index, (called, _, elapsed_ms) in sorted(call_stats.items())
+        if called
     ]
     result: dict[str, Any] = {
         "schema_version": "subjective-score-v1",
