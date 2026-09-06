@@ -439,8 +439,9 @@ def _normalize_evidence(
             raise SubjectiveScoringError(
                 f"模型 evidence 引用了未送模 block_id: {block_id or '<empty>'}"
             )
-        if not quote or not relation:
-            raise SubjectiveScoringError("模型 evidence 缺少 quote 或 relation")
+        if not quote:
+            raise SubjectiveScoringError("模型 evidence 缺少 quote")
+        relation = relation or "对应评分规则判断"
         source_text = _as_text(allowed_blocks[block_id].get("text"))
         if _normalized(quote) not in _normalized(source_text):
             raise SubjectiveScoringError(

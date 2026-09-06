@@ -190,7 +190,6 @@ def test_run_subjective_scoring_scores_only_matched_item_and_writes_artifact(tmp
                 {
                     "block_id": "b0218",
                     "quote": "不存在未按规定制作、内容错误、模糊、材料缺失和阅读困难",
-                    "relation": "对应扣分项判断",
                 }
             ],
             "uncertainty": {"level": "low", "notes": []},
@@ -215,6 +214,9 @@ def test_run_subjective_scoring_scores_only_matched_item_and_writes_artifact(tmp
     assert len(llm.calls[0]["content"]) == 1
     assert result["score_items"][0]["status"] == "ai_scored"
     assert result["score_items"][0]["recommended_score"] == 5
+    assert result["score_items"][0]["evidence"][0]["relation"] == (
+        "对应评分规则判断"
+    )
     assert result["score_items"][1]["status"] == "file_scope_missing"
     assert result["score_items"][1]["recommended_score"] is None
     assert (tmp_path / "compliance_extraction" / "subjective_scores.json").is_file()
