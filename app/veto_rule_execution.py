@@ -108,6 +108,23 @@ _PROJECT_SPECIFIC_SECTIONS = (
     "专用部分",
     "前附表",
 )
+_SUBCONDITION_BLOCKING_STATUSES = frozenset(
+    {
+        "evidence_insufficient",
+        "file_scope_missing",
+        "external_data_required",
+        "other_bidder_data_required",
+        "manual_review_required",
+    }
+)
+_SUBCONDITION_DEPENDENCY_KEYS = (
+    "external_data_required",
+    "other_bidder_data_required",
+    "manual_review_required",
+)
+_VETO_009_MARKER_RE = re.compile(
+    r"[（(]\s*(\d{1,2})\s*[）)]|(?<![\d.])(\d{1,2})[、.](?!\d)"
+)
 
 
 def _as_text(value: Any) -> str:
@@ -411,7 +428,6 @@ def _applicability_for_rule(
     tender_evidence: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     rule_name = _as_text(rule.get("name"))
-    text = _rule_text(rule)
     records = [
         record
         for record in _tender_context_records(evaluation_rules, tender_evidence)
@@ -631,6 +647,365 @@ def _finish_review(
     return review
 
 
+def _extract_veto_009_conditions(original_rule: str) -> list[str]:
+    matches = list(_VETO_009_MARKER_RE.finditer(original_rule))
+    for start, marker in enumerate(matches):
+        first_index = int(marker.group(1) or marker.group(2))
+        if first_index != 1:
+            continue
+        selected = matches[start : start + 16]
+        indexes = [
+            int(item.group(1) or item.group(2))
+            for item in selected
+        ]
+        if indexes != list(range(1, 17)):
+            continue
+        conditions: list[str] = []
+        for index, item in enumerate(selected):
+            end = selected[index + 1].start() if index < 15 else len(original_rule)
+            condition = original_rule[item.end() : end].strip().rstrip("；;。")
+            conditions.append(condition)
+        if all(conditions):
+            return conditions
+    return []
+
+
+def _subcondition_base(
+    parent_rule: Mapping[str, Any],
+    index: int | str,
+    condition: str,
+) -> dict[str, Any]:
+    suffix = f"{index:02d}" if isinstance(index, int) else str(index)
+    child = _review_base(
+        {
+            "id": f"veto_009_{suffix}",
+            "name": condition,
+            "original_rule": condition,
+            "trigger_condition": condition,
+            "consequence": parent_rule.get("consequence"),
+            "additional_consequence": parent_rule.get("additional_consequence"),
+            "evidence_requirements": parent_rule.get("evidence_requirements", []),
+            "source": parent_rule.get("source"),
+        }
+    )
+    child.update(
+        {
+            "index": index,
+            "condition": condition,
+            "original_condition": condition,
+        }
+    )
+    return child
+
+
+def _applicability_evidence(
+    applicability: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    evidence = [
+        dict(item)
+        for item in applicability.get("evidence", [])
+        if isinstance(item, Mapping)
+    ]
+    related_artifacts = list(
+        dict.fromkeys(
+            _as_text(item.get("artifact"))
+            for item in evidence
+            if _as_text(item.get("artifact"))
+        )
+    )
+    return evidence, related_artifacts
+
+
+def _finish_not_applicable_subcondition(
+    child: dict[str, Any],
+    applicability: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence, related_artifacts = _applicability_evidence(applicability)
+    child["applicability"] = dict(applicability)
+    return _finish_review(
+        child,
+        status="not_applicable",
+        reason=_as_text(applicability.get("reason")),
+        facts_required=["当前项目/投标人的适用性事实"],
+        confirmed_facts=[
+            dict(item)
+            for item in applicability.get("facts", [])
+            if isinstance(item, Mapping)
+        ],
+        evidence=evidence,
+        related_artifacts=related_artifacts,
+    )
+
+
+def _finish_uncertain_applicability_subcondition(
+    child: dict[str, Any],
+    applicability: Mapping[str, Any],
+) -> dict[str, Any]:
+    child["applicability"] = dict(applicability)
+    return _finish_review(
+        child,
+        status="evidence_insufficient",
+        reason=_as_text(applicability.get("reason")),
+        facts_required=["当前项目/投标人的适用性事实"],
+    )
+
+
+def _joint_venture_applicability(
+    evaluation_rules: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    records = _tender_context_records(evaluation_rules, tender_evidence)
+    rejected = [
+        record
+        for record in records
+        if _contains_any(
+            _as_text(record.get("source_text")),
+            ("不接受联合体投标", "不允许联合体投标"),
+        )
+    ]
+    if rejected:
+        return {
+            "status": "not_applicable",
+            "reason": "招标文件明确本项目不接受联合体投标，该子条件不适用。",
+            "facts": [
+                {"status": "not_applicable", "kind": "joint_venture"}
+            ],
+            "evidence": [
+                {
+                    "artifact": record.get("artifact"),
+                    "block_ids": record.get("block_ids", []),
+                    "source_text": record.get("source_text", ""),
+                    "matched_terms": ["不接受联合体投标"],
+                }
+                for record in rejected
+            ],
+        }
+    allowed = [
+        record
+        for record in records
+        if _contains_any(
+            _as_text(record.get("source_text")),
+            ("允许联合体投标", "接受联合体投标"),
+        )
+    ]
+    if not allowed:
+        return {
+            "status": "applicability_uncertain",
+            "reason": "未找到能够确认本项目是否允许联合体投标的招标侧事实。",
+            "facts": [],
+            "evidence": [],
+        }
+    bid_text = _document_text(evidence.get("bid_document"))
+    is_joint_bid = _contains_any(
+        bid_text,
+        ("联合体牵头人", "联合体成员", "联合体协议", "组成联合体"),
+    )
+    if not is_joint_bid:
+        return {
+            "status": "not_applicable",
+            "reason": "招标文件允许联合体，但当前投标文件没有形成联合体投标事实，该子条件不适用。",
+            "facts": [
+                {"status": "not_applicable", "kind": "joint_venture", "bid_marker_found": False}
+            ],
+            "evidence": [
+                {
+                    "artifact": record.get("artifact"),
+                    "block_ids": record.get("block_ids", []),
+                    "source_text": record.get("source_text", ""),
+                    "matched_terms": ["允许联合体投标"],
+                }
+                for record in allowed
+            ],
+        }
+    return {
+        "status": "applicable",
+        "reason": "招标文件允许联合体且当前投标文件出现联合体投标事实。",
+        "facts": [{"status": "applicable", "kind": "joint_venture"}],
+        "evidence": [],
+    }
+
+
+def _goods_packaging_applicability(
+    evaluation_rules: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    records = _tender_context_records(evaluation_rules, tender_evidence)
+    excluded_terms = (
+        "不涉及货物包装",
+        "不适用货物包装",
+        "无货物包装要求",
+        "不涉及包装、检验标准和方法",
+    )
+    for record in records:
+        text = _as_text(record.get("source_text"))
+        matched = [term for term in excluded_terms if term in text]
+        if matched:
+            return {
+                "status": "not_applicable",
+                "reason": "招标文件明确当前项目不存在货物包装、检验标准和方法要求，该子条件不适用。",
+                "facts": [{"status": "not_applicable", "kind": "goods_packaging", "matched_terms": matched}],
+                "evidence": [
+                    {
+                        "artifact": record.get("artifact"),
+                        "block_ids": record.get("block_ids", []),
+                        "source_text": text,
+                        "matched_terms": matched,
+                    }
+                ],
+            }
+    for record in records:
+        text = _as_text(record.get("source_text"))
+        project_name = re.search(r"项目名称\s*[:：]\s*([^<\n]{0,160})", text)
+        if project_name and "服务" in project_name.group(1) and "货物" not in project_name.group(1):
+            return {
+                "status": "not_applicable",
+                "reason": "招标文件项目名称明确为服务项目，未形成货物包装、检验标准和方法的项目适用事实。",
+                "facts": [
+                    {
+                        "status": "not_applicable",
+                        "kind": "goods_packaging",
+                        "inferred_from": "service_project_name",
+                    }
+                ],
+                "evidence": [
+                    {
+                        "artifact": record.get("artifact"),
+                        "block_ids": record.get("block_ids", []),
+                        "source_text": text,
+                        "matched_terms": ["项目名称", "服务"],
+                    }
+                ],
+            }
+    return {
+        "status": "applicability_uncertain",
+        "reason": "当前招标侧没有足够事实判断货物包装、检验标准和方法是否适用于本项目。",
+        "facts": [],
+        "evidence": [],
+    }
+
+
+def _aggregate_nested_subconditions(
+    review: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    *,
+    summary_key: str,
+) -> dict[str, Any]:
+    statuses = [_as_text(node.get("status")) for node in nodes]
+    triggered = [node for node in nodes if node.get("status") == "triggered"]
+    blocking = [
+        node
+        for node in nodes
+        if _as_text(node.get("status")) in _SUBCONDITION_BLOCKING_STATUSES
+    ]
+    dependencies = {
+        key: any(
+            isinstance(node.get("dependencies"), Mapping)
+            and bool(node["dependencies"].get(key))
+            for node in nodes
+        )
+        for key in _SUBCONDITION_DEPENDENCY_KEYS
+    }
+    review["dependencies"].update(dependencies)
+    review[summary_key] = {
+        "total": len(nodes),
+        "status_counts": {
+            status: statuses.count(status)
+            for status in sorted(VETO_STATUSES)
+            if status in statuses
+        },
+        "blocking_statuses": sorted(
+            set(_as_text(node.get("status")) for node in blocking)
+        ),
+    }
+    evidence = [
+        dict(item)
+        for node in nodes
+        for item in node.get("evidence", [])
+        if isinstance(item, Mapping)
+    ]
+    related_artifacts = list(
+        dict.fromkeys(
+            _as_text(item.get("artifact"))
+            for node in nodes
+            for item in node.get("evidence", [])
+            if isinstance(item, Mapping) and _as_text(item.get("artifact"))
+        )
+    )
+    bid_evidence = _merge_bid_evidence(
+        *(
+            node.get("bid_evidence", {})
+            for node in nodes
+            if isinstance(node.get("bid_evidence"), Mapping)
+        )
+    )
+    facts = [
+        {
+            "id": _as_text(node.get("id")),
+            "status": _as_text(node.get("status")),
+            "triggered": bool(node.get("triggered")),
+            "confirmed_facts": list(node.get("confirmed_facts", [])),
+        }
+        for node in nodes
+    ]
+    facts_required = list(
+        dict.fromkeys(
+            _as_text(item)
+            for node in nodes
+            for item in node.get("facts_required", [])
+            if _as_text(item)
+        )
+    )
+    if triggered:
+        return _finish_review(
+            review,
+            status="triggered",
+            reason="该复合否决条件的内部子条件已有明确触发事实。",
+            facts_required=facts_required,
+            confirmed_facts=facts,
+            evidence=evidence,
+            bid_evidence=bid_evidence,
+            related_artifacts=related_artifacts,
+            dependencies=dependencies,
+        )
+    if blocking:
+        blocking_statuses = {
+            _as_text(node.get("status"))
+            for node in blocking
+        }
+        status = next(iter(blocking_statuses)) if len(blocking_statuses) == 1 else "evidence_insufficient"
+        blocking_ids = [
+            _as_text(node.get("id"))
+            for node in blocking
+            if _as_text(node.get("id"))
+        ]
+        return _finish_review(
+            review,
+            status=status,
+            reason=(
+                f"该复合否决条件仍有未完成判断的内部子条件：{', '.join(blocking_ids)}；"
+                "未触发和不适用子条件不能替代这些未决事实。"
+            ),
+            facts_required=facts_required,
+            confirmed_facts=facts,
+            evidence=evidence,
+            bid_evidence=bid_evidence,
+            related_artifacts=related_artifacts,
+            dependencies=dependencies,
+        )
+    return _finish_review(
+        review,
+        status="not_triggered",
+        reason="所有适用的内部子条件均已明确确认未触发，不适用子条件不参与触发判断。",
+        facts_required=facts_required,
+        confirmed_facts=facts,
+        evidence=evidence,
+        bid_evidence=bid_evidence,
+        related_artifacts=related_artifacts,
+        dependencies=dependencies,
+    )
+
+
 def _explicit_fail_status(value: Any) -> bool:
     return _as_text(value).casefold() == "fail"
 
@@ -790,6 +1165,8 @@ def _direct_material_review(
     *,
     rule: Mapping[str, Any],
     evidence: Mapping[str, Any],
+    requirement_terms: tuple[str, ...] = (),
+    require_semantic_match: bool = False,
 ) -> dict[str, Any]:
     rule_text = _rule_text(rule)
     matched_uncertain: list[dict[str, Any]] = []
@@ -811,8 +1188,15 @@ def _direct_material_review(
             if not isinstance(requirement, Mapping):
                 continue
             requirement_text = _as_text(requirement.get("requirement"))
+            if requirement_terms and not _contains_any(
+                requirement_text,
+                requirement_terms,
+            ):
+                continue
             anchor = _shared_anchor(rule_text, requirement_text)
             if not anchor:
+                continue
+            if require_semantic_match and semantic_status != "matched":
                 continue
             fact = {
                 "artifact": "09_attachment_reviews.json",
@@ -883,6 +1267,400 @@ def _direct_material_review(
     return _default_review(
         review,
         ordinary_fail_present=_has_ordinary_fail(evidence),
+    )
+
+
+def _execute_veto_009_subconditions(
+    review: dict[str, Any],
+    *,
+    rule: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    bid_file: FileMetadata,
+    evaluation_rules: Mapping[str, Any],
+    tender_evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    conditions = _extract_veto_009_conditions(
+        _as_text(rule.get("original_rule"))
+    )
+    if len(conditions) != 16:
+        return _finish_review(
+            review,
+            status="evidence_insufficient",
+            reason="veto_009 的正式原始规则未能完整解析为 16 个子条件，暂不执行任何子条件推断。",
+            facts_required=["veto_009 的完整 16 项正式原始规则"],
+        )
+
+    subconditions: list[dict[str, Any]] = []
+    for index, condition in enumerate(conditions, start=1):
+        child = _subcondition_base(rule, index, condition)
+        if index == 1:
+            child = _finish_review(
+                child,
+                status="external_data_required",
+                reason="投标人须知第 1.8 款涉及信用、违法、处罚及资格限制事实，当前已有产物不能替代对应外部数据核验。",
+                facts_required=[
+                    "投标人须知第 1.8 款规定的停业、资格暂停、严重违法、信用及裁判文书等事实",
+                    "信用中国、裁判文书网或信用信息共享平台核验结果",
+                ],
+                dependencies={"external_data_required": True},
+            )
+        elif index == 2:
+            child = _finish_review(
+                child,
+                status="manual_review_required",
+                reason="该子条件依赖评标委员会在评标过程中的澄清、说明或补正要求及投标人响应，静态投标文件不能完成判断。",
+                facts_required=["评标过程中的澄清、说明或补正要求及响应记录"],
+            )
+        elif index == 3:
+            child = _direct_material_review(
+                child,
+                rule=child,
+                evidence=evidence,
+                require_semantic_match=True,
+            )
+        elif index == 4:
+            applicability = _joint_venture_applicability(
+                evaluation_rules,
+                tender_evidence,
+                evidence,
+            )
+            if applicability["status"] == "not_applicable":
+                child = _finish_not_applicable_subcondition(child, applicability)
+            elif applicability["status"] == "applicability_uncertain":
+                child = _finish_uncertain_applicability_subcondition(child, applicability)
+            else:
+                child["applicability"] = dict(applicability)
+                child = _direct_material_review(
+                    child,
+                    rule=child,
+                    evidence=evidence,
+                )
+        elif index == 5:
+            child = _finish_review(
+                child,
+                status="evidence_insufficient",
+                reason="现有业绩、附件或普通合规检查只能作为资格事实来源，当前尚未形成完整资格后审结论，不能据此认定资格条件不符合。",
+                facts_required=["完整的资格后审逐项结论及对应投标证据"],
+            )
+        elif index == 6:
+            child = _finish_review(
+                child,
+                status="other_bidder_data_required",
+                reason="该子条件需要核验当前投标人是否提交多份投标文件或报价，当前数据范围只有单份商务投标文件。",
+                facts_required=["全部递交文件和报价的清单及相互比较结果"],
+            )
+        elif index == 7:
+            low_cost = _subcondition_base(
+                rule,
+                "07_low_cost",
+                "投标报价低于成本",
+            )
+            low_cost = _finish_review(
+                low_cost,
+                status="manual_review_required",
+                reason="低于成本的认定依赖其他投标报价、书面质疑、投标人说明及评标委员会认定，不能从单份投标文件自动触发。",
+                facts_required=[
+                    "其他投标人的报价或标底比较事实",
+                    "书面质疑、投标人说明及评标委员会认定",
+                ],
+                dependencies={"other_bidder_data_required": True},
+            )
+            limit = _subcondition_base(
+                rule,
+                "07_highest_bid_limit",
+                "投标报价高于最高投标限价",
+            )
+            applicability = _applicability_for_rule(
+                {
+                    "name": "超过最高投标限价",
+                    "trigger_condition": "投标报价超过最高投标限价",
+                    "original_rule": "投标报价超过最高投标限价",
+                },
+                evaluation_rules=evaluation_rules,
+                tender_evidence=tender_evidence,
+            )
+            if applicability["status"] == "not_applicable":
+                limit = _finish_not_applicable_subcondition(limit, applicability)
+            elif applicability["status"] == "applicability_uncertain":
+                limit = _finish_uncertain_applicability_subcondition(limit, applicability)
+            else:
+                limit["applicability"] = dict(applicability)
+                limit = _dispatch_rule(
+                    limit,
+                    rule=limit,
+                    evidence=evidence,
+                    bid_file=bid_file,
+                )
+            child["branches"] = [low_cost, limit]
+            child = _aggregate_nested_subconditions(
+                child,
+                child["branches"],
+                summary_key="branch_summary",
+            )
+        elif index == 8:
+            if _is_business_only(evidence.get("bid_document"), bid_file.filename):
+                child = _finish_review(
+                    child,
+                    status="file_scope_missing",
+                    reason="当前上传文件范围仅包含商务文件，不能完整核验投标文件对全部实质性要求和条件的响应。",
+                    facts_required=["技术文件及全部实质性条款的逐项响应事实"],
+                )
+            else:
+                child = _direct_material_review(
+                    child,
+                    rule=child,
+                    evidence=evidence,
+                    requirement_terms=("实质性", "★"),
+                    require_semantic_match=True,
+                )
+        elif index == 9:
+            collusion = _subcondition_base(
+                rule,
+                "09_collusion",
+                "串通投标",
+            )
+            collusion = _finish_review(
+                collusion,
+                status="other_bidder_data_required",
+                reason="串通投标需要多个投标文件之间的异常一致或关联证据，单份投标文件不能直接认定。",
+                facts_required=["多个投标人的文件、报价及异常关联比较事实"],
+            )
+            fraud = _subcondition_base(
+                rule,
+                "09_fraud",
+                "弄虚作假",
+            )
+            fraud = _finish_review(
+                fraud,
+                status="evidence_insufficient",
+                reason="普通材料不一致或业绩金额差异不等同于弄虚作假，当前没有直接、可追溯的虚假材料或伪造事实。",
+                facts_required=["直接、可追溯的虚假材料或伪造事实"],
+            )
+            bribery = _subcondition_base(
+                rule,
+                "09_bribery",
+                "行贿等违法行为",
+            )
+            bribery = _finish_review(
+                bribery,
+                status="external_data_required",
+                reason="行贿等违法行为通常需要外部案件、处罚或评标认定事实，当前已有产物不能完成核验。",
+                facts_required=["对应外部案件、处罚或评标认定记录"],
+            )
+            child["branches"] = [collusion, fraud, bribery]
+            child = _aggregate_nested_subconditions(
+                child,
+                child["branches"],
+                summary_key="branch_summary",
+            )
+        elif index == 10:
+            child = _finish_review(
+                child,
+                status="evidence_insufficient",
+                reason="当前静态投标文件没有足以直接证明以他人名义投标的身份、授权或实际控制事实。",
+                facts_required=["投标主体、授权关系及实际投标人身份的直接证据"],
+            )
+        elif index == 11:
+            applicability = _applicability_for_rule(
+                {
+                    "name": "未递交投标保证金",
+                    "trigger_condition": "未递交投标保证金或者投标保证金有瑕疵",
+                    "original_rule": "未递交投标保证金或者投标保证金有瑕疵",
+                },
+                evaluation_rules=evaluation_rules,
+                tender_evidence=tender_evidence,
+            )
+            if applicability["status"] == "not_applicable":
+                child = _finish_not_applicable_subcondition(child, applicability)
+            elif applicability["status"] == "applicability_uncertain":
+                child = _finish_uncertain_applicability_subcondition(child, applicability)
+            else:
+                child["applicability"] = dict(applicability)
+                child = _direct_material_review(
+                    child,
+                    rule=child,
+                    evidence=evidence,
+                )
+        elif index == 12:
+            child = _finish_review(
+                child,
+                status="evidence_insufficient",
+                reason="当前没有可复用的投标完成期限与招标文件要求的完整、可比对事实，不能默认满足或超期。",
+                facts_required=["招标文件完成期限与投标文件承诺期限的可比对事实"],
+            )
+        elif index == 13:
+            if _is_business_only(evidence.get("bid_document"), bid_file.filename):
+                child = _finish_review(
+                    child,
+                    status="file_scope_missing",
+                    reason="当前上传文件范围仅包含商务文件，不包含完整技术标，不能核验技术规格和技术标准响应。",
+                    facts_required=["完整技术文件及技术规格、技术标准逐项响应事实"],
+                )
+            else:
+                child = _finish_review(
+                    child,
+                    status="evidence_insufficient",
+                    reason="当前尚未完成技术规格和技术标准的确定性逐项核验，不能直接触发。",
+                    facts_required=["技术规格、技术标准逐项响应事实"],
+                )
+        elif index == 14:
+            applicability = _goods_packaging_applicability(
+                evaluation_rules,
+                tender_evidence,
+            )
+            if applicability["status"] == "not_applicable":
+                child = _finish_not_applicable_subcondition(child, applicability)
+            elif applicability["status"] == "applicability_uncertain":
+                child = _finish_uncertain_applicability_subcondition(child, applicability)
+            else:
+                child["applicability"] = dict(applicability)
+                child = _direct_material_review(
+                    child,
+                    rule=child,
+                    evidence=evidence,
+                )
+        elif index == 15:
+            child = _finish_review(
+                child,
+                status="evidence_insufficient",
+                reason="当前没有识别到招标人明确不能接受且已由投标文件实际附加的具体条件，不能据此触发。",
+                facts_required=["投标文件附加条件及招标人可接受性判断事实"],
+            )
+        elif index == 16:
+            child = _direct_material_review(
+                child,
+                rule=child,
+                evidence=evidence,
+                requirement_terms=("实质性", "★"),
+                require_semantic_match=True,
+            )
+        subconditions.append(child)
+
+    review["sub_conditions"] = subconditions
+    status_counts = {
+        status: sum(
+            _as_text(item.get("status")) == status
+            for item in subconditions
+        )
+        for status in sorted(VETO_STATUSES)
+    }
+    triggered = [item for item in subconditions if item.get("status") == "triggered"]
+    blocking = [
+        item
+        for item in subconditions
+        if _as_text(item.get("status")) in _SUBCONDITION_BLOCKING_STATUSES
+    ]
+    review["subcondition_summary"] = {
+        "total": len(subconditions),
+        "status_counts": status_counts,
+        "triggered_subcondition_indices": [item["index"] for item in triggered],
+        "blocking_subcondition_indices": [item["index"] for item in blocking],
+        "not_applicable_subcondition_indices": [
+            item["index"]
+            for item in subconditions
+            if item.get("status") == "not_applicable"
+        ],
+    }
+    dependencies = {
+        key: any(
+            isinstance(item.get("dependencies"), Mapping)
+            and bool(item["dependencies"].get(key))
+            for item in subconditions
+        )
+        for key in _SUBCONDITION_DEPENDENCY_KEYS
+    }
+    evidence_refs = [
+        dict(item)
+        for child in subconditions
+        for item in child.get("evidence", [])
+        if isinstance(item, Mapping)
+    ]
+    related_artifacts = list(
+        dict.fromkeys(
+            _as_text(item.get("artifact"))
+            for child in subconditions
+            for item in child.get("evidence", [])
+            if isinstance(item, Mapping) and _as_text(item.get("artifact"))
+        )
+    )
+    bid_evidence = _merge_bid_evidence(
+        *(
+            child.get("bid_evidence", {})
+            for child in subconditions
+            if isinstance(child.get("bid_evidence"), Mapping)
+        )
+    )
+    facts = [
+        {
+            "sub_condition_id": _as_text(child.get("id")),
+            "index": child.get("index"),
+            "status": _as_text(child.get("status")),
+            "triggered": bool(child.get("triggered")),
+            "confirmed_facts": list(child.get("confirmed_facts", [])),
+        }
+        for child in subconditions
+    ]
+    facts_required = list(
+        dict.fromkeys(
+            _as_text(item)
+            for child in subconditions
+            for item in child.get("facts_required", [])
+            if _as_text(item)
+        )
+    )
+    if triggered:
+        result = _finish_review(
+            review,
+            status="triggered",
+            reason="veto_009 的内部子条件中至少有一项已由可追溯事实明确触发。",
+            facts_required=facts_required,
+            confirmed_facts=facts,
+            evidence=evidence_refs,
+            bid_evidence=bid_evidence,
+            related_artifacts=related_artifacts,
+            dependencies=dependencies,
+        )
+        result["triggered_by"] = [
+            _as_text(item.get("id"))
+            for item in triggered
+            if _as_text(item.get("id"))
+        ]
+        return result
+    if blocking:
+        blocking_statuses = {
+            _as_text(item.get("status"))
+            for item in blocking
+        }
+        status = (
+            next(iter(blocking_statuses))
+            if len(blocking_statuses) == 1
+            else "evidence_insufficient"
+        )
+        return _finish_review(
+            review,
+            status=status,
+            reason=(
+                "veto_009 的 16 个子条件中仍有未完成判断的条件；"
+                f"当前未决状态包括：{'、'.join(sorted(blocking_statuses))}。"
+                "因此不能汇总为 not_triggered；not_applicable 子条件不参与触发判断。"
+            ),
+            facts_required=facts_required,
+            confirmed_facts=facts,
+            evidence=evidence_refs,
+            bid_evidence=bid_evidence,
+            related_artifacts=related_artifacts,
+            dependencies=dependencies,
+        )
+    return _finish_review(
+        review,
+        status="not_triggered",
+        reason="16 个子条件中所有适用条件均已明确确认未触发，不适用条件不参与触发判断。",
+        facts_required=facts_required,
+        confirmed_facts=facts,
+        evidence=evidence_refs,
+        bid_evidence=bid_evidence,
+        related_artifacts=related_artifacts,
+        dependencies=dependencies,
     )
 
 
@@ -1149,6 +1927,44 @@ def _source_payload(
     return source
 
 
+def _subcondition_stats(
+    reviews: list[dict[str, Any]],
+) -> dict[str, Any]:
+    subconditions = [
+        item
+        for review in reviews
+        for item in review.get("sub_conditions", [])
+        if isinstance(item, Mapping)
+    ]
+    branches = [
+        branch
+        for item in subconditions
+        for branch in item.get("branches", [])
+        if isinstance(branch, Mapping)
+    ]
+    dependency_counts = {
+        key: sum(
+            isinstance(item.get("dependencies"), Mapping)
+            and bool(item["dependencies"].get(key))
+            for item in subconditions
+        )
+        for key in _SUBCONDITION_DEPENDENCY_KEYS
+    }
+    return {
+        "subcondition_count": len(subconditions),
+        "subcondition_status_counts": {
+            status: sum(_as_text(item.get("status")) == status for item in subconditions)
+            for status in sorted(VETO_STATUSES)
+        },
+        "subcondition_branch_count": len(branches),
+        "subcondition_branch_status_counts": {
+            status: sum(_as_text(item.get("status")) == status for item in branches)
+            for status in sorted(VETO_STATUSES)
+        },
+        "dependency_counts": dependency_counts,
+    }
+
+
 def _stats(
     reviews: list[dict[str, Any]],
     *,
@@ -1171,11 +1987,22 @@ def _stats(
         )
         if applicability_status in _APPLICABILITY_STATUSES:
             applicability_counts[applicability_status] += 1
+    nested_stats = _subcondition_stats(reviews)
     return {
         "formal_rule_count": len(reviews),
         "triggered_count": status_counts["triggered"],
         "status_counts": status_counts,
         "applicability_counts": applicability_counts,
+        **nested_stats,
+        "external_data_required": nested_stats["dependency_counts"][
+            "external_data_required"
+        ],
+        "other_bidder_data_required": nested_stats["dependency_counts"][
+            "other_bidder_data_required"
+        ],
+        "manual_review_required": nested_stats["dependency_counts"][
+            "manual_review_required"
+        ],
         "llm_total_calls": 0,
         "ocr_reused": bool(evidence.get("bid_document_hash_verified")),
         "duplicate_parse": False,
@@ -1237,6 +2064,15 @@ def run_veto_rule_execution(
                 status="evidence_insufficient",
                 reason=applicability["reason"],
                 facts_required=["招标文件项目专用条件"],
+            )
+        elif _as_text(rule.get("id")) == "veto_009":
+            review = _execute_veto_009_subconditions(
+                review,
+                rule=rule,
+                evidence=evidence,
+                bid_file=bid_file,
+                evaluation_rules=evaluation_rules,
+                tender_evidence=tender_evidence,
             )
         else:
             review = _dispatch_rule(

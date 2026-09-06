@@ -50,6 +50,40 @@ def make_rules(
     }
 
 
+VETO_009_CONDITIONS = [
+    "第二章“投标人须知”第1.8款规定的任何一种情形的",
+    "不按照评标委员会要求澄清、说明或者补正",
+    "投标文件未经投标单位盖章和单位负责人签字",
+    "允许联合体投标的，投标联合体没有递交共同投标协议",
+    "投标人不符合国家或者招标文件规定的资格条件",
+    "同一投标人递交两个以上不同的投标文件或者投标报价，但招标文件要求递交备选投标的除外",
+    "投标报价低于成本或者高于招标文件设定的最高投标限价",
+    "投标文件没有对招标文件的实质性要求和条件做出响应",
+    "投标人有串通投标、弄虚作假、行贿等违法行为",
+    "投标人以他人名义投标",
+    "没有按照招标文件要求提供投标担保或者所提供的投标担保有瑕疵",
+    "投标文件载明的招标项目完成期限超过招标文件规定的期限",
+    "明显不符合技术规格、技术标准的要求",
+    "投标文件载明的货物包装方式、检验标准和方法等不符合招标文件的要求",
+    "投标文件附有招标人不能接受的条件",
+    "不符合招标文件中规定的其他实质性要求",
+]
+
+
+def veto_009_rule() -> dict[str, Any]:
+    original = "3.1.2投标人有以下情形之一的，评标委员会应当否决其投标："
+    original += "".join(
+        f"（{index}）{condition}{'；' if index < 16 else '。'}"
+        for index, condition in enumerate(VETO_009_CONDITIONS, start=1)
+    )
+    return make_rule(
+        "veto_009",
+        "否决投标情形（通用）",
+        "投标人存在以下任一情形",
+        original=original,
+    )
+
+
 def bid_file(tmp_path: Path, *, name: str = "bid.docx") -> FileMetadata:
     path = tmp_path / name
     if not path.exists():
@@ -329,6 +363,159 @@ def test_conditional_rule_without_tender_applicability_fact_is_uncertain(tmp_pat
 
     assert review["status"] == "evidence_insufficient"
     assert review["applicability"]["status"] == "applicability_uncertain"
+
+
+def test_veto_009_executes_all_sixteen_subconditions_and_aggregates_dependencies(
+    tmp_path,
+):
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[veto_009_rule()]),
+        bid_file(tmp_path, name="商务投标文件.docx"),
+        bid_document=business_only_document(),
+        tender_evidence={
+            "artifact_path": "/tmp/tender/01_parsed_blocks.json",
+            "blocks": [
+                {
+                    "block_id": "tender-facts",
+                    "section": "投标人须知前附表",
+                    "text": (
+                        "本次招标不接受联合体投标；本项目不设置最高投标限价；"
+                        "本项目无需递交投标保证金；本项目为服务项目，不涉及货物包装、"
+                        "检验标准和方法。"
+                    ),
+                }
+            ],
+        },
+    )
+
+    review = result["veto_rule_reviews"][0]
+    subconditions = review["sub_conditions"]
+    by_index = {item["index"]: item for item in subconditions}
+
+    assert len(subconditions) == 16
+    assert [item["index"] for item in subconditions] == list(range(1, 17))
+    assert [item["original_condition"] for item in subconditions] == VETO_009_CONDITIONS
+    for item in subconditions:
+        assert {
+            "index",
+            "condition",
+            "original_condition",
+            "status",
+            "triggered",
+            "facts_required",
+            "confirmed_facts",
+            "reason",
+            "evidence",
+            "related_artifacts",
+            "dependencies",
+        }.issubset(item)
+
+    assert by_index[1]["status"] == "external_data_required"
+    assert by_index[2]["status"] == "manual_review_required"
+    assert by_index[4]["status"] == "not_applicable"
+    assert by_index[6]["status"] == "other_bidder_data_required"
+    assert by_index[7]["status"] == "manual_review_required"
+    assert {branch["status"] for branch in by_index[7]["branches"]} == {
+        "not_applicable",
+        "manual_review_required",
+    }
+    assert by_index[8]["status"] == "file_scope_missing"
+    assert by_index[9]["status"] == "evidence_insufficient"
+    assert {branch["status"] for branch in by_index[9]["branches"]} == {
+        "other_bidder_data_required",
+        "evidence_insufficient",
+        "external_data_required",
+    }
+    assert by_index[11]["status"] == "not_applicable"
+    assert by_index[13]["status"] == "file_scope_missing"
+    assert by_index[14]["status"] == "not_applicable"
+
+    assert review["status"] == "evidence_insufficient"
+    assert review["triggered"] is False
+    assert review["subcondition_summary"]["total"] == 16
+    assert review["subcondition_summary"]["blocking_subcondition_indices"]
+    assert review["dependencies"]["external_data_required"] is True
+    assert review["dependencies"]["other_bidder_data_required"] is True
+    assert review["dependencies"]["manual_review_required"] is True
+    assert result["stats"]["subcondition_count"] == 16
+    assert result["stats"]["dependency_counts"]["external_data_required"] >= 2
+    assert result["stats"]["dependency_counts"]["other_bidder_data_required"] >= 2
+    assert result["stats"]["dependency_counts"]["manual_review_required"] >= 2
+
+
+def test_veto_009_is_triggered_only_when_a_subcondition_has_auditable_failure(
+    tmp_path,
+):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "semantic_match": {"status": "matched"},
+                    "status": "fail",
+                    "execution_status": "completed",
+                    "requirements": [
+                        {
+                            "requirement": "投标文件未经投标单位盖章和单位负责人签字",
+                            "status": "fail",
+                            "reason": "投标文件缺少单位负责人签字",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[veto_009_rule()]),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    subcondition = next(item for item in review["sub_conditions"] if item["index"] == 3)
+    assert subcondition["status"] == "triggered"
+    assert subcondition["triggered"] is True
+    assert review["status"] == "triggered"
+    assert review["triggered"] is True
+    assert review["triggered_by"] == ["veto_009_03"]
+    assert review["bid_evidence"]["image_ids"] == ["bid-img-1"]
+
+
+def test_veto_009_does_not_promote_unmatched_material_failure_to_subcondition_trigger(
+    tmp_path,
+):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "status": "fail",
+                    "execution_status": "completed",
+                    "requirements": [
+                        {
+                            "requirement": "投标文件未经投标单位盖章和单位负责人签字",
+                            "status": "fail",
+                            "reason": "普通附件检查未完成正式评审项匹配",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[veto_009_rule()]),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    subcondition = next(item for item in review["sub_conditions"] if item["index"] == 3)
+    assert subcondition["status"] != "triggered"
+    assert review["status"] != "triggered"
 
 
 def test_low_price_requires_evaluation_process_and_is_not_auto_triggered(tmp_path):
