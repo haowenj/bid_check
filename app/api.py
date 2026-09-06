@@ -38,6 +38,11 @@ from app.compliance_extraction import (
     OpenAICompatibleLLM,
     extract_tender_compliance_objects,
 )
+from app.evaluation_rule_extraction import (
+    DeterministicEvaluationRuleLLM,
+    OpenAICompatibleEvaluationRuleLLM,
+    extract_tender_evaluation_rules,
+)
 from app.config import Settings, load_settings
 from app.models import BidCheckTask, FileMetadata
 from app.repository import BidCheckRepository
@@ -306,6 +311,101 @@ def _load_file_requirement_review_for_page(task: BidCheckTask) -> dict[str, Any]
     }
 
 
+def _format_score_for_page(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "未记录"
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _load_evaluation_rules_for_page(task: BidCheckTask) -> dict[str, Any]:
+    """Load the standalone evaluation artifact and add display-only relations."""
+
+    result = task.result if isinstance(task.result, dict) else {}
+    rules = result.get("evaluation_rules")
+    if not isinstance(rules, dict):
+        artifact_path = (
+            Path(task.tender_file.storage_path).parent
+            / "compliance_extraction"
+            / "11_evaluation_rules.json"
+        )
+        try:
+            rules = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            rules = {}
+    if not isinstance(rules, dict):
+        rules = {}
+
+    categories = [
+        dict(item) for item in rules.get("score_categories", [])
+        if isinstance(item, dict)
+    ]
+    score_items = [
+        dict(item) for item in rules.get("score_items", [])
+        if isinstance(item, dict)
+    ]
+    category_by_id = {
+        item.get("id"): item for item in categories if item.get("id")
+    }
+    item_by_id = {
+        item.get("id"): item for item in score_items if item.get("id")
+    }
+    items_by_category: dict[str, list[dict[str, Any]]] = {}
+    for item in score_items:
+        category_id = item.get("category_id")
+        item["category_name"] = (
+            category_by_id.get(category_id, {}).get("name")
+            if category_id
+            else None
+        )
+        parent_id = item.get("parent_item_id")
+        item["parent_item_name"] = (
+            item_by_id.get(parent_id, {}).get("name") if parent_id else None
+        )
+        item["full_score_label"] = _format_score_for_page(item.get("full_score"))
+        if category_id:
+            items_by_category.setdefault(category_id, []).append(item)
+    for category in categories:
+        category["parent_name"] = (
+            category_by_id.get(category.get("parent_id"), {}).get("name")
+            if category.get("parent_id")
+            else None
+        )
+        category["full_score_label"] = _format_score_for_page(
+            category.get("full_score")
+        )
+        category["items"] = items_by_category.get(category.get("id"), [])
+
+    stats = dict(rules.get("stats", {})) if isinstance(rules.get("stats"), dict) else {}
+    stats.setdefault("score_category_count", len(categories))
+    stats.setdefault("score_item_count", len(score_items))
+    stats.setdefault(
+        "veto_rule_count",
+        len(rules.get("veto_rules", []))
+        if isinstance(rules.get("veto_rules"), list)
+        else 0,
+    )
+    stats.setdefault(
+        "uncertain_rule_count",
+        len(rules.get("uncertain_rules", []))
+        if isinstance(rules.get("uncertain_rules"), list)
+        else 0,
+    )
+    return {
+        **rules,
+        "score_categories": categories,
+        "score_items": score_items,
+        "veto_rules": [
+            dict(item) for item in rules.get("veto_rules", [])
+            if isinstance(item, dict)
+        ],
+        "uncertain_rules": [
+            dict(item) for item in rules.get("uncertain_rules", [])
+            if isinstance(item, dict)
+        ],
+        "stats": stats,
+    }
+
+
 def _task_issue_counts(task: BidCheckTask) -> dict[str, int]:
     """Build list-page counts using the same result sources as the detail page."""
 
@@ -389,6 +489,9 @@ def build_default_workflow(
         poll_interval_seconds=settings.mineru_poll_interval_seconds,
     )
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
+    evaluation_cache = JsonRequirementCache(
+        settings.data_dir / "evaluation_rule_cache"
+    )
     parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
     bid_parser = bid_document_parser or MinerUBidDocumentParser(
         settings.mineru_url,
@@ -414,10 +517,18 @@ def build_default_workflow(
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
         )
+        evaluation_llm = OpenAICompatibleEvaluationRuleLLM(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            model=settings.llm_model,
+            max_tokens=settings.llm_max_tokens,
+            timeout_seconds=max(settings.llm_timeout_seconds, 180.0),
+        )
     else:
         llm = DeterministicComplianceLLM()
         template_review_llm = DeterministicTemplateTextReviewLLM()
         attachment_review_llm = DeterministicAttachmentReviewLLM()
+        evaluation_llm = DeterministicEvaluationRuleLLM()
 
     def extract_requirements(
         file_metadata: FileMetadata,
@@ -428,6 +539,20 @@ def build_default_workflow(
             parser=parser,
             llm=llm,
             cache=cache,
+            parser_cache=parser_cache,
+            recorder=recorder,
+            max_batches=settings.compliance_max_batches,
+        )
+
+    def extract_evaluation(
+        file_metadata: FileMetadata,
+        recorder=None,
+    ):
+        return extract_tender_evaluation_rules(
+            file_metadata,
+            parser=parser,
+            llm=evaluation_llm,
+            cache=evaluation_cache,
             parser_cache=parser_cache,
             recorder=recorder,
             max_batches=settings.compliance_max_batches,
@@ -446,6 +571,7 @@ def build_default_workflow(
             performance_text_llm=template_review_llm,
         ),
         extract_with_recorder=extract_requirements,
+        extract_evaluation_with_recorder=extract_evaluation,
         review_with_recorder=partial(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,
@@ -541,6 +667,7 @@ def create_app(
             name="bid_check_task.html",
             context={
                 "task": task,
+                "evaluation_rules": _load_evaluation_rules_for_page(task),
                 "bid_document": bid_document,
                 "template_comparisons": template_comparisons,
                 "file_requirement_reviews": file_requirement_data["reviews"],
@@ -557,7 +684,7 @@ def create_app(
         bid_file: UploadFile = File(...),
         check_mode: CheckModeInput = Form(...),
     ):
-        if check_mode != "compliance":
+        if check_mode not in {"compliance", "evaluation"}:
             raise HTTPException(
                 status_code=409,
                 detail="该校验方式正在开发中。",

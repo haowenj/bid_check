@@ -8,10 +8,37 @@ from threading import Barrier
 import pytest
 
 from app.workflow import BidCheckServices, BidCheckWorkflow
+from app.models import FileMetadata
 
 
 def empty_objects():
     return {"templates": [], "project_requirements": [], "supplemental_materials": []}
+
+
+def evaluation_result():
+    return {
+        "source_sections": [],
+        "score_categories": [],
+        "score_items": [],
+        "veto_rules": [],
+        "uncertain_rules": [],
+        "stats": {"score_category_count": 0},
+    }
+
+
+def create_evaluation_task(repository, tmp_path):
+    task_dir = tmp_path / "evaluation-task"
+    task_dir.mkdir()
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    return repository.create(
+        "evaluation-task",
+        FileMetadata("招标文件.docx", tender_path.stat().st_size, str(tender_path)),
+        FileMetadata("投标文件.docx", bid_path.stat().st_size, str(bid_path)),
+        "evaluation",
+    )
 
 
 def test_requirements_and_parse_enter_concurrently(task_repository):
@@ -262,3 +289,41 @@ def test_workflow_persists_task_execution_log_and_summary(task_repository):
     assert summary["stats"]["bid_parse_elapsed_ms"] is not None
     assert summary["stats"]["review_elapsed_ms"] is not None
     assert summary["stats"]["total_elapsed_ms"] is not None
+
+
+def test_evaluation_workflow_extracts_tender_only_and_skips_bid_parse(
+    task_repository, tmp_path
+):
+    calls = []
+
+    def evaluate(tender_file, recorder=None):
+        del recorder
+        calls.append(("evaluate", tender_file.filename))
+        return evaluation_result()
+
+    def parse(_bid_file):
+        calls.append(("parse", "unexpected"))
+        raise AssertionError("evaluation mode must not parse the bid file")
+
+    services = BidCheckServices(
+        extract=lambda _: empty_objects(),
+        parse=parse,
+        review=lambda *_: (_ for _ in ()).throw(
+            AssertionError("evaluation mode must skip review")
+        ),
+        extract_evaluation_with_recorder=evaluate,
+    )
+    task = create_evaluation_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    completed = task_repository.get(task.task_id)
+    assert completed is not None
+    assert completed.status == "complete"
+    assert completed.result["evaluation_rules"] == evaluation_result()
+    assert calls == [("evaluate", "招标文件.docx")]
+    assert completed.bid_parse_status == "complete"
+    assert completed.review_status == "complete"

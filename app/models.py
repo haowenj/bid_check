@@ -46,6 +46,67 @@ class SupplementalMaterial(TypedDict):
     source: TenderSource
 
 
+class EvaluationSourceSection(TypedDict):
+    section: str
+    title: str
+    block_ids: list[str]
+    source_text: str
+
+
+class ScoreCategory(TypedDict):
+    id: str
+    name: str
+    parent_id: str | None
+    full_score: float | None
+    original_rule: str
+    conditions: dict[str, Any]
+    structure_status: str
+    source: TenderSource
+
+
+class ScoreItem(TypedDict):
+    id: str
+    name: str
+    category_id: str | None
+    parent_item_id: str | None
+    original_rule: str
+    conditions: dict[str, Any]
+    scoring_method: dict[str, Any]
+    full_score: float | None
+    evidence_requirements: list[str]
+    evaluation_type: Literal["objective", "subjective", "mixed"]
+    source: TenderSource
+
+
+class VetoRule(TypedDict):
+    id: str
+    name: str
+    trigger_condition: str
+    consequence: str
+    additional_consequence: str | None
+    evidence_requirements: list[str]
+    original_rule: str
+    source: TenderSource
+
+
+class UncertainRule(TypedDict):
+    id: str
+    rule_type: str
+    description: str
+    original_rule: str
+    uncertainty_reason: str
+    source: TenderSource
+
+
+class TenderEvaluationExtractionResult(TypedDict):
+    source_sections: list[EvaluationSourceSection]
+    score_categories: list[ScoreCategory]
+    score_items: list[ScoreItem]
+    veto_rules: list[VetoRule]
+    uncertain_rules: list[UncertainRule]
+    stats: dict[str, Any]
+
+
 class FileRequirement(TypedDict):
     id: str
     name: str

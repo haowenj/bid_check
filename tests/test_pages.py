@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from app.models import FileMetadata
+
 
 def test_root_redirects_to_bid_check(client):
     response = client.get("/", follow_redirects=False)
@@ -19,7 +21,7 @@ def test_bid_check_page_has_two_docx_uploads_and_official_modes(client):
     assert "标书合规性校验" in response.text
     assert "评标规则校验" in response.text
     assert "全面校验" in response.text
-    assert response.text.count("开发中") >= 2
+    assert response.text.count("开发中") >= 1
     assert "评分+废标检查" not in response.text
     assert 'id="start-check"' in response.text
     assert 'id="start-check" class="button primary" type="submit" disabled' in response.text
@@ -32,8 +34,20 @@ def test_bid_check_page_contains_full_mode_descriptions(client):
     assert "检查模板填写、必填字段、附件完整性" in response.text
     assert "签字盖章、日期及材料完整性等问题" in response.text
     assert "评分项与否决投标风险" in response.text
-    assert "根据招标文件中的评分办法、初步评审标准" in response.text
+    assert "提取招标文件中的评分项、评分条件、证明材料和否决性规则" in response.text
+    assert "根据招标文件中的评分办法、初步评审标准" not in response.text
     assert "同时执行标书合规性校验和评标规则校验" in response.text
+
+
+def test_bid_check_page_enables_evaluation_mode_without_promising_scoring(client):
+    response = client.get("/bid-check")
+
+    assert response.status_code == 200
+    assert '<input name="check_mode" type="radio" value="evaluation" disabled>' not in response.text
+    assert 'value="evaluation"' in response.text
+    assert "本轮可执行" in response.text
+    assert "预计得分" not in response.text
+    assert "实际评分" not in response.text
 
 
 def test_task_list_page_shows_tasks_and_links_to_results(
@@ -124,6 +138,146 @@ def test_complete_page_renders_requirements_without_fake_verdict(
     assert "解析摘要" not in response.text
     assert "检查通过" not in response.text
     assert "检查不通过" not in response.text
+
+
+def test_complete_evaluation_page_renders_rule_artifact_with_provenance(
+    client,
+    settings,
+    repository,
+):
+    task_dir = settings.tasks_dir / "evaluation-task"
+    task_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    repository.create(
+        "evaluation-task",
+        FileMetadata("评标规则招标文件.docx", 6, str(tender_path)),
+        FileMetadata("未参与评分投标文件.docx", 3, str(bid_path)),
+        "evaluation",
+    )
+    repository.update_stage("evaluation-task", "requirements", "complete")
+    repository.update_stage("evaluation-task", "bid_parse", "complete")
+    repository.update_stage("evaluation-task", "review", "complete")
+    repository.complete(
+        "evaluation-task",
+        {
+            "evaluation_rules": {
+                "source_sections": [
+                    {
+                        "section": "第三章 评标办法",
+                        "title": "评标办法前附表",
+                        "block_ids": ["b100", "b101"],
+                        "source_text": "商务部分：30分；企业业绩每个2分，最高10分。",
+                    }
+                ],
+                "score_categories": [
+                    {
+                        "id": "category_001",
+                        "name": "商务部分",
+                        "parent_id": None,
+                        "full_score": 30,
+                        "original_rule": "商务部分满分30分。",
+                        "conditions": {},
+                        "structure_status": "complete",
+                        "source": {
+                            "section": "第三章 评标办法",
+                            "block_ids": ["b100"],
+                            "source_text": "商务部分：30分",
+                        },
+                    }
+                ],
+                "score_items": [
+                    {
+                        "id": "score_item_001",
+                        "name": "企业业绩",
+                        "category_id": "category_001",
+                        "parent_item_id": None,
+                        "original_rule": "投标人自2023年1月1日以来，每提供1个类似项目业绩得2分，最高10分，须提供合同关键页扫描件。",
+                        "conditions": {
+                            "time_range": "自2023年1月1日以来",
+                            "per_unit_score": 2,
+                            "quantity_unit": "个",
+                            "max_score": 10,
+                        },
+                        "scoring_method": {"type": "per_unit", "formula": "有效业绩数量×2，最高10分"},
+                        "full_score": 10,
+                        "evidence_requirements": ["合同关键页扫描件"],
+                        "evaluation_type": "objective",
+                        "source": {
+                            "section": "评标办法前附表",
+                            "block_ids": ["b101"],
+                            "source_text": "每提供1个类似项目业绩得2分，最高10分，须提供合同关键页扫描件。",
+                        },
+                    },
+                    {
+                        "id": "score_item_002",
+                        "name": "技术方案",
+                        "category_id": None,
+                        "parent_item_id": None,
+                        "original_rule": "技术方案内容完整、针对性强、措施合理的得8至10分。",
+                        "conditions": {},
+                        "scoring_method": {"type": "range", "range": "8至10分"},
+                        "full_score": 10,
+                        "evidence_requirements": [],
+                        "evaluation_type": "subjective",
+                        "source": {
+                            "section": "详细评审",
+                            "block_ids": ["b102"],
+                            "source_text": "技术方案内容完整、针对性强、措施合理的得8至10分。",
+                        },
+                    },
+                ],
+                "veto_rules": [
+                    {
+                        "id": "veto_001",
+                        "name": "资格审查不通过",
+                        "trigger_condition": "未提供营业执照。",
+                        "consequence": "否决其投标，不进入后续评审。",
+                        "evidence_requirements": ["营业执照"],
+                        "original_rule": "未提供营业执照的，否决其投标。",
+                        "source": {
+                            "section": "资格审查",
+                            "block_ids": ["b103"],
+                            "source_text": "未提供营业执照的，否决其投标。",
+                        },
+                    }
+                ],
+                "uncertain_rules": [],
+                "stats": {
+                    "candidate_count": 1,
+                    "source_section_count": 1,
+                    "score_category_count": 1,
+                    "score_item_count": 2,
+                    "veto_rule_count": 1,
+                    "llm_total_calls": 1,
+                    "llm_elapsed_ms": 1234,
+                    "estimated_prompt_tokens": 800,
+                },
+            }
+        },
+    )
+
+    response = client.get("/bid-check/tasks/evaluation-task")
+
+    assert response.status_code == 200
+    assert "评标规则提取结果" in response.text
+    assert "评标办法前附表" in response.text
+    assert "商务部分" in response.text
+    assert "30 分" in response.text
+    assert "企业业绩" in response.text
+    assert "客观评分" in response.text
+    assert "主观评分" in response.text
+    assert "每提供1个类似项目业绩得2分，最高10分" in response.text
+    assert "合同关键页扫描件" in response.text
+    assert "资格审查不通过" in response.text
+    assert "否决其投标，不进入后续评审。" in response.text
+    assert "来源 block：b101" in response.text
+    assert "来源 block：b103" in response.text
+    assert "实际评分" not in response.text
+    assert "最终得分" not in response.text
+    assert "最终排名" not in response.text
 
 
 def test_complete_page_reads_and_renders_file_requirement_artifact(

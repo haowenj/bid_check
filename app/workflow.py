@@ -36,6 +36,7 @@ class BidCheckServices:
         dict[str, Any],
     ]
     extract_with_recorder: Callable[..., dict[str, Any]] | None = None
+    extract_evaluation_with_recorder: Callable[..., dict[str, Any]] | None = None
     review_with_recorder: Callable[..., dict[str, Any]] | None = None
 
 
@@ -136,6 +137,97 @@ class BidCheckWorkflow:
                 )
 
         record_event("workflow.run.start", task_id=task_id)
+
+        if task.check_mode == "evaluation":
+            evaluation_started_at = time.perf_counter()
+            record_event(
+                "workflow.stage.start",
+                stage="requirements",
+                task_id=task_id,
+                file=task.tender_file.filename,
+                mode="evaluation",
+            )
+            logger.info(
+                "workflow.stage.start stage=requirements mode=evaluation task_id=%s file=%s",
+                task_id,
+                task.tender_file.filename,
+            )
+            self.repository.update_stage(task_id, "requirements", "running")
+            try:
+                if self.services.extract_evaluation_with_recorder is None:
+                    raise RuntimeError("evaluation extractor not configured")
+                evaluation_result = self.services.extract_evaluation_with_recorder(
+                    task.tender_file,
+                    recorder=recorder,
+                )
+                requirements_elapsed_ms = _elapsed_ms(evaluation_started_at)
+                workflow_stats["requirements_elapsed_ms"] = requirements_elapsed_ms
+                self.repository.update_stage(task_id, "requirements", "complete")
+                record_event(
+                    "workflow.stage.end",
+                    stage="requirements",
+                    task_id=task_id,
+                    mode="evaluation",
+                    status="complete",
+                    result=_result_summary(evaluation_result),
+                    elapsed_ms=requirements_elapsed_ms,
+                )
+                self.repository.update_stage(task_id, "bid_parse", "complete")
+                workflow_stats["bid_parse_elapsed_ms"] = 0
+                record_event(
+                    "workflow.stage.skip",
+                    stage="bid_parse",
+                    task_id=task_id,
+                    mode="evaluation",
+                    reason="evaluation_mode_does_not_use_bid_file",
+                )
+                self.repository.complete(
+                    task_id,
+                    {"evaluation_rules": evaluation_result},
+                )
+                workflow_stats["review_elapsed_ms"] = 0
+                record_event(
+                    "workflow.review.skip",
+                    task_id=task_id,
+                    mode="evaluation",
+                    reason="evaluation_mode_only_extracts_tender_rules",
+                )
+                finalize_workflow(status="complete")
+                logger.info(
+                    "workflow.run.end status=complete mode=evaluation task_id=%s elapsed_ms=%d",
+                    task_id,
+                    _elapsed_ms(started_at),
+                )
+                return
+            except Exception as exc:
+                failed_stage = "requirements"
+                failure = exc
+                self.repository.fail(task_id, "requirements", str(exc))
+                requirements_elapsed_ms = _elapsed_ms(evaluation_started_at)
+                workflow_stats["requirements_elapsed_ms"] = requirements_elapsed_ms
+                record_event(
+                    "workflow.stage.error",
+                    stage="requirements",
+                    task_id=task_id,
+                    mode="evaluation",
+                    status="failed",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    elapsed_ms=requirements_elapsed_ms,
+                )
+                finalize_workflow(
+                    status="failed",
+                    failed_stage=failed_stage,
+                    error=failure,
+                )
+                logger.error(
+                    "workflow.stage.error stage=requirements mode=evaluation task_id=%s error_type=%s elapsed_ms=%d",
+                    task_id,
+                    type(exc).__name__,
+                    _elapsed_ms(evaluation_started_at),
+                )
+                return
+
         stage_started_at = {
             "requirements": time.perf_counter(),
             "bid_parse": time.perf_counter(),

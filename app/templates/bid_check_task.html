@@ -196,7 +196,174 @@
     <span>任务 {{ task.task_id[:8] }}</span>
   </nav>
 
-  {% if task.status == "complete" %}
+  {% if task.check_mode == "evaluation" and task.status == "complete" %}
+    {% set evaluation_stats = evaluation_rules.stats|default({}, true) %}
+    {% set evaluation_categories = evaluation_rules.score_categories|default([], true) %}
+    {% set evaluation_items = evaluation_rules.score_items|default([], true) %}
+    {% set evaluation_veto_rules = evaluation_rules.veto_rules|default([], true) %}
+    {% set evaluation_uncertain_rules = evaluation_rules.uncertain_rules|default([], true) %}
+    <header class="page-heading result-page-heading">
+      <div>
+        <span class="eyebrow">评标规则提取已完成</span>
+        <h1>评标规则提取结果</h1>
+        <p>本阶段只提取评分和否决性规则，保留层级、原文与 MinerU block 来源，不执行投标文件评分或否决判断。</p>
+      </div>
+      <a class="button" href="/bid-check">创建新任务</a>
+    </header>
+
+    <div class="notice notice-info evaluation-notice" role="note">
+      <span class="notice-icon" aria-hidden="true">i</span>
+      <div>
+        <strong>规则产出物已生成</strong>
+        <p>客观评分项和主观评分项均只作为招标文件规则记录；后续阶段才会结合投标文件执行客观规则。</p>
+      </div>
+    </div>
+
+    <section class="card evaluation-summary-card" aria-label="评标规则提取统计">
+      <div>
+        <span class="summary-label">招标文件</span>
+        <strong>{{ task.tender_file.filename }}</strong>
+      </div>
+      <div class="evaluation-metrics">
+        <div><small>评分大类</small><strong>{{ evaluation_stats.score_category_count|default(evaluation_categories|length, true) }}</strong></div>
+        <div><small>具体评分项</small><strong>{{ evaluation_stats.score_item_count|default(evaluation_items|length, true) }}</strong></div>
+        <div><small>否决性规则</small><strong>{{ evaluation_stats.veto_rule_count|default(evaluation_veto_rules|length, true) }}</strong></div>
+        <div><small>待人工核验</small><strong>{{ evaluation_stats.uncertain_rule_count|default(evaluation_uncertain_rules|length, true) }}</strong></div>
+      </div>
+      <p>
+        评标章节 {{ evaluation_stats.source_section_count|default(evaluation_rules.source_sections|length, true) }} 个；
+        送入 LLM {{ evaluation_stats.prompt_chars|default(0, true) }} 字符（约 {{ evaluation_stats.estimated_prompt_tokens|default(0, true) }} token）；
+        调用 {{ evaluation_stats.llm_total_calls|default(0, true) }} 次；
+        总耗时 {{ evaluation_stats.total_elapsed_ms|default(evaluation_stats.llm_elapsed_ms, true) }} ms。
+      </p>
+    </section>
+
+    <section class="comparison-section evaluation-section" aria-labelledby="evaluation-sources-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">SOURCE SECTIONS</span>
+          <h2 id="evaluation-sources-heading">使用的评标章节</h2>
+        </div>
+        <span class="requirement-count">{{ evaluation_rules.source_sections|length }} 个章节</span>
+      </div>
+      <div class="evaluation-source-list">
+        {% for source_section in evaluation_rules.source_sections|default([], true) %}
+          <details class="evaluation-source-card">
+            <summary><strong>{{ source_section.title }}</strong><span>{{ source_section.section }} · block：{{ source_section.block_ids|join("、") }}</span></summary>
+            <p>{{ source_section.source_text }}</p>
+          </details>
+        {% else %}
+          <div class="card empty-card">未定位到可结构化的评标章节。</div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="comparison-section evaluation-section" aria-labelledby="evaluation-score-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">SCORING RULES</span>
+          <h2 id="evaluation-score-heading">评分规则</h2>
+        </div>
+        <span class="requirement-count">{{ evaluation_items|length }} 项</span>
+      </div>
+      {% for category in evaluation_categories %}
+        <article class="evaluation-category-card">
+          <div class="evaluation-category-heading">
+            <div>
+              <span class="eyebrow">评分大类</span>
+              <h3>{{ category.name }}</h3>
+              {% if category.parent_name %}<small>父级评分项：{{ category.parent_name }}</small>{% endif %}
+            </div>
+            <strong class="evaluation-score-value">{{ category.full_score_label }} 分</strong>
+          </div>
+          {% if category.original_rule %}<p class="evaluation-original-rule">{{ category.original_rule }}</p>{% endif %}
+              {% if category["items"] %}
+                <div class="evaluation-item-list">
+                  {% for item in category["items"] %}
+                <article class="evaluation-item-card">
+                  <div class="evaluation-item-heading">
+                    <div><strong>{{ item.name }}</strong>{% if item.parent_item_name %}<small>父级评分项：{{ item.parent_item_name }}</small>{% endif %}</div>
+                    <span class="evaluation-type evaluation-type-{{ item.evaluation_type }}">{% if item.evaluation_type == "objective" %}客观评分{% elif item.evaluation_type == "subjective" %}主观评分{% else %}客观+主观{% endif %}</span>
+                  </div>
+                  <div class="evaluation-item-score">子项满分：{{ item.full_score_label }} 分</div>
+                  <p class="evaluation-original-rule">{{ item.original_rule }}</p>
+                  {% if item.conditions %}<p><strong>结构化条件：</strong><code>{{ item.conditions|tojson }}</code></p>{% endif %}
+                  {% if item.scoring_method %}<p><strong>计分方式：</strong><code>{{ item.scoring_method|tojson }}</code></p>{% endif %}
+                  {% if item.evidence_requirements %}<p><strong>证明材料：</strong>{{ item.evidence_requirements|join("；") }}</p>{% endif %}
+                  <details class="evaluation-source-detail">
+                    <summary>原文与来源</summary>
+                    <p>{{ item.source.source_text|default("未记录", true) }}</p>
+                    <small>章节：{{ item.source.section|default("未记录", true) }}；来源 block：{{ item.source.block_ids|join("、") if item.source.block_ids else "未记录" }}</small>
+                  </details>
+                </article>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="comparison-muted">该评分大类暂未关联具体评分项，需人工核验层级关系。</p>
+          {% endif %}
+          <details class="evaluation-source-detail">
+            <summary>大类原文与来源</summary>
+            <p>{{ category.source.source_text|default("未记录", true) }}</p>
+            <small>章节：{{ category.source.section|default("未记录", true) }}；来源 block：{{ category.source.block_ids|join("、") if category.source.block_ids else "未记录" }}</small>
+          </details>
+        </article>
+      {% else %}
+        <div class="card empty-card">未提取到明确评分大类。</div>
+      {% endfor %}
+
+      {% set ungrouped_items = evaluation_items|selectattr("category_id", "none")|list %}
+      {% if ungrouped_items %}
+        <article class="evaluation-category-card evaluation-ungrouped-card">
+          <div class="evaluation-category-heading"><div><span class="eyebrow">待确认归属</span><h3>未关联评分大类的评分项</h3></div><strong class="evaluation-score-value">{{ ungrouped_items|length }} 项</strong></div>
+          {% for item in ungrouped_items %}<p><strong>{{ item.name }}</strong>：{{ item.original_rule }}（来源 block：{{ item.source.block_ids|join("、") if item.source.block_ids else "未记录" }}）</p>{% endfor %}
+        </article>
+      {% endif %}
+    </section>
+
+    <section class="comparison-section evaluation-section" aria-labelledby="evaluation-veto-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">VETO RULES</span>
+          <h2 id="evaluation-veto-heading">否决性规则</h2>
+        </div>
+        <span class="requirement-count">{{ evaluation_veto_rules|length }} 条</span>
+      </div>
+      {% for rule in evaluation_veto_rules %}
+        <article class="evaluation-veto-card">
+          <div class="evaluation-item-heading"><strong>{{ rule.name }}</strong><span class="comparison-status comparison-status-fail">明确后果</span></div>
+          <p><strong>触发条件：</strong>{{ rule.trigger_condition }}</p>
+          <p><strong>触发后果：</strong>{{ rule.consequence }}</p>
+          {% if rule.additional_consequence %}<p><strong>补充后果说明：</strong>{{ rule.additional_consequence }}</p>{% endif %}
+          {% if rule.evidence_requirements %}<p><strong>判断依据：</strong>{{ rule.evidence_requirements|join("；") }}</p>{% endif %}
+          <details class="evaluation-source-detail"><summary>原文与来源</summary><p>{{ rule.original_rule }}</p><small>章节：{{ rule.source.section|default("未记录", true) }}；来源 block：{{ rule.source.block_ids|join("、") if rule.source.block_ids else "未记录" }}</small></details>
+        </article>
+      {% else %}
+        <div class="card empty-card">未提取到具有明确否决后果的规则。</div>
+      {% endfor %}
+    </section>
+
+    <section class="comparison-section evaluation-section" aria-labelledby="evaluation-uncertain-heading">
+      <div class="section-heading result-section-heading">
+        <div>
+          <span class="section-number">MANUAL REVIEW</span>
+          <h2 id="evaluation-uncertain-heading">无法准确结构化的规则</h2>
+        </div>
+        <span class="requirement-count">{{ evaluation_uncertain_rules|length }} 条</span>
+      </div>
+      {% for rule in evaluation_uncertain_rules %}
+        <article class="evaluation-uncertain-card">
+          <strong>{{ rule.description }}</strong>
+          <p>{{ rule.uncertainty_reason }}</p>
+          <p class="evaluation-original-rule">{{ rule.original_rule }}</p>
+          <small>类型：{{ rule.rule_type }}；来源 block：{{ rule.source.block_ids|join("、") if rule.source and rule.source.block_ids else "未记录" }}</small>
+        </article>
+      {% else %}
+        <div class="card empty-card">本次没有需要单独标记的结构化不确定项。</div>
+      {% endfor %}
+    </section>
+
+    {% include "_back_to_top.html" %}
+  {% elif task.status == "complete" %}
     <header class="page-heading result-page-heading">
       <div>
         <span class="eyebrow">任务已完成</span>
@@ -892,9 +1059,9 @@
   {% else %}
     <header class="page-heading task-page-heading">
       <div>
-        <span class="eyebrow">标书合规性校验</span>
-        <h1>正在处理检查任务</h1>
-        <p>两个前置步骤会并行执行，完成后自动进入合规性检查。</p>
+        <span class="eyebrow">{% if task.check_mode == "evaluation" %}评标规则提取{% else %}标书合规性校验{% endif %}</span>
+        <h1>{% if task.check_mode == "evaluation" %}正在提取评标规则{% else %}正在处理检查任务{% endif %}</h1>
+        <p>{% if task.check_mode == "evaluation" %}本阶段只处理招标文件，完成后生成评分和否决性规则产出物。{% else %}两个前置步骤会并行执行，完成后自动进入合规性检查。{% endif %}</p>
       </div>
       <span class="task-id">任务 {{ task.task_id[:8] }}</span>
     </header>
@@ -904,9 +1071,9 @@
         <span class="file-kind">招</span>
         <span><small>招标文件</small><strong>{{ task.tender_file.filename }}</strong></span>
       </div>
-      <div>
-        <span class="file-kind bid-kind">投</span>
-        <span><small>投标文件</small><strong>{{ task.bid_file.filename }}</strong></span>
+          <div>
+            <span class="file-kind bid-kind">投</span>
+            <span><small>投标文件{% if task.check_mode == "evaluation" %}（本阶段不参与）{% endif %}</small><strong>{{ task.bid_file.filename }}</strong></span>
       </div>
     </section>
 
@@ -935,17 +1102,17 @@
         </article>
 
         <div class="connector connector-down" aria-hidden="true"></div>
-        <div class="parallel-label"><span>并行执行</span></div>
+        <div class="parallel-label"><span>{% if task.check_mode == "evaluation" %}单链路提取{% else %}并行执行{% endif %}</span></div>
 
         <div class="parallel-stages" data-parallel-stages>
           <article class="stage-card status-surface-{{ task.requirements_status }}" data-stage="requirements">
             <span class="stage-number">2</span>
-            <div><strong>提取招标文件检查对象</strong><small>识别完整模板、项目编制要求和补充材料</small></div>
+            <div><strong>{% if task.check_mode == "evaluation" %}提取评标规则{% else %}提取招标文件检查对象{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}定位完整评标章节、评分表和明确否决条款{% else %}识别完整模板、项目编制要求和补充材料{% endif %}</small></div>
             {{ status_badge(task.requirements_status) }}
           </article>
           <article class="stage-card status-surface-{{ task.bid_parse_status }}" data-stage="bid_parse">
             <span class="stage-number">3</span>
-            <div><strong>解析投标文件</strong><small>生成结构化文档摘要</small></div>
+            <div><strong>解析投标文件</strong><small>{% if task.check_mode == "evaluation" %}本阶段跳过，不参与规则提取{% else %}生成结构化文档摘要{% endif %}</small></div>
             {{ status_badge(task.bid_parse_status) }}
           </article>
         </div>
@@ -954,7 +1121,7 @@
 
         <article class="stage-card status-surface-{{ task.review_status }}" data-stage="review">
           <span class="stage-number">4</span>
-          <div><strong>执行合规性检查</strong><small>汇合两个前置步骤的结构化结果</small></div>
+          <div><strong>{% if task.check_mode == "evaluation" %}生成评标规则产出物{% else %}执行合规性检查{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}不执行投标文件评分或否决判断{% else %}汇合两个前置步骤的结构化结果{% endif %}</small></div>
           {{ status_badge(task.review_status) }}
         </article>
 
@@ -962,7 +1129,7 @@
 
         <article class="stage-card status-surface-{{ 'failed' if task.status == 'failed' else 'pending' }}" data-stage="result">
           <span class="stage-number">5</span>
-          <div><strong>检查对象结果</strong><small>展示模板、项目要求和补充材料</small></div>
+          <div><strong>{% if task.check_mode == "evaluation" %}评标规则结果{% else %}检查对象结果{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}展示评分层级、否决规则和来源 block{% else %}展示模板、项目要求和补充材料{% endif %}</small></div>
           {{ status_badge("failed" if task.status == "failed" else "pending") }}
         </article>
       </div>
@@ -972,7 +1139,7 @@
 {% endblock %}
 
 {% block scripts %}
-  {% if task.status == "complete" %}
+  {% if task.status == "complete" and task.check_mode != "evaluation" %}
     <script>
       (() => {
         const switcher = document.querySelector("[data-result-style-switcher]");

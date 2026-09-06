@@ -89,7 +89,7 @@
           <span class="section-number">02</span>
           <h2 id="mode-heading">选择校验方式</h2>
         </div>
-        <p>第一版仅开放标书合规性校验</p>
+        <p>当前开放招标文件规则提取和标书合规性校验</p>
       </div>
 
       <div class="mode-grid">
@@ -104,15 +104,15 @@
           </span>
         </label>
 
-        <label class="mode-card mode-disabled" aria-disabled="true">
-          <input name="check_mode" type="radio" value="evaluation" disabled>
+        <label class="mode-card mode-available">
+          <input name="check_mode" type="radio" value="evaluation" required>
           <span class="mode-radio" aria-hidden="true"></span>
-          <span class="mode-status">开发中</span>
+          <span class="mode-status available">本轮可执行</span>
           <strong>评标规则校验</strong>
           <span class="mode-subtitle">评分项与否决投标风险</span>
           <span class="mode-description">
-            根据招标文件中的评分办法、初步评审标准、
-            否决投标条款等，检查预计得分及废标风险。
+            提取招标文件中的评分项、评分条件、证明材料和否决性规则，
+            生成可追溯的结构化规则产出物。
           </span>
         </label>
 
@@ -142,4 +142,3 @@
 {% block scripts %}
   <script src="{{ url_for('static', path='upload.js') }}" defer></script>
 {% endblock %}
-
