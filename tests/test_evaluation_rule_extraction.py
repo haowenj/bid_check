@@ -144,7 +144,7 @@ def test_evaluation_candidates_keep_complete_score_table_and_veto_context():
         _block(
             "b8",
             "paragraph",
-            "评标委员会完成评标后形成评标报告。",
+            "评标委员会完成评标后形成评标报告，报告应当包括评标专家评分原始记录表和否决投标的情况说明。",
             "3.1 初步评审",
             8,
         ),
@@ -446,6 +446,112 @@ def test_normalizer_rebinds_whole_candidate_hint_and_keeps_unexplicit_veto_uncer
 
     assert normalized["veto_rules"] == []
     assert normalized["uncertain_rules"][0]["source"]["block_ids"] == ["b2"]
+    assert normalized["uncertain_rules"][0]["uncertainty_reason"] == (
+        "no_explicit_veto_consequence"
+    )
+
+
+def test_unrepresented_veto_signal_is_retained_for_manual_review():
+    from app.evaluation_rule_extraction import (
+        _append_unrepresented_veto_signals,
+        build_evaluation_candidates,
+    )
+
+    candidate = build_evaluation_candidates(
+        [
+            _block("b1", "heading", "3.1 初步评审", "评标办法", 1, 2),
+            _block(
+                "b2",
+                "paragraph",
+                "没有按照要求提供材料的投标将可能被否决。",
+                "3.1 初步评审",
+                2,
+            ),
+        ]
+    )[0]
+    result = {
+        "score_categories": [],
+        "score_items": [],
+        "veto_rules": [],
+        "uncertain_rules": [],
+    }
+
+    _append_unrepresented_veto_signals(result, [candidate])
+
+    assert len(result["uncertain_rules"]) == 1
+    assert result["uncertain_rules"][0]["source"]["block_ids"] == ["b2"]
+    assert result["uncertain_rules"][0]["rule_type"] == (
+        "unrepresented_veto_signal"
+    )
+
+
+def test_normalizer_accepts_explicit_document_rejection_consequence():
+    from app.evaluation_rule_extraction import (
+        _coerce_evaluation_output,
+        _normalize_evaluation_sources,
+    )
+
+    candidate = _candidate(
+        "b1",
+        "开标",
+        "出现下列情形时，招标人/招标代理机构不予接收投标文件：逾期送达。",
+    )
+    output = _coerce_evaluation_output(
+        {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [
+                {
+                    "name": "逾期送达",
+                    "trigger_condition": "逾期送达",
+                    "consequence": "不予接收投标文件",
+                    "evidence_requirements": [],
+                    "original_rule": candidate.text,
+                    "source_block_ids": ["b1"],
+                }
+            ],
+            "uncertain_rules": [],
+        }
+    )
+
+    normalized = _normalize_evaluation_sources(output, [candidate])
+
+    assert len(normalized["veto_rules"]) == 1
+    assert normalized["veto_rules"][0]["consequence"] == "不予接收投标文件"
+
+
+def test_normalizer_keeps_possible_veto_consequence_uncertain():
+    from app.evaluation_rule_extraction import (
+        _coerce_evaluation_output,
+        _normalize_evaluation_sources,
+    )
+
+    candidate = _candidate(
+        "b1",
+        "评审提醒",
+        "未按要求递交资料可能导致其投标被否决。",
+    )
+    output = _coerce_evaluation_output(
+        {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [
+                {
+                    "name": "资料不全",
+                    "trigger_condition": "未按要求递交资料",
+                    "consequence": "可能导致其投标被否决",
+                    "evidence_requirements": [],
+                    "original_rule": candidate.text,
+                    "source_block_ids": ["b1"],
+                }
+            ],
+            "uncertain_rules": [],
+        }
+    )
+
+    normalized = _normalize_evaluation_sources(output, [candidate])
+
+    assert normalized["veto_rules"] == []
     assert normalized["uncertain_rules"][0]["uncertainty_reason"] == (
         "no_explicit_veto_consequence"
     )

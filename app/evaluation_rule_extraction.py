@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 EVALUATION_RULE_SCHEMA_VERSION = "evaluation-rules-v1"
 EVALUATION_RULE_PROMPT_VERSION = "evaluation-rule-extraction-prompt-v1"
 EVALUATION_RULE_CACHE_VERSION = (
-    f"evaluation-rule-extraction-v4:{EVALUATION_RULE_PROMPT_VERSION}"
+    f"evaluation-rule-extraction-v8:{EVALUATION_RULE_PROMPT_VERSION}"
 )
 
 _EVALUATION_TITLE_RE = re.compile(
@@ -50,14 +50,16 @@ _SCORE_SIGNAL_RE = re.compile(
 )
 _VETO_SIGNAL_RE = re.compile(
     r"否决其投标|否决投标|被否决|导致被否决|废标|无效投标|不通过资格审查|不通过符合性审查|"
-    r"不进入下一阶段|不得进入评审|取消评审资格|失去评审资格"
+    r"不进入下一阶段|不得进入评审|取消评审资格|失去评审资格|"
+    r"不予接收投标文件|不接收投标文件|拒收投标文件|不予受理"
 )
 _EXPLICIT_VETO_CONSEQUENCE_RE = re.compile(
     r"否决(?:其|该|此)?(?:投标|响应)|"
     r"(?:投标|响应)(?:将|均将|应当)?被否决|"
     r"(?:投标|响应)无效|无效投标|废标|"
     r"不通过(?:资格|符合性)审查|"
-    r"不进入(?:下一阶段|评审)|取消评审资格|失去评审资格"
+    r"不进入(?:下一阶段|评审)|取消评审资格|失去评审资格|"
+    r"不予接收(?:投标文件)?|不接收(?:投标文件)?|拒收(?:投标文件)?|不予受理"
 )
 _EVIDENCE_SIGNAL_RE = re.compile(
     r"提供|提交|附|上传|扫描件|证明材料|合同|证书|报告|复印件|原件"
@@ -65,7 +67,8 @@ _EVIDENCE_SIGNAL_RE = re.compile(
 _PURE_FLOW_RE = re.compile(
     r"评标委员会(?:完成评标后)?(?:形成|编制|提交)?评标报告|"
     r"评标委员会组成人数|评标委员会由|评标程序|评标原则|开标程序|"
-    r"评标报告应当包括|评标委员会成员名单"
+    r"评标报告应当包括|评标委员会成员名单|"
+    r"评标专家评分原始记录表和否决(?:投标|响应)的情况说明"
 )
 _MAJOR_CHAPTER_RE = re.compile(
     r"^\s*(?:第[一二三四五六七八九十百千万0-9０-９]+章|"
@@ -182,9 +185,17 @@ def _is_non_evaluation_major_boundary(block: StructuredBlock) -> bool:
 def _is_pure_flow_block(block: StructuredBlock) -> bool:
     if block.type != "paragraph":
         return False
-    return bool(_PURE_FLOW_RE.search(_compact(block.text))) and not (
-        _VETO_SIGNAL_RE.search(block.text) or _SCORE_SIGNAL_RE.search(block.text)
-    )
+    compact = _compact(block.text)
+    if not _PURE_FLOW_RE.search(compact):
+        return False
+    # A report's required contents can mention scoring or vetoes without
+    # creating an executable rule of its own.
+    if re.search(
+        r"评标报告应当包括|评标专家评分原始记录表和否决(?:投标|响应)的情况说明",
+        compact,
+    ):
+        return True
+    return not (_VETO_SIGNAL_RE.search(block.text) or _SCORE_SIGNAL_RE.search(block.text))
 
 
 def _region_kind(blocks: Sequence[StructuredBlock]) -> Literal["scoring", "veto", "mixed"]:
@@ -581,6 +592,12 @@ def _source_supports_rule(rule: str, source_text: str) -> bool:
     )
 
 
+def _has_explicit_veto_consequence(text: str) -> bool:
+    if re.search(r"可能(?:会)?导致[^。；\n]{0,30}(?:被否决|废标|无效)", text):
+        return False
+    return bool(_EXPLICIT_VETO_CONSEQUENCE_RE.search(text))
+
+
 def _source_for_ids(
     source_ids: Sequence[str],
     candidates: Sequence[EvaluationCandidate],
@@ -859,7 +876,7 @@ def _normalize_evaluation_sources(
                 )
             )
             continue
-        if not _EXPLICIT_VETO_CONSEQUENCE_RE.search(raw_item["original_rule"]):
+        if not _has_explicit_veto_consequence(raw_item["original_rule"]):
             normalized["uncertain_rules"].append(
                 _uncertain_from_item(
                     raw_item,
@@ -976,7 +993,7 @@ class OpenAICompatibleEvaluationRuleLLM:
             "必须保留评分大类与评分项的父子关系、完整原文、满分、评分条件、计分方式、"
             "分档、时间/数量/金额/比例/上下限、证明材料及特殊要求。"
             "明确数量/金额/日期/固定分值/公式可标 objective；需要评委判断的内容标 subjective；"
-            "两者同时存在标 mixed。只提取有实际评分效果或明确否决/废标/无效后果的规则。"
+            "两者同时存在标 mixed。只提取有实际评分效果或明确否决/废标/无效/不予接收后果的规则。"
             "普通评标流程、评标委员会组成、评标报告、开标说明和没有明确后果的提醒不要进入正式规则。"
             "不确定的表格关系必须写入 uncertain_rules，不得强行配对。"
             "只返回 JSON 对象，顶层只能包含 score_categories、score_items、veto_rules、uncertain_rules。"
@@ -1274,6 +1291,42 @@ def _evaluation_stats(
     }
 
 
+def _append_unrepresented_veto_signals(
+    result: dict[str, list[dict[str, Any]]],
+    candidates: Sequence[EvaluationCandidate],
+) -> None:
+    """Keep veto-looking source blocks visible when the model omits them."""
+
+    covered_block_ids = {
+        block_id
+        for kind in ("score_categories", "score_items", "veto_rules", "uncertain_rules")
+        for item in result[kind]
+        for block_id in item.get("source", {}).get("block_ids", [])
+    }
+    for candidate in candidates:
+        for block in candidate.blocks:
+            if block.block_id in covered_block_ids or not _VETO_SIGNAL_RE.search(
+                block.text
+            ):
+                continue
+            result["uncertain_rules"].append(
+                {
+                    "id": "",
+                    "rule_type": "unrepresented_veto_signal",
+                    "description": "包含否决相关表述但未被模型可靠结构化的文档块",
+                    "original_rule": block.text.strip(),
+                    "uncertainty_reason": (
+                        "文档块包含否决/无效后果信号，但模型输出未引用该来源块；"
+                        "保留原文供人工核验，禁止据此自动执行否决。"
+                    ),
+                    "source": _source_payload(candidate, [block.block_id], block.text),
+                }
+            )
+            covered_block_ids.add(block.block_id)
+    for index, item in enumerate(result["uncertain_rules"], start=1):
+        item["id"] = f"uncertain_{index:03d}"
+
+
 def extract_tender_evaluation_rules(
     tender_file,
     *,
@@ -1567,6 +1620,7 @@ def extract_tender_evaluation_rules(
                     raise EvaluationRuleExtractionError("LLM 评标规则提取未完成。")
 
         merged = _merge_normalized_outputs(normalized_batches)
+        _append_unrepresented_veto_signals(merged, candidates)
         source_sections = [
             {
                 "section": candidate.section,
