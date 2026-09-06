@@ -675,6 +675,106 @@ def _normalize_contract_amount(facts: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _table_amount_value(row: Mapping[str, Any]) -> float | None:
+    raw = _as_text(row.get("销售金额（万元）") or row.get("销售金额") or row.get("amount"))
+    if not raw:
+        return None
+    match = re.search(r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _apply_amount_scope_checks(
+    amount: dict[str, Any],
+    *,
+    row: Mapping[str, Any],
+    checks: Mapping[str, Any],
+    parties_facts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prevent a project total from becoming the bidder's amount silently."""
+
+    table_amount = _table_amount_value(row)
+    consistency_check = checks.get("table_amount_consistency")
+    consistency_status = (
+        _as_text(consistency_check.get("status"))
+        if isinstance(consistency_check, Mapping)
+        else ""
+    )
+    contract_total = amount.get("value")
+    flags: list[str] = []
+    reasons: list[str] = []
+    if consistency_status == "fail":
+        flags.append("table_amount_conflict")
+        reasons.append("业绩表金额与合同金额一致性检查明确失败")
+    if (
+        table_amount is not None
+        and isinstance(contract_total, (int, float))
+        and amount.get("cumulative_value") is not None
+        and abs(table_amount - float(amount["cumulative_value"])) > 0.01
+    ):
+        if "table_amount_conflict" not in flags:
+            flags.append("table_amount_conflict")
+        reasons.append(
+            f"业绩表金额{table_amount:g}万元与合同事实金额{float(amount['cumulative_value']):g}万元不一致"
+        )
+
+    party_text = " ".join(
+        " ".join(
+            _as_text(value)
+            for value in (party.get("value"), *party.get("evidence_texts", []))
+        )
+        for party in parties_facts
+    )
+    multi_contractor = any(
+        term in party_text
+        for term in ("牵头人", "成员", "联合体", "联合体成员", "联合体牵头")
+    )
+    if multi_contractor:
+        flags.append("multi_contractor")
+        flags.append("contract_total_attribution_unconfirmed")
+        reasons.append("合同存在多个承包人或联合体成员，但没有当前投标人的金额分摊/归属事实")
+
+    amount = dict(amount)
+    amount.update(
+        {
+            "table_reported_value": table_amount,
+            "table_reported_unit": "万元" if table_amount is not None else None,
+            "table_amount_consistency_status": consistency_status or None,
+            "multi_contractor": multi_contractor,
+        }
+    )
+    if flags and isinstance(contract_total, (int, float)):
+        amount.update(
+            {
+                "contract_total_value": contract_total,
+                "contract_total_unit": amount.get("unit"),
+                "value": None,
+                "confirmation": "uncertain",
+                "cumulative_value": None,
+                "amount_ownership_confirmed": False,
+                "uncertainty_flags": list(dict.fromkeys(flags)),
+                "reason": "；".join(dict.fromkeys(reasons))
+                + "，不能确认该合同总金额可归属于当前投标人。",
+            }
+        )
+    elif flags:
+        amount.update(
+            {
+                "amount_ownership_confirmed": False,
+                "uncertainty_flags": list(dict.fromkeys(flags)),
+                "reason": "；".join(dict.fromkeys(reasons)),
+            }
+        )
+    else:
+        amount["amount_ownership_confirmed"] = True
+        amount["uncertainty_flags"] = []
+    return amount
+
+
 def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
     reviews = _review_entries(artifacts, "10_performance_reviews.json", "performance_reviews")
     facts: list[dict[str, Any]] = []
@@ -694,8 +794,15 @@ def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
         service_content_facts = [_compact_fact(fact) for fact in _fact_entries(review, "service_content")]
         contract_amount_facts = [_compact_fact(fact) for fact in _fact_entries(review, "contract_amount")]
         implementation_time_facts = [_compact_fact(fact) for fact in _fact_entries(review, "implementation_time")]
+        parties_facts = [_compact_fact(fact) for fact in _fact_entries(review, "parties")]
         signature_dates, signature_date_evidence = _signature_date_evidence(review)
         source_blocks, source_images = _source_ids(review)
+        amount = _apply_amount_scope_checks(
+            _normalize_contract_amount(contract_amount_facts),
+            row=row,
+            checks=checks,
+            parties_facts=parties_facts,
+        )
         facts.append(
             {
                 "entry_index": index,
@@ -708,6 +815,7 @@ def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "service_content_facts": service_content_facts,
                 "contract_amount_facts": contract_amount_facts,
                 "implementation_time_facts": implementation_time_facts,
+                "parties_facts": parties_facts,
                 "signature_dates": signature_dates,
                 "signature_date_evidence": signature_date_evidence,
                 "framework_contract": dict(review.get("framework_contract"))
@@ -716,7 +824,7 @@ def _performance_facts(artifacts: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "materials": [dict(material) for material in review.get("materials", []) if isinstance(material, Mapping)]
                 if isinstance(review.get("materials"), list)
                 else [],
-                "amount": _normalize_contract_amount(contract_amount_facts),
+                "amount": amount,
                 "source_blocks": source_blocks,
                 "source_images": source_images,
                 "checks": {
@@ -841,25 +949,43 @@ def _signature_date_condition(
         if _check_status(fact, "signature_date") == "fail":
             return _condition_result("invalid", "现有检查确认合同签署日期栏为空或不满足要求。")
         return _condition_result("uncertain", "未能从现有事实中确认合同签署日期。")
-    if len(set(dates)) != 1:
-        return _condition_result("uncertain", "合同签署日期存在多个相互冲突的事实，无法确定用于评分的签署日期。", dates=dates)
     if announcement_date is None:
         return _condition_result("uncertain", "缺少招标公告发布日期，无法判断签署日期是否早于公告发布前一日。", dates=dates)
-    signing_date = _parse_date(dates[0])
+    parsed_dates = [_parse_date(value) for value in dates]
     announcement = _parse_date(announcement_date)
-    if signing_date is None or announcement is None:
+    if any(parsed_date is None for parsed_date in parsed_dates) or announcement is None:
         return _condition_result("uncertain", "签署日期或公告发布日期格式无法可靠解析。", dates=dates)
     lower = date(2023, 1, 1)
-    if not lower <= signing_date < announcement:
+    valid_dates = [parsed_date for parsed_date in parsed_dates if lower <= parsed_date < announcement]
+    invalid_dates = [parsed_date for parsed_date in parsed_dates if parsed_date not in valid_dates]
+    if valid_dates and invalid_dates:
+        return _condition_result(
+            "uncertain",
+            "识别到的多个签署日期中同时存在时间范围内和范围外日期，无法确定应采用哪一个合同签订日期。",
+            dates=dates,
+            valid_dates=[value.isoformat() for value in valid_dates],
+            out_of_range_dates=[value.isoformat() for value in invalid_dates],
+        )
+    if not valid_dates:
         return _condition_result(
             "invalid",
             "合同签署日期不在2023年1月1日至公告发布前一日范围内。",
-            signing_date=signing_date.isoformat(),
+            dates=dates,
             announcement_date=announcement.isoformat(),
         )
+    if len(valid_dates) > 1:
+        return _condition_result(
+            "pass",
+            "识别到的多个签署日期均处于招标文件要求的时间范围内，多方分别签署本身不构成时间冲突。",
+            dates=dates,
+            valid_dates=[value.isoformat() for value in valid_dates],
+            announcement_date=announcement.isoformat(),
+        )
+    signing_date = valid_dates[0]
     return _condition_result(
         "pass",
         "合同签署日期处于招标文件要求的时间范围内。",
+        dates=dates,
         signing_date=signing_date.isoformat(),
         announcement_date=announcement.isoformat(),
     )

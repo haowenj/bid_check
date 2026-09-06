@@ -681,12 +681,14 @@ def test_performance_amount_is_normalized_from_ocr_facts_not_table_value(tmp_pat
     )
 
     item = result["score_items"][0]
-    assert item["status"] == "auto_scored"
-    assert item["score"] == 5
+    assert item["status"] == "evidence_insufficient"
+    assert item["score"] is None
     case = item["facts"]["case_evaluations"][1]
-    assert case["amount"]["value"] == 3640
+    assert case["amount"]["value"] is None
+    assert case["amount"]["contract_total_value"] == 3640
     assert case["amount"]["unit"] == "万元"
     assert case["amount"]["basis"] == "contract_fact"
+    assert "table_amount_conflict" in case["amount"]["uncertainty_flags"]
 
 
 def test_performance_amount_keeps_max_score_when_unknown_cases_cannot_change_tier(tmp_path):
@@ -725,3 +727,131 @@ def test_performance_amount_keeps_max_score_when_unknown_cases_cannot_change_tie
     assert item["score"] == 5
     assert item["calculation"]["max_score_proven_by_confirmed_amount"] is True
     assert item["calculation"]["unresolved_case_numbers"] == ["2"]
+
+
+def test_performance_amount_conflict_and_multi_contractor_do_not_affect_quantity_score(tmp_path):
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    scoring = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="fail",
+        amount_text="36400000元",
+        signed_date_text="2025年2月10日",
+    )
+    scoring["table_row"]["销售金额（万元）"] = "128"
+    scoring["checks_by_key"]["table_amount_consistency"] = {
+        "status": "fail",
+        "reason": "业绩表128万元与合同3640万元不一致。",
+        "evidence": [],
+    }
+    scoring["ocr_facts"]["parties"] = [
+        {
+            "field": "parties",
+            "status": "present",
+            "value": "中国建筑第六工程局有限公司（牵头人）、惠州惠阳图迹智慧运营科技有限公司（成员）",
+            "evidence": [],
+        }
+    ]
+    artifacts = {
+        "10_performance_reviews.json": {
+            "performance_reviews": [qualification, scoring],
+            "stats": {},
+        }
+    }
+
+    result = run_objective_scoring(
+        make_performance_rules(),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts=artifacts,
+    )
+    quantity_item, amount_item = result["score_items"]
+
+    assert quantity_item["status"] == "auto_scored"
+    assert quantity_item["score"] == 1
+    assert amount_item["status"] == "evidence_insufficient"
+    case = amount_item["facts"]["case_evaluations"][1]
+    assert case["current_rule_status"] == "uncertain"
+    assert case["amount"]["confirmation"] == "uncertain"
+    assert case["amount"]["value"] is None
+    assert "table_amount_conflict" in case["amount"]["uncertainty_flags"]
+    assert "multi_contractor" in case["amount"]["uncertainty_flags"]
+
+
+def test_performance_multiple_valid_signature_dates_pass_time_condition(tmp_path):
+    scoring = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="uncertain",
+        amount_text="2000000元",
+        signed_date_text="2025年2月10日",
+    )
+    scoring["text_model_extraction"]["signature_date_candidates"].append(
+        {"evidence": [{"evidence_text": "2025年2月12日"}]}
+    )
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+
+    result = run_objective_scoring(
+        make_rule_with_performance_item("score_item_010", "类似案例1"),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts={
+            "10_performance_reviews.json": {
+                "performance_reviews": [qualification, scoring],
+                "stats": {},
+            }
+        },
+    )
+
+    item = result["score_items"][0]
+    case = item["facts"]["case_evaluations"][1]
+    assert case["conditions"]["contract_signing_date"]["status"] == "pass"
+    assert case["conditions"]["contract_signing_date"]["dates"] == [
+        "2025-02-10",
+        "2025-02-12",
+    ]
+    assert case["current_rule_status"] == "valid"
+    assert item["status"] == "auto_scored"
+    assert item["score"] == 1
+
+
+def test_performance_signature_date_on_announcement_day_is_out_of_range(tmp_path):
+    qualification = make_rule_relevant_performance_review(
+        role="qualification",
+        overall_status="fail",
+        amount_text="1000000元",
+        signed_date_text="2025年1月10日",
+    )
+    scoring = make_rule_relevant_performance_review(
+        role="scoring",
+        overall_status="pass",
+        amount_text="2000000元",
+        signed_date_text="2026年3月30日",
+    )
+
+    result = run_objective_scoring(
+        make_rule_with_performance_item("score_item_010", "类似案例1"),
+        _bid_file(tmp_path),
+        tender_evidence=make_tender_evidence(),
+        existing_artifacts={
+            "10_performance_reviews.json": {
+                "performance_reviews": [qualification, scoring],
+                "stats": {},
+            }
+        },
+    )
+
+    item = result["score_items"][0]
+    case = item["facts"]["case_evaluations"][1]
+    assert case["conditions"]["contract_signing_date"]["status"] == "invalid"
+    assert case["current_rule_status"] == "invalid"
+    assert item["status"] == "auto_scored"
+    assert item["score"] == 0
