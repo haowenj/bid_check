@@ -71,6 +71,7 @@ def test_evaluation_mode_creates_tender_rule_task(client, repository, settings):
     assert task.status == "complete"
     assert task.check_mode == "evaluation"
     assert task.result["evaluation_rules"]["score_items"] == []
+    assert task.result["objective_scores"]["score_items"] == []
     artifact = (
         settings.tasks_dir
         / task_id
@@ -78,6 +79,12 @@ def test_evaluation_mode_creates_tender_rule_task(client, repository, settings):
         / "11_evaluation_rules.json"
     )
     assert artifact.is_file()
+    assert (
+        settings.tasks_dir
+        / task_id
+        / "compliance_extraction"
+        / "objective_scores.json"
+    ).is_file()
 
 
 def test_create_task_rejects_empty_file(client):

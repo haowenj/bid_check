@@ -43,6 +43,10 @@ from app.evaluation_rule_extraction import (
     OpenAICompatibleEvaluationRuleLLM,
     extract_tender_evaluation_rules,
 )
+from app.objective_scoring import (
+    load_reusable_bid_evidence,
+    run_objective_scoring,
+)
 from app.config import Settings, load_settings
 from app.models import BidCheckTask, FileMetadata
 from app.repository import BidCheckRepository
@@ -558,6 +562,37 @@ def build_default_workflow(
             max_batches=settings.compliance_max_batches,
         )
 
+    def score_objective(
+        tender_file: FileMetadata,
+        bid_file: FileMetadata,
+        evaluation_result: dict[str, Any],
+        recorder=None,
+    ) -> dict[str, Any]:
+        del tender_file
+        evidence = load_reusable_bid_evidence(bid_file)
+        parser_fallback_used = False
+        if evidence["bid_document"] is None:
+            parser_fallback_used = True
+            bid_path = Path(bid_file.storage_path).expanduser().resolve()
+            clean_bid_document(
+                bid_file,
+                parser=bid_parser,
+                output_dir=bid_path.parent / "bid_document_cleaning",
+            )
+            evidence = load_reusable_bid_evidence(bid_file)
+        return run_objective_scoring(
+            evaluation_result,
+            bid_file,
+            bid_document=evidence["bid_document"],
+            artifact_dir=(
+                Path(evidence["bid_document_artifact"]).parent
+                if evidence["bid_document_artifact"]
+                else None
+            ),
+            recorder=recorder,
+            bid_parse_fallback_used=parser_fallback_used,
+        )
+
     services = BidCheckServices(
         extract=extract_requirements,
         parse=partial(
@@ -572,6 +607,7 @@ def build_default_workflow(
         ),
         extract_with_recorder=extract_requirements,
         extract_evaluation_with_recorder=extract_evaluation,
+        score_objective_with_recorder=score_objective,
         review_with_recorder=partial(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,

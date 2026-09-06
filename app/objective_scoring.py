@@ -788,6 +788,7 @@ def run_objective_scoring(
     artifact_dir: Path | None = None,
     existing_artifacts: Mapping[str, Any] | None = None,
     recorder: ComplianceExtractionRecorder | None = None,
+    bid_parse_fallback_used: bool = False,
 ) -> dict[str, Any]:
     """Execute only objectively computable tender score rules.
 
@@ -862,6 +863,8 @@ def run_objective_scoring(
             ),
             "total_score_computed": False,
             "llm_total_calls": 0,
+            "bid_parse_reused": not bid_parse_fallback_used,
+            "bid_parse_fallback_used": bid_parse_fallback_used,
             "duplicate_parse": False,
             "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
         },

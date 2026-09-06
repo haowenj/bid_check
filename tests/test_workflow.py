@@ -327,3 +327,42 @@ def test_evaluation_workflow_extracts_tender_only_and_skips_bid_parse(
     assert calls == [("evaluate", "招标文件.docx")]
     assert completed.bid_parse_status == "complete"
     assert completed.review_status == "complete"
+
+
+def test_evaluation_workflow_runs_objective_scoring_after_rule_extraction(
+    task_repository, tmp_path
+):
+    calls = []
+    rules = evaluation_result()
+    scores = {"score_items": [], "stats": {"objective_item_count": 0}}
+
+    def evaluate(tender_file, recorder=None):
+        calls.append(("evaluate", tender_file.filename))
+        return rules
+
+    def score(tender_file, bid_file, evaluation_rules, recorder=None):
+        calls.append(("score", tender_file.filename, bid_file.filename))
+        assert evaluation_rules is rules
+        return scores
+
+    services = BidCheckServices(
+        extract=lambda _: empty_objects(),
+        parse=lambda _: {"status": "unused"},
+        review=lambda *_: {"status": "unused"},
+        extract_evaluation_with_recorder=evaluate,
+        score_objective_with_recorder=score,
+    )
+    task = create_evaluation_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    completed = task_repository.get(task.task_id)
+    assert completed is not None
+    assert completed.result["objective_scores"] == scores
+    assert calls == [
+        ("evaluate", "招标文件.docx"),
+        ("score", "招标文件.docx", "投标文件.docx"),
+    ]
