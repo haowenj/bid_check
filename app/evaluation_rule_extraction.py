@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,11 @@ logger = logging.getLogger(__name__)
 EVALUATION_RULE_SCHEMA_VERSION = "evaluation-rules-v1"
 EVALUATION_RULE_PROMPT_VERSION = "evaluation-rule-extraction-prompt-v1"
 EVALUATION_RULE_CACHE_VERSION = (
-    f"evaluation-rule-extraction-v8:{EVALUATION_RULE_PROMPT_VERSION}"
+    f"evaluation-rule-extraction-v9:{EVALUATION_RULE_PROMPT_VERSION}"
+)
+EVALUATION_LLM_MAX_CONCURRENCY = 5
+_EVALUATION_LLM_SEMAPHORE = threading.BoundedSemaphore(
+    EVALUATION_LLM_MAX_CONCURRENCY
 )
 
 _EVALUATION_TITLE_RE = re.compile(
@@ -104,6 +109,35 @@ class EvaluationCandidate:
     region_kind: Literal["scoring", "veto", "mixed"]
     table_block_ids: list[str]
     blocks: list[StructuredBlock] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _EvaluationBatchExecution:
+    normalized: dict[str, list[dict[str, Any]]]
+    llm_total_calls: int
+    llm_completed_calls: int
+    llm_failed_calls: int
+    llm_retries: int
+    llm_elapsed_ms: int
+    llm_call_elapsed_ms: list[int]
+    llm_prompt_tokens: int
+
+
+@dataclass
+class _EvaluationConcurrencyState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    inflight: int = 0
+    max_inflight: int = 0
+
+
+class _EvaluationBatchFailure(EvaluationRuleExtractionError):
+    def __init__(
+        self,
+        message: str,
+        execution: _EvaluationBatchExecution,
+    ) -> None:
+        super().__init__(message)
+        self.execution = execution
 
 
 class EvaluationRuleLLM(Protocol):
@@ -965,7 +999,15 @@ class OpenAICompatibleEvaluationRuleLLM:
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max(256, min(max_tokens, 8192))
         self._call_context = threading.local()
-        self.last_usage: dict[str, Any] | None = None
+        self._last_usage = threading.local()
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return getattr(self._last_usage, "value", None)
+
+    @last_usage.setter
+    def last_usage(self, value: dict[str, Any] | None) -> None:
+        self._last_usage.value = value
 
     def set_call_context(
         self,
@@ -1270,6 +1312,130 @@ def _is_transient_evaluation_error(error: EvaluationRuleExtractionError) -> bool
     )
 
 
+def _run_evaluation_batch(
+    *,
+    batch_index: int,
+    batch_count: int,
+    batch: Sequence[EvaluationCandidate],
+    active_llm: EvaluationRuleLLM,
+    active_recorder: ComplianceExtractionRecorder | None,
+    max_retries: int,
+    concurrency_state: _EvaluationConcurrencyState,
+) -> _EvaluationBatchExecution:
+    total_calls = 0
+    completed_calls = 0
+    failed_calls = 0
+    retries = 0
+    elapsed_ms_total = 0
+    call_elapsed_ms: list[int] = []
+    prompt_tokens = 0
+
+    for attempt in range(1, max_retries + 2):
+        call_id = (
+            active_recorder.start_llm_call(
+                batch_index=batch_index,
+                batch_count=batch_count,
+                attempt=attempt,
+                model=getattr(active_llm, "model", type(active_llm).__name__),
+                batch=[_serialize_candidate(candidate) for candidate in batch],
+            )
+            if active_recorder is not None
+            else None
+        )
+        total_calls += 1
+        if isinstance(active_llm, OpenAICompatibleEvaluationRuleLLM):
+            active_llm.set_call_context(
+                recorder=active_recorder,
+                call_id=call_id,
+            )
+        attempt_started_at = time.perf_counter()
+        semaphore_acquired = False
+        try:
+            _EVALUATION_LLM_SEMAPHORE.acquire()
+            semaphore_acquired = True
+            with concurrency_state.lock:
+                concurrency_state.inflight += 1
+                concurrency_state.max_inflight = max(
+                    concurrency_state.max_inflight,
+                    concurrency_state.inflight,
+                )
+            try:
+                raw_output = active_llm.extract(batch)
+            finally:
+                with concurrency_state.lock:
+                    concurrency_state.inflight -= 1
+                _EVALUATION_LLM_SEMAPHORE.release()
+                semaphore_acquired = False
+
+            output = _coerce_evaluation_output(raw_output)
+            normalized = _normalize_evaluation_sources(output, batch)
+            elapsed_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+            elapsed_ms_total += elapsed_ms
+            call_elapsed_ms.append(elapsed_ms)
+            completed_calls += 1
+            usage = getattr(active_llm, "last_usage", None)
+            if isinstance(usage, dict) and isinstance(usage.get("prompt_tokens"), int):
+                prompt_tokens += usage["prompt_tokens"]
+            if active_recorder is not None and call_id is not None:
+                active_recorder.complete_llm_call(
+                    call_id,
+                    parsed_objects=output,
+                    schema_valid=True,
+                    elapsed_ms=elapsed_ms,
+                )
+            return _EvaluationBatchExecution(
+                normalized=normalized,
+                llm_total_calls=total_calls,
+                llm_completed_calls=completed_calls,
+                llm_failed_calls=failed_calls,
+                llm_retries=retries,
+                llm_elapsed_ms=elapsed_ms_total,
+                llm_call_elapsed_ms=call_elapsed_ms,
+                llm_prompt_tokens=prompt_tokens,
+            )
+        except Exception as exc:
+            if semaphore_acquired:
+                with concurrency_state.lock:
+                    concurrency_state.inflight -= 1
+                _EVALUATION_LLM_SEMAPHORE.release()
+                semaphore_acquired = False
+            elapsed_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+            elapsed_ms_total += elapsed_ms
+            call_elapsed_ms.append(elapsed_ms)
+            failed_calls += 1
+            if active_recorder is not None and call_id is not None:
+                active_recorder.fail_llm_call(
+                    call_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    elapsed_ms=elapsed_ms,
+                )
+            error = (
+                exc
+                if isinstance(exc, EvaluationRuleExtractionError)
+                else EvaluationRuleExtractionError(str(exc))
+            )
+            if attempt <= max_retries and _is_transient_evaluation_error(error):
+                retries += 1
+                continue
+            raise _EvaluationBatchFailure(
+                f"评标规则第{batch_index}/{batch_count}批提取失败：{error}",
+                _EvaluationBatchExecution(
+                    normalized=_empty_llm_output(),
+                    llm_total_calls=total_calls,
+                    llm_completed_calls=completed_calls,
+                    llm_failed_calls=failed_calls,
+                    llm_retries=retries,
+                    llm_elapsed_ms=elapsed_ms_total,
+                    llm_call_elapsed_ms=call_elapsed_ms,
+                    llm_prompt_tokens=prompt_tokens,
+                ),
+            ) from error
+    raise EvaluationRuleExtractionError(
+        f"评标规则第{batch_index}/{batch_count}批提取未完成。"
+    )
+
+
 def _evaluation_stats(
     result: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -1377,6 +1543,10 @@ def extract_tender_evaluation_rules(
         "llm_elapsed_ms": 0,
         "llm_call_elapsed_ms": [],
         "llm_prompt_tokens": 0,
+        "llm_concurrency_limit": EVALUATION_LLM_MAX_CONCURRENCY,
+        "llm_worker_count": 0,
+        "llm_max_concurrency": 0,
+        "llm_wall_clock_ms": 0,
         "filtered_count": 0,
         "uncertain_rule_count": 0,
         "score_category_count": 0,
@@ -1550,74 +1720,78 @@ def extract_tender_evaluation_rules(
             output = _coerce_evaluation_output(raw_output)
             normalized_batches.append(_normalize_evaluation_sources(output, candidates))
         else:
-            for batch_index, batch in enumerate(raw_batches, start=1):
-                succeeded = False
-                for attempt in range(1, max_retries + 2):
-                    call_id = (
-                        active_recorder.start_llm_call(
-                            batch_index=batch_index,
-                            batch_count=len(raw_batches),
-                            attempt=attempt,
-                            model=getattr(active_llm, "model", type(active_llm).__name__),
-                            batch=[_serialize_candidate(candidate) for candidate in batch],
-                        )
-                        if active_recorder is not None
-                        else None
+            batch_count = len(raw_batches)
+            stats["llm_worker_count"] = min(
+                EVALUATION_LLM_MAX_CONCURRENCY,
+                batch_count,
+            )
+            concurrency_state = _EvaluationConcurrencyState()
+            llm_wall_started_at = time.perf_counter()
+            event(
+                "evaluation.llm.parallel.start",
+                batch_count=batch_count,
+                worker_count=stats["llm_worker_count"],
+                concurrency_limit=EVALUATION_LLM_MAX_CONCURRENCY,
+            )
+            batch_futures = {}
+            batch_executions: dict[int, _EvaluationBatchExecution] = {}
+            batch_errors: dict[int, Exception] = {}
+            with ThreadPoolExecutor(
+                max_workers=stats["llm_worker_count"],
+                thread_name_prefix="evaluation-llm",
+            ) as executor:
+                for batch_index, batch in enumerate(raw_batches, start=1):
+                    batch_futures[batch_index] = executor.submit(
+                        _run_evaluation_batch,
+                        batch_index=batch_index,
+                        batch_count=batch_count,
+                        batch=batch,
+                        active_llm=active_llm,
+                        active_recorder=active_recorder,
+                        max_retries=max_retries,
+                        concurrency_state=concurrency_state,
                     )
-                    stats["llm_total_calls"] += 1
-                    if isinstance(active_llm, OpenAICompatibleEvaluationRuleLLM):
-                        active_llm.set_call_context(
-                            recorder=active_recorder,
-                            call_id=call_id,
-                        )
-                    call_started_at = time.perf_counter()
+                for batch_index in sorted(batch_futures):
                     try:
-                        raw_output = active_llm.extract(batch)
-                        output = _coerce_evaluation_output(raw_output)
-                        normalized_batches.append(
-                            _normalize_evaluation_sources(output, batch)
-                        )
-                        elapsed_ms = int((time.perf_counter() - call_started_at) * 1000)
-                        stats["llm_elapsed_ms"] += elapsed_ms
-                        stats["llm_call_elapsed_ms"].append(elapsed_ms)
-                        stats["llm_completed_calls"] += 1
-                        usage = getattr(active_llm, "last_usage", None)
-                        if isinstance(usage, dict) and isinstance(
-                            usage.get("prompt_tokens"), int
-                        ):
-                            stats["llm_prompt_tokens"] += usage["prompt_tokens"]
-                        if active_recorder is not None and call_id is not None:
-                            active_recorder.complete_llm_call(
-                                call_id,
-                                parsed_objects=output,
-                                schema_valid=True,
-                                elapsed_ms=elapsed_ms,
-                            )
-                        succeeded = True
-                        break
+                        batch_executions[batch_index] = batch_futures[
+                            batch_index
+                        ].result()
                     except Exception as exc:
-                        elapsed_ms = int((time.perf_counter() - call_started_at) * 1000)
-                        stats["llm_elapsed_ms"] += elapsed_ms
-                        stats["llm_call_elapsed_ms"].append(elapsed_ms)
-                        stats["llm_failed_calls"] += 1
-                        if active_recorder is not None and call_id is not None:
-                            active_recorder.fail_llm_call(
-                                call_id,
-                                error_type=type(exc).__name__,
-                                error_message=str(exc),
-                                elapsed_ms=elapsed_ms,
-                            )
-                        error = (
-                            exc
-                            if isinstance(exc, EvaluationRuleExtractionError)
-                            else EvaluationRuleExtractionError(str(exc))
-                        )
-                        if attempt <= max_retries and _is_transient_evaluation_error(error):
-                            stats["llm_retries"] += 1
-                            continue
-                        raise error
-                if not succeeded:
-                    raise EvaluationRuleExtractionError("LLM 评标规则提取未完成。")
+                        batch_errors[batch_index] = exc
+
+            stats["llm_wall_clock_ms"] = int(
+                (time.perf_counter() - llm_wall_started_at) * 1000
+            )
+            stats["llm_max_concurrency"] = concurrency_state.max_inflight
+            event(
+                "evaluation.llm.parallel.end",
+                batch_count=batch_count,
+                worker_count=stats["llm_worker_count"],
+                concurrency_limit=EVALUATION_LLM_MAX_CONCURRENCY,
+                max_concurrency=stats["llm_max_concurrency"],
+                wall_clock_ms=stats["llm_wall_clock_ms"],
+                failed_batches=sorted(batch_errors),
+            )
+
+            for batch_index in sorted(batch_futures):
+                execution = batch_executions.get(batch_index)
+                if execution is None:
+                    error = batch_errors[batch_index]
+                    execution = getattr(error, "execution", None)
+                if execution is None:
+                    continue
+                stats["llm_total_calls"] += execution.llm_total_calls
+                stats["llm_completed_calls"] += execution.llm_completed_calls
+                stats["llm_failed_calls"] += execution.llm_failed_calls
+                stats["llm_retries"] += execution.llm_retries
+                stats["llm_elapsed_ms"] += execution.llm_elapsed_ms
+                stats["llm_call_elapsed_ms"].extend(execution.llm_call_elapsed_ms)
+                stats["llm_prompt_tokens"] += execution.llm_prompt_tokens
+                if batch_index in batch_executions:
+                    normalized_batches.append(execution.normalized)
+
+            if batch_errors:
+                raise batch_errors[min(batch_errors)]
 
         merged = _merge_normalized_outputs(normalized_batches)
         _append_unrepresented_veto_signals(merged, candidates)

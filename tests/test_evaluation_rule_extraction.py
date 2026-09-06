@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -710,6 +713,186 @@ class _StructuredEvaluationLLM:
             ],
             "uncertain_rules": [],
         }
+
+
+class _ParallelEvaluationParser:
+    def __init__(self, candidate_count=6):
+        self.candidate_count = candidate_count
+
+    def parse(self, path):
+        del path
+        blocks = []
+        for index in range(1, self.candidate_count + 1):
+            order = index * 2 - 1
+            blocks.extend(
+                [
+                    _block(
+                        f"h{index}",
+                        "heading",
+                        f"第{index}章 评标办法",
+                        f"第{index}章 评标办法",
+                        order,
+                        1,
+                    ),
+                    _block(
+                        f"r{index}",
+                        "paragraph",
+                        f"评分规则{index}",
+                        f"第{index}章 评标办法",
+                        order + 1,
+                    ),
+                ]
+            )
+        return blocks
+
+
+class _ParallelEvaluationLLM:
+    model = "parallel-test-model"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def extract(self, candidates):
+        assert len(candidates) == 1
+        index = int(candidates[0].block_ids[1][1:])
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            # Reverse completion order so the test proves result ordering is
+            # based on batch index, not on which request returns first.
+            time.sleep((7 - index) * 0.01)
+            return {
+                "score_categories": [],
+                "score_items": [],
+                "veto_rules": [],
+                "uncertain_rules": [
+                    {
+                        "rule_type": "test",
+                        "description": f"规则{index}",
+                        "original_rule": f"评分规则{index}",
+                        "uncertainty_reason": "test",
+                        "source_block_ids": [f"r{index}"],
+                    }
+                ],
+            }
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+class _BatchSpecificFailingEvaluationLLM:
+    model = "batch-failing-model"
+
+    def extract(self, candidates):
+        assert len(candidates) == 1
+        index = int(candidates[0].block_ids[1][1:])
+        if index == 2:
+            raise RuntimeError("simulated batch 2 failure")
+        return {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [],
+            "uncertain_rules": [],
+        }
+
+
+def test_evaluation_batches_run_concurrently_with_global_cap_and_stable_order(
+    tmp_path,
+):
+    from app.evaluation_rule_extraction import extract_tender_evaluation_rules
+
+    task_dir = tmp_path / "task-parallel"
+    task_dir.mkdir()
+    tender = task_dir / "tender.docx"
+    tender.write_bytes(b"tender")
+    recorder = ComplianceExtractionRecorder(task_dir)
+    llm = _ParallelEvaluationLLM()
+
+    result = extract_tender_evaluation_rules(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=_ParallelEvaluationParser(candidate_count=6),
+        llm=llm,
+        recorder=recorder,
+        max_batches=6,
+        max_batch_chars=1,
+        max_retries=0,
+    )
+
+    assert llm.max_active == 5
+    assert result["stats"]["llm_concurrency_limit"] == 5
+    assert result["stats"]["llm_worker_count"] == 5
+    assert result["stats"]["llm_max_concurrency"] == 5
+    assert [item["original_rule"] for item in result["uncertain_rules"]] == [
+        f"评分规则{index}" for index in range(1, 7)
+    ]
+    assert result["stats"]["llm_total_calls"] == 6
+    assert result["stats"]["llm_completed_calls"] == 6
+    assert result["stats"]["llm_wall_clock_ms"] > 0
+
+    outputs = sorted((task_dir / "compliance_extraction" / "llm").glob("*_output.json"))
+    assert len(outputs) == 6
+    output_payloads = [json.loads(path.read_text()) for path in outputs]
+    assert sorted(item["batch_index"] for item in output_payloads) == list(range(1, 7))
+    assert len({item["call_id"] for item in output_payloads}) == 6
+
+
+def test_evaluation_batch_failure_identifies_batch_and_keeps_call_stats(tmp_path):
+    from app.evaluation_rule_extraction import extract_tender_evaluation_rules
+
+    task_dir = tmp_path / "task-batch-failure"
+    task_dir.mkdir()
+    tender = task_dir / "tender.docx"
+    tender.write_bytes(b"tender")
+    recorder = ComplianceExtractionRecorder(task_dir)
+
+    with pytest.raises(Exception, match="第2/2批提取失败：simulated batch 2 failure"):
+        extract_tender_evaluation_rules(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=_ParallelEvaluationParser(candidate_count=2),
+            llm=_BatchSpecificFailingEvaluationLLM(),
+            recorder=recorder,
+            max_batches=2,
+            max_batch_chars=1,
+            max_retries=0,
+        )
+
+    summary = json.loads(
+        (task_dir / "compliance_extraction" / "summary.json").read_text()
+    )
+    assert summary["status"] == "failed"
+    assert summary["stats"]["llm_total_calls"] == 2
+    assert summary["stats"]["llm_completed_calls"] == 1
+    assert summary["stats"]["llm_failed_calls"] == 1
+
+
+def test_evaluation_request_semaphore_caps_concurrent_tasks_at_five(tmp_path):
+    from app.evaluation_rule_extraction import extract_tender_evaluation_rules
+
+    llm = _ParallelEvaluationLLM()
+
+    def run_task(index):
+        task_dir = tmp_path / f"task-{index}"
+        task_dir.mkdir()
+        tender = task_dir / "tender.docx"
+        tender.write_bytes(f"tender-{index}".encode())
+        return extract_tender_evaluation_rules(
+            FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+            parser=_ParallelEvaluationParser(candidate_count=4),
+            llm=llm,
+            recorder=ComplianceExtractionRecorder(task_dir),
+            max_batches=4,
+            max_batch_chars=1,
+            max_retries=0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run_task, range(2)))
+
+    assert len(results) == 2
+    assert llm.max_active == 5
 
 
 def test_evaluation_extractor_writes_independent_artifacts_and_stats(tmp_path):
