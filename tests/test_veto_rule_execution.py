@@ -16,6 +16,7 @@ def make_rule(
     trigger: str,
     *,
     original: str | None = None,
+    section: str = "初步评审",
 ) -> dict[str, Any]:
     source_text = original or trigger
     return {
@@ -27,7 +28,7 @@ def make_rule(
         "evidence_requirements": [],
         "original_rule": original or f"{trigger}，否决其投标。",
         "source": {
-            "section": "初步评审",
+            "section": section,
             "block_ids": ["tender-b1"],
             "source_text": source_text,
         },
@@ -76,6 +77,55 @@ def write_structured_document(path: Path, source_path: Path) -> None:
             "stats": {},
         },
     )
+
+
+def business_only_document() -> dict[str, Any]:
+    return {
+        "source": {},
+        "sections": [
+            {
+                "section_id": "s1",
+                "title": "商务投标文件",
+                "path": ["商务投标文件"],
+            }
+        ],
+        "blocks": [
+            {"block_id": "bid-b1", "text": "商务响应内容"},
+        ],
+        "tables": [],
+        "images": [],
+    }
+
+
+def document_with_text(text: str) -> dict[str, Any]:
+    return {
+        "source": {},
+        "sections": [
+            {
+                "section_id": "s1",
+                "title": "投标文件",
+                "path": ["投标文件"],
+            }
+        ],
+        "blocks": [{"block_id": "bid-b1", "text": text}],
+        "tables": [],
+        "images": [],
+    }
+
+
+def document_with_bid_image() -> dict[str, Any]:
+    document = document_with_text("营业执照扫描件")
+    document["blocks"] = [
+        {"block_id": "bid-b1", "text": "营业执照扫描件"},
+    ]
+    document["images"] = [
+        {
+            "image_id": "bid-img-1",
+            "block_id": "bid-b1",
+            "img_path": "/tmp/bid-img-1.png",
+        }
+    ]
+    return document
 
 
 def test_veto_execution_keeps_each_formal_rule_and_excludes_uncertain_rules(tmp_path):
@@ -167,3 +217,384 @@ def test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_js
     review = result["veto_rule_reviews"][0]
     assert review["tender_rule_source"]["block_ids"] == ["tender-b1"]
     assert "related_artifacts" in review
+
+
+def test_business_only_file_does_not_trigger_star_rule(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "★技术条款",
+                    "任一★技术条款不满足即否决",
+                )
+            ]
+        ),
+        bid_file(tmp_path, name="商务投标文件.docx"),
+        bid_document=business_only_document(),
+    )
+
+    assert result["veto_rule_reviews"][0]["status"] == "file_scope_missing"
+
+
+def test_low_price_requires_evaluation_process_and_is_not_auto_triggered(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "低于成本报价",
+                    "投标报价可能低于成本且不能合理说明的，否决投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        bid_document=document_with_text("投标报价为最低价"),
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] == "manual_review_required"
+    assert review["triggered"] is False
+
+
+def test_collusion_requires_other_bidder_data(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "串通投标",
+                    "投标文件异常一致的，否决投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+    )
+
+    assert result["veto_rule_reviews"][0]["status"] == "other_bidder_data_required"
+
+
+def test_external_supplier_record_requires_external_data(tmp_path):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "不良行为",
+                    "存在供应商不良行为记录的，否决投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+    )
+
+    assert result["veto_rule_reviews"][0]["status"] == "external_data_required"
+
+
+def test_inconsistent_performance_amount_is_not_fraud_veto(tmp_path):
+    artifacts = {
+        "10_performance_reviews.json": {
+            "performance_reviews": [
+                {
+                    "status": "fail",
+                    "checks_by_key": {
+                        "table_amount_consistency": {
+                            "status": "fail",
+                            "reason": "业绩表金额与合同金额不一致",
+                        }
+                    },
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "弄虚作假",
+                    "提供虚假业绩材料的，否决投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] in {"evidence_insufficient", "manual_review_required"}
+    assert review["triggered"] is False
+
+
+def test_rule_classifier_does_not_use_unrelated_neighbor_text_from_source_block(
+    tmp_path,
+):
+    rule = make_rule(
+        "veto_001",
+        "低于成本价的情况",
+        "投标人不能合理说明低于成本价的，否决投标",
+    )
+    rule["source"]["source_text"] = "★技术条款不满足的，均将被否决。"
+
+    result = run_veto_rule_execution(
+        make_rules(veto_rules=[rule]),
+        bid_file(tmp_path),
+    )
+
+    assert result["veto_rule_reviews"][0]["status"] == "manual_review_required"
+
+
+def test_generic_aggregate_with_fraud_word_is_not_treated_as_direct_fraud_finding(
+    tmp_path,
+):
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "否决投标情形（通用）",
+                    "投标人存在以下任一情形：投标人有串通投标、弄虚作假等违法行为",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] == "evidence_insufficient"
+    assert "汇总规则" in review["reason"]
+
+
+def test_non_substantive_threshold_counts_only_explicit_failures(tmp_path):
+    artifacts = {
+        "08_template_text_reviews.json": {
+            "template_text_reviews": [
+                {
+                    "status": "fail",
+                    "issues": [
+                        {
+                            "type": "non_substantive_deviation",
+                            "status": "fail",
+                            "reason": "非实质性条款第1项不满足",
+                        }
+                    ],
+                },
+                {
+                    "status": "uncertain",
+                    "issues": [
+                        {
+                            "type": "non_substantive_deviation",
+                            "status": "uncertain",
+                            "reason": "第2项待确认",
+                        }
+                    ],
+                },
+            ]
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "非实质性条款阈值",
+                    "非实质性条款超过10项不满足的，视为实质性不满足",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] != "triggered"
+    assert review["confirmed_facts"][0]["counted_failure_count"] == 1
+
+
+def test_non_substantive_threshold_triggers_only_after_complete_coverage(tmp_path):
+    artifacts = {
+        "08_template_text_reviews.json": {
+            "stats": {"coverage_complete": True},
+            "template_text_reviews": [
+                {
+                    "status": "fail",
+                    "issues": [
+                        {
+                            "type": "non_substantive_deviation",
+                            "status": "fail",
+                            "reason": "非实质性条款第1项不满足",
+                            "evidence_image_ids": ["bid-img-1"],
+                        },
+                        {
+                            "type": "non_substantive_deviation",
+                            "status": "fail",
+                            "reason": "非实质性条款第2项不满足",
+                            "evidence_image_ids": ["bid-img-1"],
+                        },
+                    ],
+                }
+            ],
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "非实质性条款阈值",
+                    "非实质性条款超过1项不满足的，视为实质性不满足",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] == "triggered"
+    assert review["confirmed_facts"][0]["coverage_complete"] is True
+    assert review["confirmed_facts"][0]["counted_failure_count"] == 2
+
+
+def test_matching_attachment_failure_triggers_with_auditable_evidence(tmp_path):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "semantic_match": {"status": "matched"},
+                    "status": "fail",
+                    "business_status": "fail",
+                    "execution_status": "completed",
+                    "image_ids": ["bid-img-1"],
+                    "requirements": [
+                        {
+                            "requirement": "投标文件须提供营业执照",
+                            "status": "fail",
+                            "reason": "未提供营业执照",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "营业执照缺失",
+                    "未提供营业执照的，否决其投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    review = result["veto_rule_reviews"][0]
+    assert review["status"] == "triggered"
+    assert review["triggered"] is True
+    assert review["bid_evidence"]["image_ids"] == ["bid-img-1"]
+    assert review["related_artifacts"] == ["09_attachment_reviews.json"]
+    assert review["confirmed_facts"]
+    assert review["tender_rule_source"]["block_ids"] == ["tender-b1"]
+
+
+def test_matching_attachment_pass_is_not_triggered_only_with_complete_evidence(tmp_path):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "semantic_match": {"status": "matched"},
+                    "status": "pass",
+                    "business_status": "pass",
+                    "execution_status": "completed",
+                    "requirements": [
+                        {
+                            "requirement": "投标文件须提供营业执照",
+                            "status": "pass",
+                            "reason": "已提供营业执照",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[
+                make_rule(
+                    "veto_001",
+                    "营业执照缺失",
+                    "未提供营业执照的，否决其投标",
+                )
+            ]
+        ),
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    assert result["veto_rule_reviews"][0]["status"] == "not_triggered"
+    assert result["veto_rule_reviews"][0]["triggered"] is False
+
+
+def test_preliminary_aggregate_links_to_a_triggered_child_without_duplicate_cause(
+    tmp_path,
+):
+    artifacts = {
+        "09_attachment_reviews.json": {
+            "attachment_reviews": [
+                {
+                    "semantic_match": {"status": "matched"},
+                    "status": "fail",
+                    "business_status": "fail",
+                    "execution_status": "completed",
+                    "requirements": [
+                        {
+                            "requirement": "投标文件须提供营业执照",
+                            "status": "fail",
+                            "reason": "未提供营业执照",
+                            "evidence_image_ids": ["bid-img-1"],
+                        }
+                    ],
+                }
+            ],
+            "stats": {},
+        }
+    }
+    rules = make_rules(
+        veto_rules=[
+            make_rule(
+                "veto_001",
+                "资格材料缺失",
+                "未提供营业执照的，否决其投标",
+                section="资格审查",
+            ),
+            make_rule(
+                "veto_002",
+                "初步评审不通过",
+                "初步评审中有一项不符合评审标准的，否决其投标",
+                section="初步评审",
+            ),
+        ]
+    )
+    result = run_veto_rule_execution(
+        rules,
+        bid_file(tmp_path),
+        bid_document=document_with_bid_image(),
+        existing_artifacts=artifacts,
+    )
+
+    child, parent = result["veto_rule_reviews"]
+    assert child["status"] == "triggered"
+    assert parent["status"] == "triggered"
+    assert parent["triggered_by"] == ["veto_001"]
+    assert child["parent_rule_ids"] == ["veto_002"]
