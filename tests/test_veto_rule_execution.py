@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.models import FileMetadata
 from app.veto_rule_execution import run_veto_rule_execution
 
@@ -130,3 +131,39 @@ def test_ordinary_fail_is_not_automatically_a_veto(tmp_path):
     review = result["veto_rule_reviews"][0]
     assert review["status"] != "triggered"
     assert "普通" in review["reason"] or "正式" in review["reason"]
+
+
+def test_veto_execution_reuses_hash_verified_artifacts_and_writes_independent_json(
+    tmp_path,
+):
+    bid = bid_file(tmp_path)
+    cleaning_dir = tmp_path / "bid_document_cleaning"
+    cleaning_dir.mkdir()
+    write_structured_document(
+        cleaning_dir / "structured_document.json",
+        Path(bid.storage_path),
+    )
+    write_json(
+        tmp_path / "compliance_extraction" / "09_attachment_reviews.json",
+        {"attachment_reviews": [], "stats": {}},
+    )
+    recorder = ComplianceExtractionRecorder(tmp_path)
+
+    result = run_veto_rule_execution(
+        make_rules(
+            veto_rules=[make_rule("veto_001", "材料缺失", "未提供营业执照")]
+        ),
+        bid,
+        recorder=recorder,
+    )
+
+    assert result["source"]["bid_document_hash_verified"] is True
+    assert "09_attachment_reviews.json" in result["source"]["reused_artifacts"]
+    assert result["source"]["evaluation_rules_artifact"] == "11_evaluation_rules.json"
+    assert result["stats"]["llm_total_calls"] == 0
+    assert (
+        tmp_path / "compliance_extraction" / "veto_rule_reviews.json"
+    ).is_file()
+    review = result["veto_rule_reviews"][0]
+    assert review["tender_rule_source"]["block_ids"] == ["tender-b1"]
+    assert "related_artifacts" in review
