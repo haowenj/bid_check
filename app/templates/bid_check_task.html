@@ -24,6 +24,29 @@
   {% else %}{{ status|default("待确认", true) }}{% endif %}
 {%- endmacro %}
 
+{% macro compliance_issue_type(issue_type) -%}
+  {% if issue_type == "missing_fill" %}未填写或占位残留
+  {% elif issue_type == "missing_content" %}固定内容缺失
+  {% elif issue_type == "substantive_change" %}实质性内容修改
+  {% elif issue_type == "other" %}其他文本问题
+  {% else %}{{ issue_type|default("其他文本问题", true) }}{% endif %}
+{%- endmacro %}
+
+{% macro render_compliance_issue(issue) -%}
+  <li>
+    <strong>{{ compliance_issue_type(issue.type) }}</strong>：{{ issue.reason|default("未记录问题原因。", true) }}
+    {% if issue.requirement or issue.actual %}
+      <details class="review-issue-details">
+        <summary>查看要求与实际</summary>
+        <div class="review-issue-details-content">
+          {% if issue.requirement %}<p><strong>要求：</strong>{{ issue.requirement }}</p>{% endif %}
+          {% if issue.actual %}<p><strong>实际：</strong>{{ issue.actual }}</p>{% endif %}
+        </div>
+      </details>
+    {% endif %}
+  </li>
+{%- endmacro %}
+
 {% macro render_evaluation_evidence(evidence) -%}
   {% if evidence %}
     <ul class="evaluation-evidence-list">
@@ -127,26 +150,21 @@
 
 {% macro render_evaluation_qualification_cases(cases) -%}
   {% if cases %}
-    <section class="evaluation-qualification-section" aria-labelledby="qualification-performance-heading">
+    <section class="evaluation-result-card evaluation-qualification-section" aria-labelledby="qualification-performance-heading">
       <div class="evaluation-qualification-heading">
-        <div><span class="section-number">QUALIFICATION</span><h3 id="qualification-performance-heading">资格业绩核验</h3></div>
+        <div><h3 id="qualification-performance-heading">资格业绩核验</h3></div>
         <span>{{ cases|length }} 项</span>
       </div>
       <p class="evaluation-qualification-note">以下合同在业绩情况表中被标记为资格要求业绩，先用于核验资格，不计入“类似案例”评分。</p>
       <div class="evaluation-qualification-list">
         {% for case in cases %}
-          <article class="evaluation-qualification-card">
+          <article class="evaluation-result-card evaluation-qualification-card">
             <div class="evaluation-result-card-heading">
               <div><strong>{% if case.case_number %}案例 {{ case.case_number }} · {% endif %}{{ case.project_name|default(case.subtitle|default("资格要求业绩", true), true) }}</strong><small>资格要求业绩</small></div>
               <span class="evaluation-result-status status-tone-{{ case.status_tone }}">{{ case.status_label }}</span>
             </div>
-            {% if case.fields %}
-              <dl class="evaluation-evidence-fields">
-                {% for field in case.fields %}<div><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>{% endfor %}
-              </dl>
-            {% endif %}
             {% if case.check_details %}
-              <div class="evaluation-qualification-issues">
+              <div class="evaluation-issue-summary">
                 <strong>影响资格判断的问题</strong>
                 <ul class="evaluation-check-detail-list">
                   {% for detail in case.check_details %}
@@ -161,12 +179,14 @@
             {% else %}
               <p class="evaluation-qualification-clear">当前未发现需要处理的资格业绩检查问题。</p>
             {% endif %}
-            <details class="evaluation-evidence-raw">
-              <summary>查看资格业绩证据</summary>
-              {% if case.source_artifact %}<small>产物文件：{{ case.source_artifact }}</small>{% endif %}
-              {% if case.meta %}<small>证据定位：{{ case.meta }}</small>{% endif %}
-              {% if case.raw_json %}<pre>{{ case.raw_json }}</pre>{% endif %}
-            </details>
+            {% if case.fields %}
+              <details class="evaluation-qualification-contract">
+                <summary>查看合同信息</summary>
+                <dl class="evaluation-evidence-fields">
+                  {% for field in case.fields %}<div><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>{% endfor %}
+                </dl>
+              </details>
+            {% endif %}
           </article>
         {% endfor %}
       </div>
@@ -243,7 +263,7 @@
 {% macro render_evaluation_workbench(evaluation_summary, result_summary, filename, summary_label="评分结果概览") -%}
   {{ render_evaluation_summary_card(result_summary, filename, summary_label) }}
   <section class="comparison-section evaluation-result-section" aria-labelledby="objective-results-heading">
-    <div class="section-heading result-section-heading"><div><span class="section-number">OBJECTIVE</span><h2 id="objective-results-heading">客观评分</h2></div><span class="requirement-count">{{ result_summary.objective_total }} 项</span></div>
+    <div class="section-heading result-section-heading"><div><h2 id="objective-results-heading">客观评分</h2></div><span class="requirement-count">{{ result_summary.objective_total }} 项</span></div>
     {{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}
     <div class="evaluation-result-list">{{ render_evaluation_objective_cards(evaluation_summary.objective_items) }}</div>
   </section>
@@ -375,7 +395,7 @@
         {% if review.issues %}
           <ul class="review-issue-list">
             {% for issue in review.issues %}
-              <li><strong>{{ issue.type }}</strong>：{{ issue.reason }}{% if issue.requirement or issue.actual %}<br><small>要求：{{ issue.requirement|default("未记录", true) }}；实际：{{ issue.actual|default("未记录", true) }}</small>{% endif %}</li>
+              {{ render_compliance_issue(issue) }}
             {% endfor %}
           </ul>
         {% endif %}
@@ -547,7 +567,7 @@
 
       <section class="comparison-section evaluation-result-section" aria-labelledby="objective-results-heading">
         <div class="section-heading result-section-heading">
-          <div><span class="section-number">OBJECTIVE</span><h2 id="objective-results-heading">客观评分</h2></div>
+          <div><h2 id="objective-results-heading">客观评分</h2></div>
           <span class="requirement-count">{{ result_summary.objective_total }} 项</span>
         </div>
         {{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}
@@ -899,7 +919,6 @@
     <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-template-issues-heading">
       <div class="section-heading result-section-heading">
         <div>
-          <span class="section-number">TEMPLATE COMPLIANCE</span>
           <h2 id="final-template-issues-heading">模板规范检查</h2>
         </div>
         <span class="requirement-count">{{ final_issue_counts.template }} 项问题</span>
@@ -937,7 +956,7 @@
                 {% if review.issues %}
                   <ul class="review-issue-list">
                     {% for issue in review.issues %}
-                      <li><strong>{{ issue.type }}</strong>：{{ issue.reason }}{% if issue.requirement or issue.actual %}<br><small>要求：{{ issue.requirement|default("未记录", true) }}；实际：{{ issue.actual|default("未记录", true) }}</small>{% endif %}</li>
+                      {{ render_compliance_issue(issue) }}
                     {% endfor %}
                   </ul>
                 {% endif %}
@@ -951,7 +970,6 @@
     <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-attachment-issues-heading">
       <div class="section-heading result-section-heading">
         <div>
-          <span class="section-number">ATTACHMENT COMPLIANCE</span>
           <h2 id="final-attachment-issues-heading">附件检查</h2>
         </div>
         <span class="requirement-count">{{ final_issue_counts.attachment }} 项问题</span>
@@ -994,7 +1012,6 @@
     <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-performance-issues-heading">
       <div class="section-heading result-section-heading">
         <div>
-          <span class="section-number">PERFORMANCE CONTRACT</span>
           <h2 id="final-performance-issues-heading">业绩合同检查</h2>
         </div>
         <span class="requirement-count">{{ final_issue_counts.performance }} 项问题</span>
@@ -1037,7 +1054,6 @@
     <section class="comparison-section review-results-section final-issues-section" aria-labelledby="final-file-requirement-heading">
       <div class="section-heading result-section-heading">
         <div>
-          <span class="section-number">UPLOADED FILE METADATA</span>
           <h2 id="final-file-requirement-heading">文件自身检查</h2>
         </div>
         <span class="requirement-count">{{ file_requirement_reviews|length }} 项要求</span>
@@ -1066,7 +1082,7 @@
         </aside>
         <main class="result-dashboard-main">
           <div class="result-dashboard-breadcrumb">标书检查 / {{ task.bid_file.filename }}</div>
-          <div class="result-dashboard-heading"><div><span class="section-number">FINAL REVIEW</span><h2>问题总览</h2><p>审阅重点集中在需要人工关注的结论。</p></div><span class="result-dashboard-state">需处理</span></div>
+          <div class="result-dashboard-heading"><div><h2>问题总览</h2><p>审阅重点集中在需要人工关注的结论。</p></div><span class="result-dashboard-state">需处理</span></div>
           <div class="result-dashboard-alert">优先复核业绩合同中的关键页证据，以及没有关联图片的附件材料。</div>
           <div class="result-dashboard-metrics">
             <div><span>模板规范</span><strong>{{ final_issue_counts.template }}</strong><small>未匹配或文本问题</small></div>
@@ -1086,7 +1102,7 @@
 
     <div class="result-style-view result-style-report" data-result-style-view="report" data-active="false">
       <div class="result-report-paper">
-        <header class="result-report-head"><div><span class="section-number">COMPLIANCE REVIEW REPORT</span><h2>标书合规性校验</h2></div><div class="result-report-file">最终结果<br>{{ task.bid_file.filename }}</div></header>
+        <header class="result-report-head"><div><h2>标书合规性校验</h2></div><div class="result-report-file">最终结果<br>{{ task.bid_file.filename }}</div></header>
         <section class="result-report-lede"><div><h3>需要处理的问题</h3><p>本页汇总未通过、待确认及无法自动检查的检查结论，并保留文件自身检查的所有要求明细。</p></div><div class="result-report-stats"><div><strong>{{ final_issue_counts.template }}</strong><span>模板规范</span></div><div><strong>{{ final_issue_counts.attachment }}</strong><span>附件材料</span></div><div><strong>{{ final_issue_counts.performance }}</strong><span>业绩合同</span></div><div><strong>{{ final_issue_counts.file }}</strong><span>文件自身</span></div></div></section>
         <div class="result-report-columns"><aside class="result-report-index"><h3>问题索引</h3><div><strong>模板规范</strong><span>{{ final_issue_counts.template }} 项</span></div><div><strong>附件材料</strong><span>{{ final_issue_counts.attachment }} 项</span></div><div><strong>业绩合同</strong><span>{{ final_issue_counts.performance }} 项</span></div><div><strong>文件自身</strong><span>{{ final_issue_counts.file }} 项</span></div><div><strong>优先复核</strong><span>原始文件元数据与招标原文</span></div></aside><main class="result-report-main"><section><div class="result-report-section-head"><h3>业绩合同</h3><span>{{ final_issue_counts.performance }} 项</span></div>{% if final_issue_counts.performance == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_performance_issues(performance_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>附件材料</h3><span>{{ final_issue_counts.attachment }} 项</span></div>{% if final_issue_counts.attachment == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_attachment_issues(attachment_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>模板规范</h3><span>{{ final_issue_counts.template }} 项</span></div>{% if final_issue_counts.template == 0 %}<div class="result-report-empty">未发现需处理的问题</div>{% else %}{{ render_template_issues(template_comparisons, text_reviews) }}{% endif %}</section><section><div class="result-report-section-head"><h3>文件自身</h3><span>{{ final_issue_counts.file }} 项</span></div>{{ render_file_requirement_reviews(file_requirement_reviews) }}</section></main></div>
         <footer class="result-report-foot">说明：证据图片仅用于定位原始材料，不代表页面重新判断了图片真实性。</footer>

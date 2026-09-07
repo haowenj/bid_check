@@ -151,6 +151,15 @@ def test_complete_page_renders_requirements_without_fake_verdict(
     assert "未发现需处理的附件问题" in response.text
     assert "未发现需处理的业绩合同问题" in response.text
     assert "最终检查结果" in response.text
+    for internal_label in (
+        "TEMPLATE COMPLIANCE",
+        "ATTACHMENT COMPLIANCE",
+        "PERFORMANCE CONTRACT",
+        "UPLOADED FILE METADATA",
+        "FINAL REVIEW",
+        "COMPLIANCE REVIEW REPORT",
+    ):
+        assert internal_label not in response.text
     assert "section_count" not in response.text
     assert "解析摘要" not in response.text
     assert "检查通过" not in response.text
@@ -462,7 +471,11 @@ def test_complete_evaluation_page_summarizes_independent_result_artifacts(
                         {
                             "case_number": "1",
                             "project_name": "示例业绩合同",
+                            "role": "qualification",
+                            "role_label": "资格要求业绩",
                             "overall_status": "fail",
+                            "final_user": "示例最终用户",
+                            "raw_only_marker": "资格业绩原始JSON不应展示",
                             "checks": {
                                 "signature_date": {
                                     "status": "fail",
@@ -607,6 +620,8 @@ def test_complete_evaluation_page_summarizes_independent_result_artifacts(
     assert response.status_code == 200
     assert "评标结果汇总" in response.text
     assert "客观评分" in response.text
+    assert "OBJECTIVE" not in response.text
+    assert "QUALIFICATION" not in response.text
     assert "1 项已确定 / 1 项待补充" in response.text
     assert "主观评分 / AI辅助评分" in response.text
     assert "1 项已评分 / 0 项缺少文件 / 1 项其他待补充" in response.text
@@ -617,6 +632,15 @@ def test_complete_evaluation_page_summarizes_independent_result_artifacts(
     assert "暂无法确定" in response.text
     assert "缺少可核验的合同原件。" in response.text
     assert "业绩核验结论" in response.text
+    assert "影响资格判断的问题" in response.text
+    assert "查看合同信息" in response.text
+    assert response.text.index("影响资格判断的问题") < response.text.index("查看合同信息")
+    assert '<section class="evaluation-result-card evaluation-qualification-section"' in response.text
+    assert '<article class="evaluation-result-card evaluation-qualification-card">' in response.text
+    assert '<div class="evaluation-issue-summary">' in response.text
+    assert '<details class="evaluation-qualification-contract">' in response.text
+    assert '<details class="evaluation-qualification-contract" open>' not in response.text
+    assert "查看资格业绩证据" not in response.text
     assert "影响评分的问题" in response.text
     assert "合同签署日期" in response.text
     assert "签署日期栏为空，无法确认合同签署日期。" in response.text
@@ -1481,6 +1505,12 @@ def test_complete_page_merges_template_match_and_text_review_statuses(
                                 "requirement": "保留固定正文。",
                                 "actual": "正文缺失。",
                                 "reason": "模板正文未保留。",
+                            },
+                            {
+                                "type": "missing_fill",
+                                "requirement": "清理模板占位提示。",
+                                "actual": "实际内容后仍有占位提示。",
+                                "reason": "填写内容后模板提示文字仍然残留。",
                             }
                         ],
                         "llm_elapsed_ms": 20,
@@ -1520,6 +1550,13 @@ def test_complete_page_merges_template_match_and_text_review_statuses(
     assert "对应关系待确认" in response.text
     assert "未匹配" in response.text
     assert "模板正文未保留。" in response.text
+    assert "固定内容缺失" in response.text
+    assert "未填写或占位残留" in response.text
+    assert "<strong>missing_content</strong>" not in response.text
+    assert "<strong>missing_fill</strong>" not in response.text
+    assert '<details class="review-issue-details">' in response.text
+    assert '<details class="review-issue-details" open>' not in response.text
+    assert "查看要求与实际" in response.text
     assert "模拟请求失败" in response.text
     assert "查看招标模板原文" not in response.text
     assert "查看投标模块内容" not in response.text

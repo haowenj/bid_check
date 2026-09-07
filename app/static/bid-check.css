@@ -361,6 +361,11 @@ h1 { margin-bottom: 5px; font-size: clamp(25px, 3vw, 32px); line-height: 1.25; }
 .review-results-table td small { display: block; margin-top: 4px; color: #8a98a9; overflow-wrap: anywhere; }
 .review-issue-list { margin: 9px 0 0; padding-left: 17px; color: #53677f; font-size: 12px; }
 .review-issue-list li + li { margin-top: 7px; }
+.review-issue-details { margin-top: 7px; }
+.review-issue-details > summary { color: #315b8c; cursor: pointer; font-size: 11px; font-weight: 700; }
+.review-issue-details-content { margin-top: 6px; padding: 8px 10px; border-left: 2px solid #dce5ee; color: #718197; font-size: 11px; }
+.review-issue-details-content p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.review-issue-details-content p + p { margin-top: 5px; }
 .final-result-summary { margin-top: 20px; }
 .final-result-summary .result-metrics { grid-template-columns: repeat(4, minmax(90px, 1fr)); }
 .final-issues-section { margin-top: 24px; }
@@ -607,18 +612,16 @@ h1 { margin-bottom: 5px; font-size: clamp(25px, 3vw, 32px); line-height: 1.25; }
 .evaluation-result-reason > p { margin: 5px 0 0; color: #53677f; white-space: pre-wrap; overflow-wrap: anywhere; }
 .evaluation-result-evidence { margin-top: 13px; padding-top: 11px; border-top: 1px solid #e5ebf2; }
 .evaluation-result-evidence > summary, .evaluation-subconditions > summary { color: #315b8c; cursor: pointer; font-size: 12px; font-weight: 750; }
-.evaluation-qualification-section { margin: 0 0 14px; padding: 15px; border: 1px solid #e7d2a8; border-radius: 12px; background: #fffaf0; }
+.evaluation-qualification-section { margin: 0 0 14px; }
 .evaluation-qualification-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
-.evaluation-qualification-heading > div > h3 { margin: 3px 0 0; color: #5c431b; font-size: 16px; }
-.evaluation-qualification-heading > span { color: #8a5a16; font-size: 11px; font-weight: 750; }
-.evaluation-qualification-note { margin: 8px 0 0; color: #806536; font-size: 12px; line-height: 1.55; }
+.evaluation-qualification-heading > div > h3 { margin: 0; color: #263b52; font-size: 16px; }
+.evaluation-qualification-heading > span { color: #718197; font-size: 11px; font-weight: 750; }
+.evaluation-qualification-note { margin: 8px 0 0; color: #718197; font-size: 12px; line-height: 1.55; }
 .evaluation-qualification-list { display: grid; gap: 10px; margin-top: 12px; }
-.evaluation-qualification-card { padding: 12px; border: 1px solid #ecdcbf; border-radius: 9px; background: #fff; }
-.evaluation-qualification-card .evaluation-result-card-heading > div > strong { display: block; color: #41546c; }
-.evaluation-qualification-card .evaluation-result-card-heading > div > small { display: block; margin-top: 4px; color: #8a5a16; font-size: 11px; font-weight: 700; }
-.evaluation-qualification-issues { margin-top: 11px; padding-top: 10px; border-top: 1px solid #f1e5d1; }
-.evaluation-qualification-issues > strong { color: #895b1a; font-size: 11px; }
 .evaluation-qualification-clear { margin: 10px 0 0; color: #53677f; font-size: 11px; }
+.evaluation-qualification-contract { margin-top: 11px; padding-top: 10px; border-top: 1px dashed #dce4ed; }
+.evaluation-qualification-contract > summary { color: #315b8c; cursor: pointer; font-size: 11px; font-weight: 750; }
+.evaluation-qualification-contract[open] > summary { margin-bottom: 9px; }
 .evaluation-evidence-list { display: grid; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
 .evaluation-evidence-list li { padding: 9px 11px; border-radius: 8px; background: #f4f7fa; }
 .evaluation-evidence-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
