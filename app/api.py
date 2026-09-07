@@ -44,6 +44,7 @@ from app.evaluation_rule_extraction import (
     OpenAICompatibleEvaluationRuleLLM,
     extract_tender_evaluation_rules,
 )
+from app.evaluation_summary import load_evaluation_summary
 from app.models import BidCheckTask, FileMetadata
 from app.objective_scoring import (
     load_reusable_bid_evidence,
@@ -347,17 +348,15 @@ def _load_evaluation_rules_for_page(task: BidCheckTask) -> dict[str, Any]:
     """Load the standalone evaluation artifact and add display-only relations."""
 
     result = task.result if isinstance(task.result, dict) else {}
-    rules = result.get("evaluation_rules")
-    if not isinstance(rules, dict):
-        artifact_path = (
-            Path(task.tender_file.storage_path).parent
-            / "compliance_extraction"
-            / "11_evaluation_rules.json"
-        )
-        try:
-            rules = json.loads(artifact_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            rules = {}
+    artifact_path = (
+        Path(task.tender_file.storage_path).parent
+        / "compliance_extraction"
+        / "11_evaluation_rules.json"
+    )
+    try:
+        rules = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        rules = result.get("evaluation_rules")
     if not isinstance(rules, dict):
         rules = {}
 
@@ -788,6 +787,7 @@ def create_app(
             context={
                 "task": task,
                 "evaluation_rules": _load_evaluation_rules_for_page(task),
+                "evaluation_summary": load_evaluation_summary(task),
                 "bid_document": bid_document,
                 "template_comparisons": template_comparisons,
                 "file_requirement_reviews": file_requirement_data["reviews"],

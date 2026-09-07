@@ -1,6 +1,13 @@
 import json
 from pathlib import Path
 
+from app.evaluation_summary import (
+    _facts_evidence_view,
+    _objective_item_view,
+    _qualification_performance_view,
+    _status_view,
+    _subjective_item_view,
+)
 from app.models import FileMetadata
 
 
@@ -125,7 +132,10 @@ def test_complete_page_renders_requirements_without_fake_verdict(
     response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
 
     assert response.status_code == 200
-    assert "标书合规性校验结果" in response.text
+    assert "标书校验结果" in response.text
+    assert "标书合规性校验结果" not in response.text
+    assert response.text.count('data-result-mode="compliance"') == 1
+    assert 'data-result-mode="evaluation"' not in response.text
     assert "以下按模板规范、附件、业绩合同和文件自身四个检查范围展示合规性结果。" in response.text
     assert "模板规范检查" in response.text
     assert "附件检查" in response.text
@@ -138,6 +148,88 @@ def test_complete_page_renders_requirements_without_fake_verdict(
     assert "解析摘要" not in response.text
     assert "检查通过" not in response.text
     assert "检查不通过" not in response.text
+
+
+def test_complete_compliance_page_renders_merged_evaluation_results(
+    client,
+    repository,
+    stored_task,
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.complete(
+        stored_task.task_id,
+        {
+            "templates": [],
+            "project_requirements": [],
+            "supplemental_materials": [],
+            "bid_parse": {"status": "success"},
+            "review_result": {"mode": "template_text", "template_text_reviews": []},
+        },
+    )
+    artifact_dir = Path(stored_task.tender_file.storage_path).parent / "compliance_extraction"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {
+        "11_evaluation_rules.json": {
+            "score_categories": [],
+            "score_items": [
+                {
+                    "id": "score_item_001",
+                    "name": "投标文件编写质量",
+                    "full_score": 5,
+                    "evaluation_type": "subjective",
+                }
+            ],
+            "veto_rules": [],
+            "uncertain_rules": [],
+            "source_sections": [],
+        },
+        "objective_scores.json": {"score_items": []},
+        "subjective_scores.json": {
+            "score_items": [
+                {
+                    "score_item_id": "score_item_001",
+                    "rule_name": "投标文件编写质量",
+                    "max_score": 5,
+                    "status": "evidence_insufficient",
+                    "recommended_score": None,
+                    "score_band": None,
+                    "reason": "五类扣分项证据覆盖不足。",
+                    "evidence": [],
+                    "matched_bid_content": [],
+                }
+            ]
+        },
+        "veto_rule_reviews.json": {"veto_rule_reviews": []},
+    }
+    for filename, payload in artifacts.items():
+        (artifact_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+    response = client.get(f"/bid-check/tasks/{stored_task.task_id}")
+
+    assert response.status_code == 200
+    assert "标书校验结果" in response.text
+    assert "标书合规性校验结果" not in response.text
+    assert 'data-result-mode="compliance"' in response.text
+    assert 'data-result-mode="evaluation"' in response.text
+    assert 'data-result-mode-view="compliance"' in response.text
+    assert 'data-result-mode-view="evaluation"' in response.text
+    assert 'data-result-mode-view="compliance" data-active="true"' in response.text
+    assert 'data-result-mode-view="evaluation" data-active="false"' in response.text
+    assert response.text.count('data-result-style-view="workbench"') >= 2
+    assert response.text.count('data-result-style-view="dashboard"') >= 2
+    assert response.text.count('data-result-style-view="report"') >= 2
+    assert 'evaluation-result-style-workbench' in response.text
+    assert 'evaluation-result-style-dashboard' in response.text
+    assert 'evaluation-result-style-report' in response.text
+    assert "评标结果汇总" in response.text
+    assert "评分结果概览" in response.text
+    assert "独立评标产出物" not in response.text
+    assert "主观评分 / AI辅助评分" in response.text
+    assert "投标文件编写质量" in response.text
+    assert "五类扣分项证据覆盖不足。" in response.text
 
 
 def test_complete_evaluation_page_renders_rule_artifact_with_provenance(
@@ -278,6 +370,829 @@ def test_complete_evaluation_page_renders_rule_artifact_with_provenance(
     assert "实际评分" not in response.text
     assert "最终得分" not in response.text
     assert "最终排名" not in response.text
+    assert "comparison-status-fail" not in response.text
+
+
+def test_complete_evaluation_page_summarizes_independent_result_artifacts(
+    client,
+    settings,
+    repository,
+):
+    task_dir = settings.tasks_dir / "evaluation-summary-task"
+    artifact_dir = task_dir / "compliance_extraction"
+    artifact_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    repository.create(
+        "evaluation-summary-task",
+        FileMetadata("汇总测试招标文件.docx", 6, str(tender_path)),
+        FileMetadata("汇总测试投标文件.docx", 3, str(bid_path)),
+        "evaluation",
+    )
+    repository.update_stage("evaluation-summary-task", "requirements", "complete")
+    repository.update_stage("evaluation-summary-task", "bid_parse", "complete")
+    repository.update_stage("evaluation-summary-task", "review", "complete")
+    repository.complete("evaluation-summary-task", {})
+
+    rules = {
+        "score_categories": [],
+        "score_items": [
+            {
+                "id": "objective_pending",
+                "name": "待补充客观项",
+                "full_score": 5,
+                "evaluation_type": "objective",
+            },
+            {
+                "id": "objective_scored",
+                "name": "已确定客观项",
+                "full_score": 3,
+                "evaluation_type": "objective",
+            },
+            {
+                "id": "score_item_001",
+                "name": "投标文件编写质量",
+                "full_score": 5,
+                "evaluation_type": "subjective",
+            },
+            {
+                "id": "subjective_scored",
+                "name": "技术方案完整性",
+                "full_score": 5,
+                "evaluation_type": "subjective",
+            },
+        ],
+        "veto_rules": [
+            {
+                "id": "veto_not_applicable",
+                "name": "项目不适用规则",
+                "trigger_condition": "未递交投标保证金。",
+                "consequence": "否决投标。",
+                "original_rule": "未递交投标保证金的，否决投标。",
+                "evidence_requirements": [],
+                "source": {},
+            }
+        ],
+        "uncertain_rules": [],
+        "source_sections": [],
+    }
+    objective_scores = {
+        "score_items": [
+            {
+                "id": "objective_pending",
+                "name": "待补充客观项",
+                "full_score": 5,
+                "status": "evidence_insufficient",
+                "score": 2,
+                "reason": "缺少可核验的合同原件。",
+                "evidence": [],
+                "facts": {
+                    "performance_summary": "uncertain",
+                    "matched_terms": ["合同关键页"],
+                    "performance_cases": [
+                        {
+                            "case_number": "1",
+                            "project_name": "示例业绩合同",
+                            "overall_status": "fail",
+                            "checks": {
+                                "signature_date": {
+                                    "status": "fail",
+                                    "reason": "签署日期栏为空，无法确认合同签署日期。",
+                                    "evidence": [
+                                        {
+                                            "image_id": "i0021",
+                                            "block_id": "b0376",
+                                        }
+                                    ],
+                                },
+                            },
+                        }
+                    ],
+                },
+                "related_artifacts": ["10_performance_reviews.json"],
+            },
+            {
+                "id": "objective_scored",
+                "name": "已确定客观项",
+                "full_score": 3,
+                "status": "auto_scored",
+                "score": 3,
+                "reason": "已满足评分条件。",
+                "evidence": [],
+            },
+        ]
+    }
+    subjective_scores = {
+        "score_items": [
+            {
+                "score_item_id": "score_item_001",
+                "rule_name": "投标文件编写质量",
+                "max_score": 5,
+                "status": "evidence_insufficient",
+                "recommended_score": None,
+                "score_band": None,
+                "reason": "其余扣分项证据不足，最终分数无法确定。",
+                "evidence": [],
+                "matched_bid_content": [],
+                "deduction_checks": [
+                    {
+                        "deduction_item": "文件内容错误",
+                        "status": "confirmed_present",
+                        "confirmed_exists": True,
+                        "reason": "模板检查已确认存在残留占位文字。",
+                        "evidence": [
+                            {
+                                "artifact": "08_template_text_reviews.json",
+                                "quote": "致：【招标人名称】",
+                                "block_ids": ["b0030"],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "score_item_id": "subjective_scored",
+                "rule_name": "技术方案完整性",
+                "max_score": 5,
+                "status": "ai_scored",
+                "recommended_score": 4,
+                "score_band": "良好",
+                "reason": "方案结构完整。",
+                "evidence": [
+                    {"quote": "技术方案包含实施计划。", "block_ids": ["b0100"]}
+                ],
+                "matched_bid_content": [],
+            },
+        ]
+    }
+    veto_reviews = {
+        "veto_rule_reviews": [
+            {
+                "id": "veto_triggered",
+                "name": "明确触发规则",
+                "status": "triggered",
+                "triggered": True,
+                "reason": "已发现明确触发事实。",
+                "evidence": [{"quote": "明确不响应实质性条款。"}],
+                "dependencies": {},
+            },
+            {
+                "id": "veto_not_triggered",
+                "name": "明确未触发规则",
+                "status": "not_triggered",
+                "triggered": False,
+                "reason": "证据确认未触发。",
+                "evidence": [],
+                "dependencies": {},
+            },
+            {
+                "id": "veto_not_applicable",
+                "name": "项目不适用规则",
+                "status": "not_applicable",
+                "triggered": False,
+                "reason": "本项目不要求投标保证金。",
+                "evidence": [],
+                "dependencies": {},
+            },
+            {
+                "id": "veto_009",
+                "name": "否决投标情形（通用）",
+                "status": "evidence_insufficient",
+                "triggered": False,
+                "reason": "16 个子条件仍有未完成判断的条件。",
+                "evidence": [],
+                "dependencies": {
+                    "external_data_required": True,
+                    "other_bidder_data_required": True,
+                    "manual_review_required": True,
+                },
+                "sub_conditions": [
+                    {
+                        "id": f"veto_009_{index:02d}",
+                        "index": index,
+                        "name": f"第 {index} 个子条件",
+                        "status": "file_scope_missing" if index == 1 else "not_applicable",
+                        "triggered": False,
+                        "reason": "文件范围不足" if index == 1 else "本项目不适用",
+                        "evidence": [],
+                        "dependencies": {},
+                    }
+                    for index in range(1, 17)
+                ],
+            },
+        ]
+    }
+    for filename, payload in (
+        ("11_evaluation_rules.json", rules),
+        ("objective_scores.json", objective_scores),
+        ("subjective_scores.json", subjective_scores),
+        ("veto_rule_reviews.json", veto_reviews),
+    ):
+        (artifact_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    response = client.get("/bid-check/tasks/evaluation-summary-task")
+
+    assert response.status_code == 200
+    assert "评标结果汇总" in response.text
+    assert "客观评分" in response.text
+    assert "1 项已确定 / 1 项待补充" in response.text
+    assert "主观评分 / AI辅助评分" in response.text
+    assert "1 项已评分 / 0 项缺少文件 / 1 项其他待补充" in response.text
+    assert "否决规则" in response.text
+    assert "存在 1 项明确触发" in response.text
+    assert "暂不具备计算完整评标总分的条件" in response.text
+    assert "待补充客观项" in response.text
+    assert "暂无法确定" in response.text
+    assert "缺少可核验的合同原件。" in response.text
+    assert "业绩核验结论" in response.text
+    assert "影响评分的问题" in response.text
+    assert "合同签署日期" in response.text
+    assert "签署日期栏为空，无法确认合同签署日期。" in response.text
+    assert "查看检查问题（1项）" in response.text
+    assert "合同签署日期" in response.text
+    assert "签署日期栏为空，无法确认合同签署日期。" in response.text
+    assert "证据图片：i0021；block：b0376" in response.text
+    assert "performance_summary" in response.text
+    raw_fact_index = response.text.index("performance_summary")
+    raw_details_start = response.text.rfind(
+        '<details class="evaluation-evidence-raw">', 0, raw_fact_index
+    )
+    assert raw_details_start >= 0
+    assert response.text.find("</details>", raw_fact_index) > raw_fact_index
+    assert "合同关键页" in response.text
+    assert "10_performance_reviews.json" in response.text
+    assert "投标文件编写质量" in response.text
+    assert "AI辅助评分" in response.text
+    assert "已确认扣分事实" in response.text
+    assert "文件内容错误" in response.text
+    assert "致：【招标人名称】" in response.text
+    assert "项目不适用规则" in response.text
+    assert "不适用" in response.text
+    assert '<small>file_scope_missing</small>' not in response.text
+    assert '<small>evidence_insufficient</small>' not in response.text
+    assert "证据不足" in response.text
+    assert 'data-result-mode="evaluation"' in response.text
+    assert 'data-result-mode="compliance"' not in response.text
+    assert 'data-result-style-switcher' in response.text
+    assert response.text.count('data-result-style-view="workbench"') >= 1
+    assert response.text.count('data-result-style-view="dashboard"') >= 1
+    assert response.text.count('data-result-style-view="report"') >= 1
+    assert 'data-veto-status="triggered"' in response.text
+    assert response.text.count('data-veto-status="triggered"') == 3
+    assert "comparison-status-fail" not in response.text
+    assert 'data-veto-rule-id="veto_009"' in response.text
+    assert response.text.count('data-veto-subcondition="veto_009_') == 48
+
+
+def test_evaluation_performance_facts_are_presented_as_business_evidence():
+    views = _facts_evidence_view(
+        {
+            "performance_cases": [
+                {
+                    "case_number": "1",
+                    "project_name": "信达旺大厦云平台运营及维护服务",
+                    "role_label": "资格要求业绩",
+                    "overall_status": "fail",
+                    "table_row": {
+                        "最终用户": "广东双能低碳智慧城市运营管理有限公司",
+                        "销售金额（万元）": "96",
+                        "证明文件所在页码": "38~50",
+                    },
+                    "contract_amount_facts": [
+                        {"value": "960000.00元", "image_id": "i0011"}
+                    ],
+                    "implementation_time_facts": [
+                        {
+                            "value": "2025年1月19日至2026年1月19日",
+                            "image_id": "i0012",
+                        }
+                    ],
+                    "source_blocks": ["b0355", "b0366"],
+                }
+            ]
+        },
+        source_artifact="10_performance_reviews.json",
+    )
+
+    assert len(views) == 1
+    view = views[0]
+    assert view["title"] == "业绩合同检查结果"
+    assert view["subtitle"] == "案例 1"
+    fields = {field["label"]: field["value"] for field in view["fields"]}
+    assert fields["项目名称"] == "信达旺大厦云平台运营及维护服务"
+    assert fields["检查状态"] == "未通过"
+    assert fields["合同金额"] == "960000.00元"
+    assert fields["服务期限"] == "2025年1月19日至2026年1月19日"
+    assert view["meta"] == "block：b0355、b0366"
+    assert "performance_cases" not in view["text"]
+    assert view["source_artifact"] == "10_performance_reviews.json"
+
+
+def test_evaluation_performance_case_shows_check_reasons_and_evidence():
+    views = _facts_evidence_view(
+        {
+            "performance_cases": [
+                {
+                    "case_number": "1",
+                    "project_name": "信达旺大厦云平台运营及维护服务",
+                    "overall_status": "fail",
+                    "source_blocks": ["b0376"],
+                    "checks": {
+                        "order_alignment": {
+                            "status": "pass",
+                            "reason": "业绩材料顺序一致。",
+                            "evidence": [{"block_id": "b0355"}],
+                        },
+                        "signature_date": {
+                            "status": "fail",
+                            "reason": "甲乙双方下方的“年 月 日”日期栏均为空白，未实际填写任何日期。",
+                            "evidence": [
+                                {
+                                    "image_id": "i0021",
+                                    "block_id": "b0376",
+                                }
+                            ],
+                        },
+                        "table_amount_consistency": {
+                            "status": "uncertain",
+                            "reason": "合同金额与业绩表金额无法统一确认。",
+                            "evidence": [
+                                {
+                                    "image_id": "i0011",
+                                    "block_id": "b0366",
+                                }
+                            ],
+                        },
+                    },
+                }
+            ]
+        },
+        source_artifact="10_performance_reviews.json",
+    )
+
+    details = views[0]["check_details"]
+    assert [detail["label"] for detail in details] == ["合同签署日期", "金额一致性"]
+    assert views[0]["check_issue_count"] == 2
+    assert details[0]["status_label"] == "未通过"
+    assert "日期栏均为空白" in details[0]["reason"]
+    assert details[0]["meta"] == "证据图片：i0021；block：b0376"
+    assert details[1]["status_label"] == "待确认"
+    assert "金额无法统一确认" in details[1]["reason"]
+    assert all(detail["status_label"] != "通过" for detail in details)
+
+
+def test_evaluation_performance_case_facts_replace_filename_only_duplicates():
+    view = _objective_item_view(
+        {
+            "id": "performance-score",
+            "name": "类似案例1",
+            "status": "evidence_insufficient",
+            "reason": "案例金额仍待确认。",
+            "evidence": [
+                {
+                    "artifact": "10_performance_reviews.json",
+                    "case_number": "1",
+                    "overall_status": "fail",
+                }
+            ],
+            "facts": {
+                "performance_cases": [
+                    {
+                        "case_number": "1",
+                        "project_name": "信达旺大厦云平台运营及维护服务",
+                        "overall_status": "fail",
+                        "source_blocks": ["b0355"],
+                    }
+                ]
+            },
+            "related_artifacts": ["10_performance_reviews.json"],
+        },
+        {"full_score": 5},
+    )
+
+    performance_evidence = [
+        item for item in view["evidence_view"] if item["title"] == "业绩合同检查结果"
+    ]
+    assert len(performance_evidence) == 1
+    assert performance_evidence[0]["fields"]
+    assert all(item["title"] != "评分证据" for item in view["evidence_view"])
+
+
+def test_subjective_deduction_shows_issue_reason_instead_of_bid_quote():
+    view = _subjective_item_view(
+        {
+            "score_item_id": "score_item_001",
+            "rule_name": "投标文件编写质量",
+            "max_score": 5,
+            "status": "evidence_insufficient",
+            "reason": "其他扣分项证据不足。",
+            "deduction_checks": [
+                {
+                    "deduction_item": "文件内容错误",
+                    "status": "confirmed_present",
+                    "confirmed_exists": True,
+                    "reason": "发现模板提示文字残留。",
+                    "evidence": [
+                        {
+                            "artifact": "08_template_text_reviews.json",
+                            "quote": "投标人名称实际值（投标人名称）仍在正文中",
+                            "requirement": (
+                                "字段“投标人名称”的模板填写提示文字"
+                                "“（投标人名称）”应在填写实际值后清理。"
+                            ),
+                            "block_ids": ["b0031"],
+                        }
+                    ],
+                }
+            ],
+        },
+        {"full_score": 5},
+    )
+
+    evidence = view["confirmed_deductions"][0]["evidence_view"][0]
+
+    assert "仍残留在投标文件中" in evidence["text"]
+    assert "投标人名称实际值（投标人名称）仍在正文中" not in evidence["text"]
+    assert evidence["meta"] == "block：b0031"
+    assert evidence["raw_json"]
+
+
+def test_qualification_performance_is_separated_from_scoring_cases():
+    cases = [
+        {
+            "case_number": "1",
+            "project_name": "信达旺大厦云平台运营及维护服务",
+            "role": "qualification",
+            "role_label": "资格要求业绩",
+            "overall_status": "fail",
+            "source_blocks": ["b0355", "b0376"],
+            "checks": {
+                "order_alignment": {
+                    "status": "pass",
+                    "reason": "业绩材料顺序一致。",
+                },
+                "signature_date": {
+                    "status": "fail",
+                    "reason": "签字页的“年 月 日”均为空白，无法核实合同签订日期。",
+                    "evidence": [{"image_id": "i0021", "block_id": "b0376"}],
+                },
+            },
+        },
+        {
+            "case_number": "2",
+            "project_name": "评分业绩合同",
+            "role": "scoring",
+            "role_label": "评分业绩",
+            "overall_status": "pass",
+            "source_blocks": ["b0400"],
+            "checks": {},
+        },
+    ]
+
+    views = _qualification_performance_view(
+        [
+            {
+                "id": "score_item_010",
+                "facts": {
+                    "performance_cases": cases,
+                    "case_evaluations": [
+                        {
+                            "case_number": "1",
+                            "role": "qualification",
+                            "current_rule_status": "excluded_by_role",
+                        },
+                        {
+                            "case_number": "2",
+                            "role": "scoring",
+                            "current_rule_status": "valid",
+                        },
+                    ],
+                },
+            },
+            {
+                "id": "score_item_011",
+                "facts": {
+                    "performance_cases": cases,
+                    "case_evaluations": [
+                        {
+                            "case_number": "1",
+                            "role": "qualification",
+                            "current_rule_status": "excluded_by_role",
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    assert len(views) == 1
+    assert views[0]["case_number"] == "1"
+    assert views[0]["project_name"] == "信达旺大厦云平台运营及维护服务"
+    assert views[0]["role_label"] == "资格要求业绩"
+    assert views[0]["status_label"] == "未通过"
+    assert [detail["label"] for detail in views[0]["check_details"]] == ["合同签署日期"]
+    assert "无法核实合同签订日期" in views[0]["check_details"][0]["reason"]
+    assert views[0]["check_details"][0]["meta"] == "证据图片：i0021；block：b0376"
+
+
+def test_evaluation_performance_issues_are_scoped_to_the_score_item():
+    cases = [
+        {
+            "case_number": "1",
+            "project_name": "资格要求业绩",
+            "overall_status": "fail",
+            "checks": {
+                "signature_date": {
+                    "status": "fail",
+                    "reason": "签署日期栏为空。",
+                    "evidence": [{"image_id": "i0001", "block_id": "b0001"}],
+                }
+            },
+        },
+        {
+            "case_number": "2",
+            "project_name": "评分业绩",
+            "overall_status": "uncertain",
+            "checks": {
+                "contract_amount": {
+                    "status": "uncertain",
+                    "reason": "未提供可直接核验的固定合同金额。",
+                    "evidence": [{"image_id": "i0002", "block_id": "b0002"}],
+                }
+            },
+        },
+    ]
+
+    count_item = _objective_item_view(
+        {
+            "id": "score_item_010",
+            "name": "类似案例1",
+            "status": "evidence_insufficient",
+            "reason": "存在数量待确认的业绩。",
+            "evidence": [],
+            "facts": {
+                "performance_cases": cases,
+                "case_evaluations": [
+                    {
+                        "case_number": "1",
+                        "role": "qualification",
+                        "current_rule_status": "excluded_by_role",
+                        "conditions": {},
+                    },
+                    {
+                        "case_number": "2",
+                        "role": "scoring",
+                        "current_rule_status": "valid",
+                        "included_in_scoring": True,
+                        "conditions": {"proof_material": {"status": "pass"}},
+                    },
+                ],
+            },
+        },
+        {"full_score": 5},
+    )
+    amount_item = _objective_item_view(
+        {
+            "id": "score_item_011",
+            "name": "类似案例2",
+            "status": "evidence_insufficient",
+            "reason": "存在累计金额待确认的业绩。",
+            "evidence": [],
+            "facts": {
+                "performance_cases": cases,
+                "case_evaluations": [
+                    {
+                        "case_number": "1",
+                        "role": "qualification",
+                        "current_rule_status": "excluded_by_role",
+                        "conditions": {},
+                    },
+                    {
+                        "case_number": "2",
+                        "role": "scoring",
+                        "current_rule_status": "uncertain",
+                        "included_in_scoring": False,
+                        "conditions": {
+                            "proof_material": {
+                                "status": "uncertain",
+                                "reason": "合同金额事实不是可直接累计的固定金额。",
+                            }
+                        },
+                        "amount": {
+                            "reason": "合同金额事实不是可直接累计的固定金额。"
+                        },
+                    },
+                ],
+            },
+        },
+        {"full_score": 5},
+    )
+
+    assert count_item["issue_summary"] == []
+    count_case = [
+        item for item in count_item["evidence_view"] if item["kind"] == "performance_case"
+    ][0]
+    assert count_case["check_details"] == []
+
+    assert len(amount_item["issue_summary"]) == 1
+    assert amount_item["issue_summary"][0]["label"] == "案例 2 · 评分业绩 · 累计金额"
+    assert amount_item["issue_summary"][0]["status_label"] == "待确认"
+    amount_case = [
+        item
+        for item in amount_item["evidence_view"]
+        if item["kind"] == "performance_case" and item["case_number"] == "2"
+    ][0]
+    assert [detail["label"] for detail in amount_case["check_details"]] == ["累计金额"]
+
+
+def test_evaluation_status_codes_are_presented_as_chinese_labels():
+    assert _status_view("fail")[0] == "未通过"
+    assert _status_view("uncertain")[0] == "待确认"
+    assert _status_view("evidence_insufficient")[0] == "证据不足"
+
+
+def test_complete_evaluation_page_marks_full_score_as_unavailable_without_totalling(
+    client,
+    settings,
+    repository,
+):
+    task_dir = settings.tasks_dir / "evaluation-complete-scores"
+    artifact_dir = task_dir / "compliance_extraction"
+    artifact_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    repository.create(
+        "evaluation-complete-scores",
+        FileMetadata("招标文件.docx", 6, str(tender_path)),
+        FileMetadata("投标文件.docx", 3, str(bid_path)),
+        "evaluation",
+    )
+    repository.update_stage("evaluation-complete-scores", "requirements", "complete")
+    repository.update_stage("evaluation-complete-scores", "bid_parse", "complete")
+    repository.update_stage("evaluation-complete-scores", "review", "complete")
+    repository.complete("evaluation-complete-scores", {})
+    artifacts = {
+        "11_evaluation_rules.json": {
+            "score_items": [
+                {"id": "obj", "name": "客观项", "full_score": 5, "evaluation_type": "objective"},
+                {"id": "subj", "name": "主观项", "full_score": 5, "evaluation_type": "subjective"},
+            ]
+        },
+        "objective_scores.json": {
+            "score_items": [
+                {"id": "obj", "name": "客观项", "full_score": 5, "status": "auto_scored", "score": 5, "reason": "已确定", "evidence": []}
+            ]
+        },
+        "subjective_scores.json": {
+            "score_items": [
+                {"score_item_id": "subj", "rule_name": "主观项", "max_score": 5, "status": "ai_scored", "recommended_score": 4, "score_band": "良好", "reason": "理由", "evidence": []}
+            ]
+        },
+        "veto_rule_reviews.json": {"veto_rule_reviews": []},
+    }
+    for filename, payload in artifacts.items():
+        (artifact_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+    response = client.get("/bid-check/tasks/evaluation-complete-scores")
+
+    assert response.status_code == 200
+    assert "已具备计算完整评标总分的条件" in response.text
+    assert "最终总分" not in response.text
+
+
+def test_partial_evaluation_artifacts_do_not_claim_veto_or_score_completeness(
+    client,
+    settings,
+    repository,
+):
+    task_dir = settings.tasks_dir / "partial-evaluation-results"
+    artifact_dir = task_dir / "compliance_extraction"
+    artifact_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    repository.create(
+        "partial-evaluation-results",
+        FileMetadata("招标文件.docx", 6, str(tender_path)),
+        FileMetadata("投标文件.docx", 3, str(bid_path)),
+        "evaluation",
+    )
+    repository.update_stage("partial-evaluation-results", "requirements", "complete")
+    repository.update_stage("partial-evaluation-results", "bid_parse", "complete")
+    repository.update_stage("partial-evaluation-results", "review", "complete")
+    repository.complete("partial-evaluation-results", {"veto_rule_reviews": {}})
+    (artifact_dir / "11_evaluation_rules.json").write_text(
+        json.dumps(
+            {
+                "score_items": [
+                    {
+                        "id": "mixed_item",
+                        "name": "混合评分项",
+                        "full_score": 10,
+                        "evaluation_type": "mixed",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "objective_scores.json").write_text(
+        json.dumps({"score_items": []}), encoding="utf-8"
+    )
+    (artifact_dir / "subjective_scores.json").write_text(
+        json.dumps({"score_items": []}), encoding="utf-8"
+    )
+
+    response = client.get("/bid-check/tasks/partial-evaluation-results")
+
+    assert response.status_code == 200
+    assert "评标结果汇总" in response.text
+    assert "尚未生成否决规则结果，无法确认是否存在明确触发项" in response.text
+    assert "未发现明确触发项" not in response.text
+    assert "暂不具备计算完整评标总分的条件" in response.text
+
+
+def test_evaluation_page_prefers_rule_artifact_over_stored_rule_result(
+    client,
+    settings,
+    repository,
+):
+    task_dir = settings.tasks_dir / "artifact-first-evaluation"
+    artifact_dir = task_dir / "compliance_extraction"
+    artifact_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    repository.create(
+        "artifact-first-evaluation",
+        FileMetadata("招标文件.docx", 6, str(tender_path)),
+        FileMetadata("投标文件.docx", 3, str(bid_path)),
+        "evaluation",
+    )
+    repository.update_stage("artifact-first-evaluation", "requirements", "complete")
+    repository.update_stage("artifact-first-evaluation", "bid_parse", "complete")
+    repository.update_stage("artifact-first-evaluation", "review", "complete")
+    repository.complete(
+        "artifact-first-evaluation",
+        {
+            "evaluation_rules": {
+                "score_categories": [],
+                "score_items": [
+                    {
+                        "id": "stale",
+                        "name": "数据库中的旧规则",
+                        "category_id": None,
+                        "evaluation_type": "objective",
+                        "original_rule": "旧规则原文。",
+                        "source": {},
+                    }
+                ],
+                "veto_rules": [],
+                "uncertain_rules": [],
+                "source_sections": [],
+            }
+        },
+    )
+    (artifact_dir / "11_evaluation_rules.json").write_text(
+        json.dumps(
+            {
+                "score_categories": [],
+                "score_items": [
+                    {
+                        "id": "current",
+                        "name": "文件中的当前规则",
+                        "category_id": None,
+                        "evaluation_type": "objective",
+                        "original_rule": "当前规则原文。",
+                        "source": {},
+                    }
+                ],
+                "veto_rules": [],
+                "uncertain_rules": [],
+                "source_sections": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/bid-check/tasks/artifact-first-evaluation")
+
+    assert response.status_code == 200
+    assert "文件中的当前规则" in response.text
+    assert "数据库中的旧规则" not in response.text
 
 
 def test_complete_page_reads_and_renders_file_requirement_artifact(

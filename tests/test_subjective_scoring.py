@@ -444,6 +444,7 @@ def test_score_item_001_maps_missing_fill_to_content_once_and_links_block(
                     "type": "missing_fill",
                     "actual": actual_text,
                     "requirement": "模板提示文字应在填写实际值后清理。",
+                    "reason": "投标文件中仍残留模板提示文字。",
                 }
             ],
         }
@@ -462,6 +463,10 @@ def test_score_item_001_maps_missing_fill_to_content_once_and_links_block(
     assert checks["文件内容错误"]["confirmed_exists"] is True
     assert any(
         "b-format" in evidence.get("block_ids", [])
+        for evidence in checks["文件内容错误"]["evidence"]
+    )
+    assert any(
+        evidence.get("reason") == "投标文件中仍残留模板提示文字。"
         for evidence in checks["文件内容错误"]["evidence"]
     )
     assert checks["材料缺失"]["status"] == "insufficient"

@@ -702,6 +702,9 @@ def _quality_artifact_evidence(
                 ]
                 if matched_block_ids:
                     reference["block_ids"] = matched_block_ids[:3]
+        issue_reason = _as_text(child.get("reason")).strip()
+        if issue_reason:
+            reference["reason"] = issue_reason
         if "template_id" in child:
             reference["record_id"] = _as_text(child.get("template_id"))
         if "requirement" in child:

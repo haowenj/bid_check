@@ -9,6 +9,293 @@
   </span>
 {%- endmacro %}
 
+{% macro business_status(status) -%}
+  {% if status == "pass" %}通过
+  {% elif status == "fail" %}未通过
+  {% elif status == "uncertain" %}待确认
+  {% elif status == "not_applicable" %}不适用
+  {% elif status == "not_supported" %}暂不支持
+  {% elif status == "matched" %}已匹配
+  {% elif status == "mismatched" %}不匹配
+  {% elif status == "failed" %}检查失败
+  {% elif status == "pending" %}待处理
+  {% elif status == "running" %}运行中
+  {% elif status == "complete" %}已完成
+  {% else %}{{ status|default("待确认", true) }}{% endif %}
+{%- endmacro %}
+
+{% macro render_evaluation_evidence(evidence) -%}
+  {% if evidence %}
+    <ul class="evaluation-evidence-list">
+      {% for item in evidence %}
+        <li>
+          <div class="evaluation-evidence-heading">
+            <strong>{{ item.title }}</strong>
+            {% if item.subtitle %}<span>{{ item.subtitle }}</span>{% endif %}
+          </div>
+          {% if item.fields %}
+            <dl class="evaluation-evidence-fields">
+              {% for field in item.fields %}<div><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>{% endfor %}
+            </dl>
+          {% endif %}
+          {% if item.text %}<p class="evaluation-evidence-text">{{ item.text }}</p>{% endif %}
+          {% if item.meta %}<small class="evaluation-evidence-meta">{{ item.meta }}</small>{% endif %}
+          {% if item.check_details %}
+            <details class="evaluation-evidence-checks">
+              <summary>查看检查问题（{{ item.check_issue_count }}项）</summary>
+              <ul class="evaluation-check-detail-list">
+                {% for detail in item.check_details %}
+                  <li>
+                    <div class="evaluation-check-detail-heading">
+                      <strong>{{ detail.label }}</strong>
+                      <span class="status-tone-{{ detail.status_tone }}">{{ detail.status_label }}</span>
+                    </div>
+                    <p>{{ detail.reason }}</p>
+                    {% if detail.meta %}<small>{{ detail.meta }}</small>{% endif %}
+                  </li>
+                {% endfor %}
+              </ul>
+            </details>
+          {% endif %}
+          {% if item.source_artifact or item.raw_json %}
+            <details class="evaluation-evidence-raw">
+              <summary>查看原始证据</summary>
+              {% if item.source_artifact %}<small>产物文件：{{ item.source_artifact }}</small>{% endif %}
+              {% if item.raw_json %}<pre>{{ item.raw_json }}</pre>{% endif %}
+            </details>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="evaluation-empty-evidence">未记录可展示的关键证据。</p>
+  {% endif %}
+{%- endmacro %}
+
+{% macro render_evaluation_summary_card(result_summary, filename, summary_label="评分结果概览") -%}
+  <section class="card evaluation-result-summary" aria-label="{{ summary_label }}">
+    <div class="evaluation-result-summary-heading">
+      <span class="summary-label">{{ summary_label }}</span>
+      <strong>{{ filename }}</strong>
+    </div>
+    <div class="evaluation-result-metrics">
+      <div><small>客观评分</small><strong>{% if result_summary.objective_available %}{{ result_summary.objective_determined }} 项已确定 / {{ result_summary.objective_pending }} 项待补充{% else %}尚未生成客观评分结果{% endif %}</strong></div>
+      <div><small>主观评分</small><strong>{% if result_summary.subjective_available %}{{ result_summary.subjective_scored }} 项已评分 / {{ result_summary.subjective_file_missing }} 项缺少文件{% if result_summary.subjective_other_pending %} / {{ result_summary.subjective_other_pending }} 项其他待补充{% endif %}{% else %}尚未生成 AI 辅助评分结果{% endif %}</strong></div>
+      <div><small>否决规则</small><strong>{% if not result_summary.veto_available %}尚未生成否决规则结果{% elif result_summary.veto_triggered %}存在 {{ result_summary.veto_triggered }} 项明确触发{% else %}未发现明确触发项{% endif %}</strong></div>
+      <div><small>完整评分条件</small><strong>{% if result_summary.scores_complete %}已具备{% else %}暂不具备{% endif %}</strong></div>
+    </div>
+    <p>汇总层不合并三类结果，也不计算或推测未确定分值。</p>
+  </section>
+{%- endmacro %}
+
+{% macro render_evaluation_objective_cards(items) -%}
+  {% for item in items|default([], true) %}
+    <article class="evaluation-result-card" data-score-item-id="{{ item.id }}">
+      <div class="evaluation-result-card-heading">
+        <strong>{{ item.name }}</strong>
+        <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+      </div>
+      <dl class="evaluation-result-fields">
+        <div><dt>满分</dt><dd>{{ item.full_score_label }}{% if item.full_score_label != "暂无法确定" %} 分{% endif %}</dd></div>
+        <div><dt>当前状态</dt><dd>{{ item.status_label }}</dd></div>
+        <div><dt>已确定得分</dt><dd class="{% if not item.score_determined %}score-unavailable{% endif %}">{{ item.score_label }}{% if item.score_determined %} 分{% endif %}</dd></div>
+      </dl>
+      <div class="evaluation-result-reason"><strong>评分说明</strong><p>{{ item.reason }}</p></div>
+      {% if item.issue_summary %}
+        <section class="evaluation-issue-summary">
+          <strong>影响评分的问题</strong>
+          <ul>
+            {% for issue in item.issue_summary %}
+              <li>
+                <div class="evaluation-issue-summary-heading">
+                  <strong>{{ issue.label }}</strong>
+                  <span class="status-tone-{{ issue.status_tone }}">{{ issue.status_label }}</span>
+                </div>
+                <p>{{ issue.reason }}</p>
+                {% if issue.meta %}<small>{{ issue.meta }}</small>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </section>
+      {% endif %}
+      <details class="evaluation-result-evidence"><summary>关键证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+    </article>
+  {% else %}
+    <div class="card empty-card">尚未生成可展示的客观评分结果。</div>
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_evaluation_qualification_cases(cases) -%}
+  {% if cases %}
+    <section class="evaluation-qualification-section" aria-labelledby="qualification-performance-heading">
+      <div class="evaluation-qualification-heading">
+        <div><span class="section-number">QUALIFICATION</span><h3 id="qualification-performance-heading">资格业绩核验</h3></div>
+        <span>{{ cases|length }} 项</span>
+      </div>
+      <p class="evaluation-qualification-note">以下合同在业绩情况表中被标记为资格要求业绩，先用于核验资格，不计入“类似案例”评分。</p>
+      <div class="evaluation-qualification-list">
+        {% for case in cases %}
+          <article class="evaluation-qualification-card">
+            <div class="evaluation-result-card-heading">
+              <div><strong>{% if case.case_number %}案例 {{ case.case_number }} · {% endif %}{{ case.project_name|default(case.subtitle|default("资格要求业绩", true), true) }}</strong><small>资格要求业绩</small></div>
+              <span class="evaluation-result-status status-tone-{{ case.status_tone }}">{{ case.status_label }}</span>
+            </div>
+            {% if case.fields %}
+              <dl class="evaluation-evidence-fields">
+                {% for field in case.fields %}<div><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>{% endfor %}
+              </dl>
+            {% endif %}
+            {% if case.check_details %}
+              <div class="evaluation-qualification-issues">
+                <strong>影响资格判断的问题</strong>
+                <ul class="evaluation-check-detail-list">
+                  {% for detail in case.check_details %}
+                    <li>
+                      <div class="evaluation-check-detail-heading"><strong>{{ detail.label }}</strong><span class="status-tone-{{ detail.status_tone }}">{{ detail.status_label }}</span></div>
+                      <p>{{ detail.reason }}</p>
+                      {% if detail.meta %}<small>{{ detail.meta }}</small>{% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            {% else %}
+              <p class="evaluation-qualification-clear">当前未发现需要处理的资格业绩检查问题。</p>
+            {% endif %}
+            <details class="evaluation-evidence-raw">
+              <summary>查看资格业绩证据</summary>
+              {% if case.source_artifact %}<small>产物文件：{{ case.source_artifact }}</small>{% endif %}
+              {% if case.meta %}<small>证据定位：{{ case.meta }}</small>{% endif %}
+              {% if case.raw_json %}<pre>{{ case.raw_json }}</pre>{% endif %}
+            </details>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+{%- endmacro %}
+
+{% macro render_evaluation_subjective_cards(items) -%}
+  {% for item in items|default([], true) %}
+    <article class="evaluation-result-card evaluation-subjective-card" data-score-item-id="{{ item.id }}">
+      <div class="evaluation-result-card-heading">
+        <div><strong>{{ item.name }}</strong><small>AI辅助评分</small></div>
+        <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+      </div>
+      <dl class="evaluation-result-fields">
+        <div><dt>满分</dt><dd>{{ item.full_score_label }}{% if item.full_score_label != "暂无法确定" %} 分{% endif %}</dd></div>
+        <div><dt>建议分</dt><dd class="{% if not item.score_determined %}score-unavailable{% endif %}">{{ item.recommended_score_label }}{% if item.score_determined %} 分{% endif %}</dd></div>
+        <div><dt>评分档</dt><dd>{{ item.score_band_label }}</dd></div>
+      </dl>
+      <div class="evaluation-result-reason"><strong>评分理由</strong><p>{{ item.reason }}</p></div>
+      {% if item.confirmed_deductions %}
+        <div class="evaluation-deduction-facts">
+          <strong>已确认扣分事实</strong>
+          {% for deduction in item.confirmed_deductions %}
+            <article>
+              <div><strong>{{ deduction.deduction_item }}</strong><span>已确认存在</span></div>
+              <p>{{ deduction.reason }}</p>
+              {{ render_evaluation_evidence(deduction.evidence_view) }}
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <details class="evaluation-result-evidence"><summary>证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+    </article>
+  {% else %}
+    <div class="card empty-card">尚未生成可展示的 AI 辅助评分结果。</div>
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_evaluation_veto_cards(items) -%}
+  {% for item in items|default([], true) %}
+    <article class="evaluation-result-card evaluation-veto-result-card status-surface-{{ item.status_tone }}" data-veto-rule-id="{{ item.id }}" data-veto-status="{{ item.status }}">
+      <div class="evaluation-result-card-heading">
+        <strong>{{ item.name }}</strong>
+        <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+      </div>
+      <div class="evaluation-result-reason"><strong>判断理由</strong><p>{{ item.reason }}</p></div>
+      {% if item.dependencies_view %}<div class="evaluation-dependency-list">{% for dependency in item.dependencies_view %}<span>{{ dependency }}</span>{% endfor %}</div>{% endif %}
+      <details class="evaluation-result-evidence"><summary>关键证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+      {% if item.sub_conditions %}
+        <details class="evaluation-subconditions" data-veto-rule-id="{{ item.id }}">
+          <summary>展开查看 {{ item.sub_conditions|length }} 个子条件</summary>
+          <div class="evaluation-subcondition-list">
+            {% for condition in item.sub_conditions %}
+              <article data-veto-subcondition="{{ condition.id }}">
+                <div class="evaluation-result-card-heading">
+                  <strong>{{ condition.index }}. {{ condition.name }}</strong>
+                  <span class="evaluation-result-status status-tone-{{ condition.status_tone }}">{{ condition.status_label }}</span>
+                </div>
+                <p>{{ condition.reason }}</p>
+                {% if condition.dependencies_view %}<div class="evaluation-dependency-list">{% for dependency in condition.dependencies_view %}<span>{{ dependency }}</span>{% endfor %}</div>{% endif %}
+                {% if condition.evidence_view %}<details class="evaluation-result-evidence"><summary>证据（{{ condition.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(condition.evidence_view) }}</details>{% endif %}
+              </article>
+            {% endfor %}
+          </div>
+        </details>
+      {% endif %}
+    </article>
+  {% else %}
+    <div class="card empty-card">尚未生成可展示的否决规则复核结果。</div>
+  {% endfor %}
+{%- endmacro %}
+
+{% macro render_evaluation_workbench(evaluation_summary, result_summary, filename, summary_label="评分结果概览") -%}
+  {{ render_evaluation_summary_card(result_summary, filename, summary_label) }}
+  <section class="comparison-section evaluation-result-section" aria-labelledby="objective-results-heading">
+    <div class="section-heading result-section-heading"><div><span class="section-number">OBJECTIVE</span><h2 id="objective-results-heading">客观评分</h2></div><span class="requirement-count">{{ result_summary.objective_total }} 项</span></div>
+    {{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}
+    <div class="evaluation-result-list">{{ render_evaluation_objective_cards(evaluation_summary.objective_items) }}</div>
+  </section>
+  <section class="comparison-section evaluation-result-section" aria-labelledby="subjective-results-heading">
+    <div class="section-heading result-section-heading"><div><span class="section-number">AI-ASSISTED</span><h2 id="subjective-results-heading">主观评分 / AI辅助评分</h2><p class="evaluation-heading-note">以下为 AI 辅助建议，供评标人员复核。</p></div><span class="requirement-count">{{ result_summary.subjective_total }} 项</span></div>
+    <div class="evaluation-result-list">{{ render_evaluation_subjective_cards(evaluation_summary.subjective_items) }}</div>
+  </section>
+  <section class="comparison-section evaluation-result-section" aria-labelledby="veto-results-heading">
+    <div class="section-heading result-section-heading"><div><span class="section-number">VETO REVIEW</span><h2 id="veto-results-heading">否决规则</h2></div><span class="requirement-count">{{ result_summary.veto_total }} 条</span></div>
+    <div class="evaluation-result-list">{{ render_evaluation_veto_cards(evaluation_summary.veto_items) }}</div>
+  </section>
+{%- endmacro %}
+
+{% macro render_evaluation_dashboard(evaluation_summary, result_summary, filename) -%}
+  <div class="result-dashboard-shell evaluation-result-dashboard">
+    <aside class="result-dashboard-sidebar" aria-label="评分分类导航">
+      <span class="result-dashboard-kicker">EVALUATION</span>
+      <h2>评分审阅</h2>
+      <div class="result-dashboard-nav is-selected"><span aria-hidden="true">◈</span><strong>评分总览</strong><b>{{ result_summary.objective_total + result_summary.subjective_total }}</b></div>
+      <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>客观评分</strong><b>{{ result_summary.objective_total }}</b></div>
+      <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>主观评分</strong><b>{{ result_summary.subjective_total }}</b></div>
+      <div class="result-dashboard-nav"><span aria-hidden="true">◇</span><strong>否决规则</strong><b>{{ result_summary.veto_total }}</b></div>
+      <div class="result-dashboard-tip">未确定分值保留待补充状态<br>建议分仅供评审人员复核</div>
+    </aside>
+    <main class="result-dashboard-main">
+      <div class="result-dashboard-breadcrumb">标书检查 / {{ filename }}</div>
+      <div class="result-dashboard-heading"><div><span class="section-number">EVALUATION REVIEW</span><h2>评分风险总览</h2><p>集中查看当前评分结果及待补充项。</p></div><span class="result-dashboard-state">待复核</span></div>
+      <div class="result-dashboard-alert">评分结果按客观评分、主观评分和否决规则分别保留，未确定项不会被推算。</div>
+      <div class="result-dashboard-metrics">
+        <div><span>客观评分</span><strong>{{ result_summary.objective_determined }}</strong><small>/ {{ result_summary.objective_total }} 项已确定</small></div>
+        <div><span>主观评分</span><strong>{{ result_summary.subjective_scored }}</strong><small>/ {{ result_summary.subjective_total }} 项已评分</small></div>
+        <div><span>缺少文件</span><strong>{{ result_summary.subjective_file_missing }}</strong><small>项评分待补充文件</small></div>
+        <div><span>明确触发</span><strong>{{ result_summary.veto_triggered }}</strong><small>/ {{ result_summary.veto_total }} 条规则</small></div>
+      </div>
+      <div class="result-dashboard-focus">
+        <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>主观评分</h3><span>{{ result_summary.subjective_total }} 项</span></div><div class="evaluation-result-list">{{ render_evaluation_subjective_cards(evaluation_summary.subjective_items) }}</div></section>
+        <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>客观评分</h3><span>{{ result_summary.objective_total }} 项</span></div>{{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}<div class="evaluation-result-list">{{ render_evaluation_objective_cards(evaluation_summary.objective_items) }}</div></section>
+        <section class="result-dashboard-panel"><div class="result-dashboard-panel-head"><h3>否决规则</h3><span>{{ result_summary.veto_total }} 条</span></div><div class="evaluation-result-list">{{ render_evaluation_veto_cards(evaluation_summary.veto_items) }}</div></section>
+      </div>
+    </main>
+  </div>
+{%- endmacro %}
+
+{% macro render_evaluation_report(evaluation_summary, result_summary, filename) -%}
+  <div class="result-report-paper evaluation-result-report">
+    <header class="result-report-head"><div><span class="section-number">EVALUATION REPORT</span><h2>评分结果报告</h2></div><div class="result-report-file">当前文件<br>{{ filename }}</div></header>
+    <section class="result-report-lede"><div><h3>评分结果概览</h3><p>本页按评标规则展示已生成的评分和否决判断，并保留未确定项的待复核状态。</p></div><div class="result-report-stats"><div><strong>{{ result_summary.objective_determined }}</strong><span>客观已确定</span></div><div><strong>{{ result_summary.subjective_scored }}</strong><span>主观已评分</span></div><div><strong>{{ result_summary.subjective_file_missing }}</strong><span>缺少文件</span></div><div><strong>{{ result_summary.veto_triggered }}</strong><span>明确触发</span></div></div></section>
+    <div class="result-report-columns"><aside class="result-report-index"><h3>结果索引</h3><div><strong>客观评分</strong><span>{{ result_summary.objective_total }} 项</span></div><div><strong>主观评分</strong><span>{{ result_summary.subjective_total }} 项</span></div><div><strong>否决规则</strong><span>{{ result_summary.veto_total }} 条</span></div><div><strong>完整评分条件</strong><span>{% if result_summary.scores_complete %}已具备{% else %}暂不具备{% endif %}</span></div></aside><main class="result-report-main"><section><div class="result-report-section-head"><h3>客观评分</h3><span>{{ result_summary.objective_total }} 项</span></div>{{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}<div class="evaluation-result-list">{{ render_evaluation_objective_cards(evaluation_summary.objective_items) }}</div></section><section><div class="result-report-section-head"><h3>主观评分</h3><span>{{ result_summary.subjective_total }} 项</span></div><div class="evaluation-result-list">{{ render_evaluation_subjective_cards(evaluation_summary.subjective_items) }}</div></section><section><div class="result-report-section-head"><h3>否决规则</h3><span>{{ result_summary.veto_total }} 条</span></div><div class="evaluation-result-list">{{ render_evaluation_veto_cards(evaluation_summary.veto_items) }}</div></section></main></div>
+    <footer class="result-report-foot">说明：建议分和未确定状态仅用于辅助评审，不替代正式评标结论。</footer>
+  </div>
+{%- endmacro %}
+
 {% macro render_bid_section_content(section) -%}
   {% for block in section.blocks %}
     {% if not block.is_section_heading %}
@@ -117,7 +404,7 @@
           <ul class="review-issue-list">
             {% for requirement in review.requirements %}
               {% if requirement.status in ["fail", "uncertain"] %}
-                <li><strong>{{ requirement.requirement }}：{{ requirement.status }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
+                <li><strong>{{ requirement.requirement }}：{{ business_status(requirement.status) }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
               {% endif %}
             {% endfor %}
           </ul>
@@ -147,7 +434,7 @@
           <ul class="review-issue-list">
             {% for check in review.checks %}
               {% if check.status in ["fail", "uncertain"] %}
-                <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+                <li><strong>{{ check.requirement }}：{{ business_status(check.status) }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
               {% endif %}
             {% endfor %}
           </ul>
@@ -174,7 +461,7 @@
           大小 {{ review.actual.size_display|default("未获取", true) }}（{{ review.actual.size_bytes|default("未获取", true) }}）
         {% else %}未获取原始文件元数据{% endif %}
       </p>
-      <p><strong>判定：</strong>{{ review.status_label|default(review.status, true) }}。{{ review.message|default("", true) }}</p>
+      <p><strong>判定：</strong>{{ review.status_label|default(business_status(review.status), true) }}。{{ review.message|default("", true) }}</p>
       <details class="file-requirement-source">
         <summary>招标文件原文依据</summary>
         {% if review.source %}<p>{{ review.source.source_text|default("未记录", true) }}</p><small>章节：{{ review.source.section|default("未记录", true) }}；block：{{ review.source.block_ids|join("、") if review.source.block_ids else "未记录" }}</small>{% else %}<p>未记录来源文档块。</p>{% endif %}
@@ -202,22 +489,187 @@
     {% set evaluation_items = evaluation_rules.score_items|default([], true) %}
     {% set evaluation_veto_rules = evaluation_rules.veto_rules|default([], true) %}
     {% set evaluation_uncertain_rules = evaluation_rules.uncertain_rules|default([], true) %}
+    {% set result_summary = evaluation_summary.summary|default({}, true) %}
     <header class="page-heading result-page-heading">
       <div>
-        <span class="eyebrow">评标规则提取已完成</span>
-        <h1>评标规则提取结果</h1>
-        <p>本阶段只提取评分和否决性规则，保留层级、原文与 MinerU block 来源，不执行投标文件评分或否决判断。</p>
+        {% if evaluation_summary.has_any_result %}
+          <span class="eyebrow">独立评标产出物已汇总</span>
+          <h1>评标结果汇总</h1>
+          <p>客观评分、AI辅助评分和否决规则分别展示；本页面只读取既有结果，不重新执行评标逻辑。</p>
+        {% else %}
+          <span class="eyebrow">评标规则提取已完成</span>
+          <h1>评标规则提取结果</h1>
+          <p>本阶段只提取评分和否决性规则，保留层级、原文与 MinerU block 来源，不执行投标文件评分或否决判断。</p>
+        {% endif %}
       </div>
       <a class="button" href="/bid-check">创建新任务</a>
     </header>
 
-    <div class="notice notice-info evaluation-notice" role="note">
-      <span class="notice-icon" aria-hidden="true">i</span>
-      <div>
-        <strong>规则产出物已生成</strong>
-        <p>客观评分项和主观评分项均只作为招标文件规则记录；后续阶段才会结合投标文件执行客观规则。</p>
-      </div>
+    <div class="result-style-switcher" data-result-style-switcher role="tablist" aria-label="结果页风格切换">
+      <span class="result-style-label">展示风格</span>
+      <button type="button" role="tab" aria-selected="true" aria-pressed="true" data-result-style="workbench">A · 审阅工作台</button>
+      <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-style="dashboard">B · 风险驾驶舱</button>
+      <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-style="report">C · 结论报告页</button>
     </div>
+
+    <div class="result-mode-switcher" data-result-mode-switcher role="tablist" aria-label="标书检查方式">
+      <span class="result-mode-label">检查方式</span>
+      <button type="button" role="tab" aria-selected="true" aria-pressed="true" data-result-mode="evaluation" aria-controls="evaluation-result-mode-panel">评分结果</button>
+    </div>
+    <div class="result-mode-view" id="evaluation-result-mode-panel" data-result-mode-view="evaluation" data-active="true">
+    {% if evaluation_summary.has_any_result %}
+      <div class="result-style-view evaluation-result-style-workbench" data-result-style-view="workbench" data-active="true">
+      <section class="card evaluation-result-summary" aria-label="评标结果整体摘要">
+        <div class="evaluation-result-summary-heading">
+          <span class="summary-label">整体摘要</span>
+          <strong>{{ task.bid_file.filename }}</strong>
+        </div>
+        <div class="evaluation-result-metrics">
+          <div>
+            <small>客观评分</small>
+            <strong>{% if result_summary.objective_available %}{{ result_summary.objective_determined }} 项已确定 / {{ result_summary.objective_pending }} 项待补充{% else %}尚未生成客观评分结果{% endif %}</strong>
+          </div>
+          <div>
+            <small>主观评分</small>
+            <strong>{% if result_summary.subjective_available %}{{ result_summary.subjective_scored }} 项已评分 / {{ result_summary.subjective_file_missing }} 项缺少文件{% if result_summary.subjective_other_pending %} / {{ result_summary.subjective_other_pending }} 项其他待补充{% endif %}{% else %}尚未生成 AI 辅助评分结果{% endif %}</strong>
+          </div>
+          <div>
+            <small>否决规则</small>
+            <strong>{% if not result_summary.veto_available %}尚未生成否决规则结果，无法确认是否存在明确触发项{% elif result_summary.veto_triggered %}存在 {{ result_summary.veto_triggered }} 项明确触发{% else %}未发现明确触发项{% endif %}</strong>
+          </div>
+          <div>
+            <small>完整评分条件</small>
+            <strong>{% if result_summary.scores_complete %}已具备计算完整评标总分的条件{% else %}暂不具备计算完整评标总分的条件{% endif %}</strong>
+          </div>
+        </div>
+        <p>汇总层不合并三类结果，也不计算或推测未确定分值。</p>
+      </section>
+
+      <section class="comparison-section evaluation-result-section" aria-labelledby="objective-results-heading">
+        <div class="section-heading result-section-heading">
+          <div><span class="section-number">OBJECTIVE</span><h2 id="objective-results-heading">客观评分</h2></div>
+          <span class="requirement-count">{{ result_summary.objective_total }} 项</span>
+        </div>
+        {{ render_evaluation_qualification_cases(evaluation_summary.qualification_performance_cases) }}
+        <div class="evaluation-result-list">
+          {% for item in evaluation_summary.objective_items %}
+            <article class="evaluation-result-card" data-score-item-id="{{ item.id }}">
+              <div class="evaluation-result-card-heading">
+                <strong>{{ item.name }}</strong>
+                <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+              </div>
+              <dl class="evaluation-result-fields">
+                <div><dt>满分</dt><dd>{{ item.full_score_label }}{% if item.full_score_label != "暂无法确定" %} 分{% endif %}</dd></div>
+                <div><dt>当前状态</dt><dd>{{ item.status_label }}</dd></div>
+                <div><dt>已确定得分</dt><dd class="{% if not item.score_determined %}score-unavailable{% endif %}">{{ item.score_label }}{% if item.score_determined %} 分{% endif %}</dd></div>
+              </dl>
+              <div class="evaluation-result-reason"><strong>无法评分原因 / 评分说明</strong><p>{{ item.reason }}</p></div>
+              <details class="evaluation-result-evidence"><summary>关键证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+            </article>
+          {% else %}
+            <div class="card empty-card">尚未生成可展示的客观评分结果。</div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="comparison-section evaluation-result-section" aria-labelledby="subjective-results-heading">
+        <div class="section-heading result-section-heading">
+          <div><span class="section-number">AI-ASSISTED</span><h2 id="subjective-results-heading">主观评分 / AI辅助评分</h2><p class="evaluation-heading-note">以下为 AI 辅助建议，供评标人员复核。</p></div>
+          <span class="requirement-count">{{ result_summary.subjective_total }} 项</span>
+        </div>
+        <div class="evaluation-result-list">
+          {% for item in evaluation_summary.subjective_items %}
+            <article class="evaluation-result-card evaluation-subjective-card" data-score-item-id="{{ item.id }}">
+              <div class="evaluation-result-card-heading">
+                <div><strong>{{ item.name }}</strong><small>AI辅助评分</small></div>
+                <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+              </div>
+              <dl class="evaluation-result-fields">
+                <div><dt>满分</dt><dd>{{ item.full_score_label }}{% if item.full_score_label != "暂无法确定" %} 分{% endif %}</dd></div>
+                <div><dt>建议分</dt><dd class="{% if not item.score_determined %}score-unavailable{% endif %}">{{ item.recommended_score_label }}{% if item.score_determined %} 分{% endif %}</dd></div>
+                <div><dt>评分档</dt><dd>{{ item.score_band_label }}</dd></div>
+              </dl>
+              <div class="evaluation-result-reason"><strong>评分理由</strong><p>{{ item.reason }}</p></div>
+              {% if item.confirmed_deductions %}
+                <div class="evaluation-deduction-facts">
+                  <strong>已确认扣分事实</strong>
+                  {% for deduction in item.confirmed_deductions %}
+                    <article>
+                      <div><strong>{{ deduction.deduction_item }}</strong><span>已确认存在</span></div>
+                      <p>{{ deduction.reason }}</p>
+                      {{ render_evaluation_evidence(deduction.evidence_view) }}
+                    </article>
+                  {% endfor %}
+                </div>
+              {% endif %}
+              <details class="evaluation-result-evidence"><summary>证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+            </article>
+          {% else %}
+            <div class="card empty-card">尚未生成可展示的 AI 辅助评分结果。</div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="comparison-section evaluation-result-section" aria-labelledby="veto-results-heading">
+        <div class="section-heading result-section-heading">
+          <div><span class="section-number">VETO REVIEW</span><h2 id="veto-results-heading">否决规则</h2></div>
+          <span class="requirement-count">{{ result_summary.veto_total }} 条</span>
+        </div>
+        <div class="evaluation-result-list">
+          {% for item in evaluation_summary.veto_items %}
+            <article class="evaluation-result-card evaluation-veto-result-card status-surface-{{ item.status_tone }}" data-veto-rule-id="{{ item.id }}" data-veto-status="{{ item.status }}">
+              <div class="evaluation-result-card-heading">
+                <strong>{{ item.name }}</strong>
+                <span class="evaluation-result-status status-tone-{{ item.status_tone }}">{{ item.status_label }}</span>
+              </div>
+              <div class="evaluation-result-reason"><strong>判断理由</strong><p>{{ item.reason }}</p></div>
+              {% if item.dependencies_view %}<div class="evaluation-dependency-list">{% for dependency in item.dependencies_view %}<span>{{ dependency }}</span>{% endfor %}</div>{% endif %}
+              <details class="evaluation-result-evidence"><summary>关键证据（{{ item.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(item.evidence_view) }}</details>
+              {% if item.sub_conditions %}
+                <details class="evaluation-subconditions" data-veto-rule-id="{{ item.id }}">
+                  <summary>展开查看 {{ item.sub_conditions|length }} 个子条件</summary>
+                  <div class="evaluation-subcondition-list">
+                    {% for condition in item.sub_conditions %}
+                      <article data-veto-subcondition="{{ condition.id }}">
+                        <div class="evaluation-result-card-heading">
+                          <strong>{{ condition.index }}. {{ condition.name }}</strong>
+                          <span class="evaluation-result-status status-tone-{{ condition.status_tone }}">{{ condition.status_label }}</span>
+                        </div>
+                        <p>{{ condition.reason }}</p>
+                        {% if condition.dependencies_view %}<div class="evaluation-dependency-list">{% for dependency in condition.dependencies_view %}<span>{{ dependency }}</span>{% endfor %}</div>{% endif %}
+                        {% if condition.evidence_view %}<details class="evaluation-result-evidence"><summary>证据（{{ condition.evidence_view|length }} 条）</summary>{{ render_evaluation_evidence(condition.evidence_view) }}</details>{% endif %}
+                      </article>
+                    {% endfor %}
+                  </div>
+                </details>
+              {% endif %}
+            </article>
+          {% else %}
+            <div class="card empty-card">尚未生成可展示的否决规则复核结果。</div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <div class="notice notice-info evaluation-notice" role="note">
+        <span class="notice-icon" aria-hidden="true">i</span>
+        <div><strong>以下为评标规则依据</strong><p>保留原始规则层级与来源，便于核对上述结果；该区域不参与重新评分。</p></div>
+      </div>
+      </div>
+      <div class="result-style-view evaluation-result-style-dashboard" data-result-style-view="dashboard" data-active="false">
+        {{ render_evaluation_dashboard(evaluation_summary, result_summary, task.bid_file.filename) }}
+      </div>
+      <div class="result-style-view evaluation-result-style-report" data-result-style-view="report" data-active="false">
+        {{ render_evaluation_report(evaluation_summary, result_summary, task.bid_file.filename) }}
+      </div>
+    {% else %}
+      <div class="notice notice-info evaluation-notice" role="note">
+        <span class="notice-icon" aria-hidden="true">i</span>
+        <div>
+          <strong>规则产出物已生成</strong>
+          <p>客观评分项和主观评分项均只作为招标文件规则记录；后续阶段才会结合投标文件执行客观规则。</p>
+        </div>
+      </div>
+    {% endif %}
 
     <section class="card evaluation-summary-card" aria-label="评标规则提取统计">
       <div>
@@ -329,8 +781,8 @@
         <span class="requirement-count">{{ evaluation_veto_rules|length }} 条</span>
       </div>
       {% for rule in evaluation_veto_rules %}
-        <article class="evaluation-veto-card">
-          <div class="evaluation-item-heading"><strong>{{ rule.name }}</strong><span class="comparison-status comparison-status-fail">明确后果</span></div>
+        <article class="evaluation-veto-card evaluation-veto-reference-card">
+          <div class="evaluation-item-heading"><strong>{{ rule.name }}</strong><span class="comparison-status comparison-status-reference">规则后果</span></div>
           <p><strong>触发条件：</strong>{{ rule.trigger_condition }}</p>
           <p><strong>触发后果：</strong>{{ rule.consequence }}</p>
           {% if rule.additional_consequence %}<p><strong>补充后果说明：</strong>{{ rule.additional_consequence }}</p>{% endif %}
@@ -362,12 +814,13 @@
       {% endfor %}
     </section>
 
+    </div>
     {% include "_back_to_top.html" %}
   {% elif task.status == "complete" %}
     <header class="page-heading result-page-heading">
       <div>
         <span class="eyebrow">任务已完成</span>
-        <h1>标书合规性校验结果</h1>
+        <h1>标书校验结果</h1>
         <p>以下按模板规范、附件、业绩合同和文件自身四个检查范围展示合规性结果。</p>
       </div>
       <a class="button" href="/bid-check">创建新任务</a>
@@ -420,6 +873,15 @@
       <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-style="report">C · 结论报告页</button>
     </div>
 
+    <div class="result-mode-switcher" data-result-mode-switcher role="tablist" aria-label="标书检查方式">
+      <span class="result-mode-label">检查方式</span>
+      <button type="button" role="tab" aria-selected="true" aria-pressed="true" data-result-mode="compliance" aria-controls="compliance-result-mode-panel">合规性检查</button>
+      {% if evaluation_summary.has_any_result %}
+        <button type="button" role="tab" aria-selected="false" aria-pressed="false" data-result-mode="evaluation" aria-controls="evaluation-result-mode-panel">评分结果</button>
+      {% endif %}
+    </div>
+
+    <div class="result-mode-view" id="compliance-result-mode-panel" data-result-mode-view="compliance" data-active="true">
     <div class="result-style-view result-style-workbench" data-result-style-view="workbench" data-active="true">
     <section class="card result-summary-card final-result-summary" aria-label="问题汇总">
       <div>
@@ -517,7 +979,7 @@
                   <ul class="review-issue-list">
                     {% for requirement in review.requirements %}
                       {% if requirement.status in ["fail", "uncertain"] %}
-                        <li><strong>{{ requirement.requirement }}：{{ requirement.status }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
+                        <li><strong>{{ requirement.requirement }}：{{ business_status(requirement.status) }}</strong>：{{ requirement.reason }}<br><small>证据图片：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
                       {% endif %}
                     {% endfor %}
                   </ul>
@@ -560,7 +1022,7 @@
                   <ul class="review-issue-list">
                     {% for check in review.checks %}
                       {% if check.status in ["fail", "uncertain"] %}
-                        <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+                        <li><strong>{{ check.requirement }}：{{ business_status(check.status) }}</strong>：{{ check.reason }}<br><small>证据图片：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
                       {% endif %}
                     {% endfor %}
                   </ul>
@@ -630,6 +1092,28 @@
         <footer class="result-report-foot">说明：证据图片仅用于定位原始材料，不代表页面重新判断了图片真实性。</footer>
       </div>
     </div>
+
+    </div>
+
+    {% if evaluation_summary.has_any_result %}
+      {% set merged_evaluation_summary = evaluation_summary.summary|default({}, true) %}
+      <div class="result-mode-view" id="evaluation-result-mode-panel" data-result-mode-view="evaluation" data-active="false">
+        <div class="evaluation-result-mode-heading">
+          <span class="section-number">MERGED EVALUATION</span>
+          <h2>评标结果汇总</h2>
+          <p class="evaluation-heading-note">以下展示当前任务已生成的评分和否决结果，供评审人员查看。</p>
+        </div>
+        <div class="result-style-view evaluation-result-style-workbench" data-result-style-view="workbench" data-active="true">
+          {{ render_evaluation_workbench(evaluation_summary, merged_evaluation_summary, task.bid_file.filename, "评分结果概览") }}
+        </div>
+        <div class="result-style-view evaluation-result-style-dashboard" data-result-style-view="dashboard" data-active="false">
+          {{ render_evaluation_dashboard(evaluation_summary, merged_evaluation_summary, task.bid_file.filename) }}
+        </div>
+        <div class="result-style-view evaluation-result-style-report" data-result-style-view="report" data-active="false">
+          {{ render_evaluation_report(evaluation_summary, merged_evaluation_summary, task.bid_file.filename) }}
+        </div>
+      </div>
+    {% endif %}
 
     {% if false %}
 
@@ -943,7 +1427,7 @@
                             {% if material.facts %}
                               <ul>
                                 {% for fact in material.facts %}
-                                  <li>{{ fact.name }}：{{ fact.status }}{% if fact.value %}；{{ fact.value }}{% endif %}（证据：{{ fact.evidence_image_ids|join("、") if fact.evidence_image_ids else "无" }}）</li>
+                                  <li>{{ fact.name }}：{{ business_status(fact.status) }}{% if fact.value %}；{{ fact.value }}{% endif %}（证据：{{ fact.evidence_image_ids|join("、") if fact.evidence_image_ids else "无" }}）</li>
                                 {% endfor %}
                               </ul>
                             {% endif %}
@@ -958,7 +1442,7 @@
                     {% if review.requirements %}
                       <ul class="review-issue-list">
                         {% for requirement in review.requirements %}
-                          <li><strong>{{ requirement.status }}</strong>：{{ requirement.reason }}<br><small>要求：{{ requirement.requirement }}；证据：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
+                          <li><strong>{{ business_status(requirement.status) }}</strong>：{{ requirement.reason }}<br><small>要求：{{ requirement.requirement }}；证据：{{ requirement.evidence_image_ids|join("、") if requirement.evidence_image_ids else "无" }}</small></li>
                         {% endfor %}
                       </ul>
                     {% else %}
@@ -1039,7 +1523,7 @@
                     {% if review.checks %}
                       <ul class="review-issue-list">
                         {% for check in review.checks %}
-                          <li><strong>{{ check.requirement }}：{{ check.status }}</strong>：{{ check.reason }}<br><small>证据：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
+                          <li><strong>{{ check.requirement }}：{{ business_status(check.status) }}</strong>：{{ check.reason }}<br><small>证据：{{ check.evidence_image_ids|join("、") if check.evidence_image_ids else "无" }}</small></li>
                         {% endfor %}
                       </ul>
                     {% else %}
@@ -1139,7 +1623,43 @@
 {% endblock %}
 
 {% block scripts %}
-  {% if task.status == "complete" and task.check_mode != "evaluation" %}
+  {% if task.status == "complete" %}
+    <script>
+      (() => {
+        const switcher = document.querySelector("[data-result-mode-switcher]");
+        if (!switcher) return;
+        const buttons = [...switcher.querySelectorAll("[data-result-mode]")];
+        const views = [...document.querySelectorAll("[data-result-mode-view]")];
+        const modes = buttons.map((button) => button.dataset.resultMode);
+        if (!buttons.length || !views.length) return;
+        const storageKey = `bid-check-result-mode:${document.body.dataset.taskId || "default"}`;
+        let selected = modes[0];
+        try {
+          const stored = window.localStorage.getItem(storageKey);
+          if (modes.includes(stored)) selected = stored;
+        } catch (error) {
+          selected = modes[0];
+        }
+        const applyMode = (mode) => {
+          const activeMode = modes.includes(mode) ? mode : modes[0];
+          buttons.forEach((button) => {
+            const active = button.dataset.resultMode === activeMode;
+            button.setAttribute("aria-selected", String(active));
+            button.setAttribute("aria-pressed", String(active));
+          });
+          views.forEach((view) => {
+            view.dataset.active = String(view.dataset.resultModeView === activeMode);
+          });
+          try {
+            window.localStorage.setItem(storageKey, activeMode);
+          } catch (error) {
+            // Private browsing or disabled storage should not block switching.
+          }
+        };
+        buttons.forEach((button) => button.addEventListener("click", () => applyMode(button.dataset.resultMode)));
+        applyMode(selected);
+      })();
+    </script>
     <script>
       (() => {
         const switcher = document.querySelector("[data-result-style-switcher]");
