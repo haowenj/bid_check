@@ -28,7 +28,6 @@ def test_bid_check_page_has_two_docx_uploads_and_official_modes(client):
     assert "标书合规性校验" in response.text
     assert "评标规则校验" in response.text
     assert "全面校验" in response.text
-    assert response.text.count("开发中") >= 1
     assert "评分+废标检查" not in response.text
     assert 'id="start-check"' in response.text
     assert 'id="start-check" class="button primary" type="submit" disabled' in response.text
@@ -55,6 +54,14 @@ def test_bid_check_page_enables_evaluation_mode_without_promising_scoring(client
     assert "本轮可执行" in response.text
     assert "预计得分" not in response.text
     assert "实际评分" not in response.text
+
+
+def test_bid_check_page_enables_full_mode(client):
+    response = client.get("/bid-check")
+
+    assert response.status_code == 200
+    assert 'input name="check_mode" type="radio" value="full" disabled' not in response.text
+    assert 'value="full"' in response.text
 
 
 def test_task_list_page_shows_tasks_and_links_to_results(

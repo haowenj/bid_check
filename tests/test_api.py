@@ -43,17 +43,23 @@ def test_create_task_rejects_non_docx(client, field):
     assert response.json()["detail"] == "当前仅支持 .docx 文件。"
 
 
-@pytest.mark.parametrize("mode", ["full"])
-def test_development_modes_do_not_create_tasks(client, repository, mode):
+def test_full_mode_creates_task_and_runs_both_check_phases(client, repository):
     response = client.post(
         "/api/bid-check/tasks",
         files=docx_files(),
-        data={"check_mode": mode},
+        data={"check_mode": "full"},
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "该校验方式正在开发中。"
-    assert repository.count() == 0
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["check_mode"] == "full"
+    task = repository.get(payload["task_id"])
+    assert task is not None
+    assert task.status == "complete"
+    assert "review_result" in task.result
+    assert "evaluation_rules" in task.result
+    assert "objective_scores" in task.result
+    assert "veto_rule_reviews" in task.result
 
 
 def test_evaluation_mode_creates_tender_rule_task(client, repository, settings):

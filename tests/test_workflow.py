@@ -41,6 +41,21 @@ def create_evaluation_task(repository, tmp_path):
     )
 
 
+def create_full_task(repository, tmp_path):
+    task_dir = tmp_path / "full-task"
+    task_dir.mkdir()
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    return repository.create(
+        "full-task",
+        FileMetadata("招标文件.docx", tender_path.stat().st_size, str(tender_path)),
+        FileMetadata("投标文件.docx", bid_path.stat().st_size, str(bid_path)),
+        "full",
+    )
+
+
 def test_requirements_and_parse_enter_concurrently(task_repository):
     barrier = Barrier(2, timeout=2)
     entered: list[str] = []
@@ -419,6 +434,148 @@ def test_evaluation_workflow_runs_veto_execution_after_objective_scoring(
     assert completed is not None
     assert completed.result["veto_rule_reviews"] == veto
     assert calls == ["evaluate", "objective", "veto"]
+
+
+def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
+    task_repository, tmp_path
+):
+    calls = []
+    rules = evaluation_result()
+    objective = {"score_items": [], "stats": {"objective_item_count": 0}}
+    veto = {"veto_rule_reviews": [], "stats": {"formal_rule_count": 0}}
+
+    def extract(_tender_file):
+        calls.append("extract")
+        return empty_objects()
+
+    def parse(_bid_file):
+        calls.append("parse")
+        return {"status": "success"}
+
+    def review(_requirements, _parsed_bid):
+        calls.append("review")
+        return {"mode": "compliance"}
+
+    def evaluate(_tender_file, recorder=None):
+        del recorder
+        assert calls[-1] == "review"
+        calls.append("evaluate")
+        return rules
+
+    def score(_tender_file, _bid_file, evaluation_rules, recorder=None):
+        del recorder
+        assert evaluation_rules is rules
+        assert calls[-1] == "evaluate"
+        calls.append("objective")
+        return objective
+
+    def execute(
+        _tender_file,
+        _bid_file,
+        evaluation_rules,
+        *,
+        objective_scores=None,
+        recorder=None,
+    ):
+        del recorder
+        assert evaluation_rules is rules
+        assert objective_scores is objective
+        assert calls[-1] == "objective"
+        calls.append("veto")
+        return veto
+
+    services = BidCheckServices(
+        extract=extract,
+        parse=parse,
+        review=review,
+        extract_evaluation_with_recorder=evaluate,
+        score_objective_with_recorder=score,
+        execute_veto_with_recorder=execute,
+    )
+    task = create_full_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    completed = task_repository.get(task.task_id)
+    assert completed is not None
+    assert completed.status == "complete"
+    assert completed.requirements_status == "complete"
+    assert completed.bid_parse_status == "complete"
+    assert completed.review_status == "complete"
+    assert completed.result["review_result"] == {"mode": "compliance"}
+    assert completed.result["evaluation_rules"] is not None
+    assert completed.result["objective_scores"] == objective
+    assert completed.result["veto_rule_reviews"] == veto
+    assert calls[-4:] == ["review", "evaluate", "objective", "veto"]
+
+
+def test_full_workflow_does_not_start_evaluation_when_compliance_fails(
+    task_repository, tmp_path
+):
+    calls = []
+
+    def fail_review(_requirements, _parsed_bid):
+        calls.append("review")
+        raise RuntimeError("合规阶段失败")
+
+    services = BidCheckServices(
+        extract=lambda _file: empty_objects(),
+        parse=lambda _file: {"status": "success"},
+        review=fail_review,
+        extract_evaluation_with_recorder=lambda *_args, **_kwargs: calls.append(
+            "evaluate"
+        ),
+        score_objective_with_recorder=lambda *_args, **_kwargs: calls.append(
+            "objective"
+        ),
+        execute_veto_with_recorder=lambda *_args, **_kwargs: calls.append("veto"),
+    )
+    task = create_full_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    failed = task_repository.get(task.task_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.failed_stage == "review"
+    assert failed.error_message == "合规阶段失败"
+    assert calls == ["review"]
+
+
+def test_full_workflow_keeps_compliance_result_when_evaluation_fails(
+    task_repository, tmp_path
+):
+    compliance_result = {"mode": "compliance", "issues": ["kept"]}
+
+    def fail_score(*_args, **_kwargs):
+        raise RuntimeError("评分阶段失败")
+
+    services = BidCheckServices(
+        extract=lambda _file: empty_objects(),
+        parse=lambda _file: {"status": "success"},
+        review=lambda _requirements, _parsed_bid: compliance_result,
+        extract_evaluation_with_recorder=lambda _file, recorder=None: evaluation_result(),
+        score_objective_with_recorder=fail_score,
+    )
+    task = create_full_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    failed = task_repository.get(task.task_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.failed_stage == "review"
+    assert failed.error_message == "评分阶段失败"
+    assert failed.result["review_result"] == compliance_result
 
 
 def test_run_subjective_does_not_call_other_evaluation_stages(

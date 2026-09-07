@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
-from app.models import FileMetadata, StageName
+from app.models import BidCheckTask, FileMetadata, StageName
 from app.repository import BidCheckRepository
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,8 @@ class BidCheckWorkflow:
             "requirements_elapsed_ms": None,
             "bid_parse_elapsed_ms": None,
             "review_elapsed_ms": None,
+            "evaluation_rules_elapsed_ms": None,
+            "evaluation_elapsed_ms": None,
             "objective_scoring_elapsed_ms": None,
             "veto_rule_execution_elapsed_ms": None,
             "total_elapsed_ms": None,
@@ -145,224 +147,17 @@ class BidCheckWorkflow:
         record_event("workflow.run.start", task_id=task_id)
 
         if task.check_mode == "evaluation":
-            evaluation_started_at = time.perf_counter()
-            record_event(
-                "workflow.stage.start",
-                stage="requirements",
-                task_id=task_id,
-                file=task.tender_file.filename,
+            self._run_evaluation_phase(
+                task_id,
+                task,
+                recorder=recorder,
+                workflow_stats=workflow_stats,
+                record_event=record_event,
+                finalize_workflow=finalize_workflow,
+                started_at=started_at,
                 mode="evaluation",
             )
-            logger.info(
-                "workflow.stage.start stage=requirements mode=evaluation task_id=%s file=%s",
-                task_id,
-                task.tender_file.filename,
-            )
-            self.repository.update_stage(task_id, "requirements", "running")
-            try:
-                if self.services.extract_evaluation_with_recorder is None:
-                    raise RuntimeError("evaluation extractor not configured")
-                evaluation_result = self.services.extract_evaluation_with_recorder(
-                    task.tender_file,
-                    recorder=recorder,
-                )
-                requirements_elapsed_ms = _elapsed_ms(evaluation_started_at)
-                workflow_stats["requirements_elapsed_ms"] = requirements_elapsed_ms
-                self.repository.update_stage(task_id, "requirements", "complete")
-                record_event(
-                    "workflow.stage.end",
-                    stage="requirements",
-                    task_id=task_id,
-                    mode="evaluation",
-                    status="complete",
-                    result=_result_summary(evaluation_result),
-                    elapsed_ms=requirements_elapsed_ms,
-                )
-                self.repository.update_stage(task_id, "bid_parse", "complete")
-                workflow_stats["bid_parse_elapsed_ms"] = 0
-                record_event(
-                    "workflow.stage.skip",
-                    stage="bid_parse",
-                    task_id=task_id,
-                    mode="evaluation",
-                    reason="evaluation_mode_does_not_use_bid_file",
-                )
-                objective_scores = None
-                if self.services.score_objective_with_recorder is not None:
-                    scoring_started_at = time.perf_counter()
-                    record_event(
-                        "workflow.stage.start",
-                        stage="objective_scoring",
-                        task_id=task_id,
-                        mode="evaluation",
-                        file=task.bid_file.filename,
-                    )
-                    try:
-                        objective_scores = self.services.score_objective_with_recorder(
-                            task.tender_file,
-                            task.bid_file,
-                            evaluation_result,
-                            recorder=recorder,
-                        )
-                        scoring_elapsed_ms = _elapsed_ms(scoring_started_at)
-                        workflow_stats["objective_scoring_elapsed_ms"] = scoring_elapsed_ms
-                        record_event(
-                            "workflow.stage.end",
-                            stage="objective_scoring",
-                            task_id=task_id,
-                            mode="evaluation",
-                            status="complete",
-                            result=_result_summary(objective_scores),
-                            elapsed_ms=scoring_elapsed_ms,
-                        )
-                    except Exception as scoring_error:
-                        scoring_elapsed_ms = _elapsed_ms(scoring_started_at)
-                        workflow_stats["objective_scoring_elapsed_ms"] = scoring_elapsed_ms
-                        record_event(
-                            "workflow.stage.error",
-                            stage="objective_scoring",
-                            task_id=task_id,
-                            mode="evaluation",
-                            status="failed",
-                            error_type=type(scoring_error).__name__,
-                            error_message=str(scoring_error),
-                            elapsed_ms=scoring_elapsed_ms,
-                        )
-                        self.repository.fail(task_id, "review", str(scoring_error))
-                        finalize_workflow(
-                            status="failed",
-                            failed_stage="review",
-                            error=scoring_error,
-                        )
-                        logger.error(
-                            "workflow.stage.error stage=objective_scoring mode=evaluation task_id=%s error_type=%s elapsed_ms=%d",
-                            task_id,
-                            type(scoring_error).__name__,
-                            scoring_elapsed_ms,
-                        )
-                        return
-                veto_rule_reviews = None
-                if self.services.execute_veto_with_recorder is not None:
-                    veto_started_at = time.perf_counter()
-                    record_event(
-                        "workflow.stage.start",
-                        stage="veto_rule_execution",
-                        task_id=task_id,
-                        mode="evaluation",
-                        file=task.bid_file.filename,
-                    )
-                    try:
-                        veto_rule_reviews = self.services.execute_veto_with_recorder(
-                            task.tender_file,
-                            task.bid_file,
-                            evaluation_result,
-                            objective_scores=objective_scores,
-                            recorder=recorder,
-                        )
-                        veto_elapsed_ms = _elapsed_ms(veto_started_at)
-                        workflow_stats[
-                            "veto_rule_execution_elapsed_ms"
-                        ] = veto_elapsed_ms
-                        record_event(
-                            "workflow.stage.end",
-                            stage="veto_rule_execution",
-                            task_id=task_id,
-                            mode="evaluation",
-                            status="complete",
-                            result=_result_summary(veto_rule_reviews),
-                            elapsed_ms=veto_elapsed_ms,
-                        )
-                    except Exception as veto_error:
-                        veto_elapsed_ms = _elapsed_ms(veto_started_at)
-                        workflow_stats[
-                            "veto_rule_execution_elapsed_ms"
-                        ] = veto_elapsed_ms
-                        record_event(
-                            "workflow.stage.error",
-                            stage="veto_rule_execution",
-                            task_id=task_id,
-                            mode="evaluation",
-                            status="failed",
-                            error_type=type(veto_error).__name__,
-                            error_message=str(veto_error),
-                            elapsed_ms=veto_elapsed_ms,
-                        )
-                        self.repository.fail(task_id, "review", str(veto_error))
-                        finalize_workflow(
-                            status="failed",
-                            failed_stage="review",
-                            error=veto_error,
-                        )
-                        logger.error(
-                            "workflow.stage.error stage=veto_rule_execution mode=evaluation task_id=%s error_type=%s elapsed_ms=%d",
-                            task_id,
-                            type(veto_error).__name__,
-                            veto_elapsed_ms,
-                        )
-                        return
-
-                self.repository.complete(
-                    task_id,
-                    {
-                        "evaluation_rules": evaluation_result,
-                        **(
-                            {"objective_scores": objective_scores}
-                            if objective_scores is not None
-                            else {}
-                        ),
-                        **(
-                            {"veto_rule_reviews": veto_rule_reviews}
-                            if veto_rule_reviews is not None
-                            else {}
-                        ),
-                    },
-                )
-                workflow_stats["review_elapsed_ms"] = 0
-                record_event(
-                    "workflow.review.skip",
-                    task_id=task_id,
-                    mode="evaluation",
-                    reason=(
-                        "evaluation_mode_does_not_run_subjective_scoring"
-                        if veto_rule_reviews is not None
-                        else "evaluation_mode_does_not_run_subjective_or_veto_scoring"
-                    ),
-                )
-                finalize_workflow(status="complete")
-                logger.info(
-                    "workflow.run.end status=complete mode=evaluation task_id=%s elapsed_ms=%d",
-                    task_id,
-                    _elapsed_ms(started_at),
-                )
-                return
-            except Exception as exc:
-                failed_stage = "requirements"
-                failure = exc
-                self.repository.fail(task_id, "requirements", str(exc))
-                requirements_elapsed_ms = _elapsed_ms(evaluation_started_at)
-                workflow_stats["requirements_elapsed_ms"] = requirements_elapsed_ms
-                record_event(
-                    "workflow.stage.error",
-                    stage="requirements",
-                    task_id=task_id,
-                    mode="evaluation",
-                    status="failed",
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    elapsed_ms=requirements_elapsed_ms,
-                )
-                finalize_workflow(
-                    status="failed",
-                    failed_stage=failed_stage,
-                    error=failure,
-                )
-                logger.error(
-                    "workflow.stage.error stage=requirements mode=evaluation task_id=%s error_type=%s elapsed_ms=%d",
-                    task_id,
-                    type(exc).__name__,
-                    _elapsed_ms(evaluation_started_at),
-                )
-                return
+            return
 
         stage_started_at = {
             "requirements": time.perf_counter(),
@@ -494,14 +289,34 @@ class BidCheckWorkflow:
                     outputs["requirements"],
                     bid_parse_for_review,
                 )
-            self.repository.complete(
-                task_id,
-                {
-                    **outputs["requirements"],
-                    "bid_parse": outputs["bid_parse"],
-                    "review_result": review_result,
-                },
-            )
+            compliance_result = {
+                **outputs["requirements"],
+                "bid_parse": outputs["bid_parse"],
+                "review_result": review_result,
+            }
+            if task.check_mode == "full":
+                self.repository.update_stage(task_id, "review", "complete")
+                self.repository.update_result(task_id, compliance_result)
+                record_event(
+                    "workflow.compliance.end",
+                    task_id=task_id,
+                    mode="full",
+                    status="complete",
+                    result=_result_summary(review_result),
+                )
+                self._run_evaluation_phase(
+                    task_id,
+                    task,
+                    recorder=recorder,
+                    workflow_stats=workflow_stats,
+                    record_event=record_event,
+                    finalize_workflow=finalize_workflow,
+                    started_at=started_at,
+                    mode="full",
+                    initial_result=compliance_result,
+                )
+                return
+            self.repository.complete(task_id, compliance_result)
             review_elapsed_ms = _elapsed_ms(review_started_at)
             workflow_stats["review_elapsed_ms"] = review_elapsed_ms
             record_event(
@@ -553,6 +368,272 @@ class BidCheckWorkflow:
                 task_id,
                 _elapsed_ms(started_at),
             )
+
+    def _run_evaluation_phase(
+        self,
+        task_id: str,
+        task: BidCheckTask,
+        *,
+        recorder: ComplianceExtractionRecorder | None,
+        workflow_stats: dict[str, Any],
+        record_event: Callable[..., None],
+        finalize_workflow: Callable[..., None],
+        started_at: float,
+        mode: str,
+        initial_result: dict[str, Any] | None = None,
+    ) -> None:
+        """Run the existing evaluation flow, optionally after compliance."""
+
+        evaluation_started_at = time.perf_counter()
+        standalone = mode == "evaluation"
+        extraction_stage = "requirements" if standalone else "evaluation_rules"
+        failure_stage: StageName = "requirements" if standalone else "review"
+        elapsed_stat = (
+            "requirements_elapsed_ms"
+            if standalone
+            else "evaluation_rules_elapsed_ms"
+        )
+
+        def set_evaluation_elapsed() -> int:
+            elapsed_ms = _elapsed_ms(evaluation_started_at)
+            workflow_stats["evaluation_elapsed_ms"] = elapsed_ms
+            return elapsed_ms
+
+        record_event("workflow.evaluation.start", task_id=task_id, mode=mode)
+        record_event(
+            "workflow.stage.start",
+            stage=extraction_stage,
+            task_id=task_id,
+            file=task.tender_file.filename,
+            mode=mode,
+        )
+        logger.info(
+            "workflow.stage.start stage=%s mode=%s task_id=%s file=%s",
+            extraction_stage,
+            mode,
+            task_id,
+            task.tender_file.filename,
+        )
+        if standalone:
+            self.repository.update_stage(task_id, "requirements", "running")
+
+        try:
+            if self.services.extract_evaluation_with_recorder is None:
+                raise RuntimeError("evaluation extractor not configured")
+            evaluation_result = self.services.extract_evaluation_with_recorder(
+                task.tender_file,
+                recorder=recorder,
+            )
+            extraction_elapsed_ms = _elapsed_ms(evaluation_started_at)
+            workflow_stats[elapsed_stat] = extraction_elapsed_ms
+            if standalone:
+                self.repository.update_stage(task_id, "requirements", "complete")
+                self.repository.update_stage(task_id, "bid_parse", "complete")
+                workflow_stats["bid_parse_elapsed_ms"] = 0
+                record_event(
+                    "workflow.stage.skip",
+                    stage="bid_parse",
+                    task_id=task_id,
+                    mode=mode,
+                    reason="evaluation_mode_does_not_use_bid_file",
+                )
+            record_event(
+                "workflow.stage.end",
+                stage=extraction_stage,
+                task_id=task_id,
+                mode=mode,
+                status="complete",
+                result=_result_summary(evaluation_result),
+                elapsed_ms=extraction_elapsed_ms,
+            )
+            if not standalone:
+                self.repository.update_result(
+                    task_id,
+                    {"evaluation_rules": evaluation_result},
+                )
+        except Exception as exc:
+            extraction_elapsed_ms = _elapsed_ms(evaluation_started_at)
+            workflow_stats[elapsed_stat] = extraction_elapsed_ms
+            set_evaluation_elapsed()
+            record_event(
+                "workflow.stage.error",
+                stage=extraction_stage,
+                task_id=task_id,
+                mode=mode,
+                status="failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                elapsed_ms=extraction_elapsed_ms,
+            )
+            self.repository.fail(task_id, failure_stage, str(exc))
+            finalize_workflow(
+                status="failed",
+                failed_stage=failure_stage,
+                error=exc,
+            )
+            logger.error(
+                "workflow.stage.error stage=%s mode=%s task_id=%s error_type=%s elapsed_ms=%d",
+                extraction_stage,
+                mode,
+                task_id,
+                type(exc).__name__,
+                extraction_elapsed_ms,
+            )
+            return
+
+        objective_scores = None
+        if self.services.score_objective_with_recorder is not None:
+            scoring_started_at = time.perf_counter()
+            record_event(
+                "workflow.stage.start",
+                stage="objective_scoring",
+                task_id=task_id,
+                mode=mode,
+                file=task.bid_file.filename,
+            )
+            try:
+                objective_scores = self.services.score_objective_with_recorder(
+                    task.tender_file,
+                    task.bid_file,
+                    evaluation_result,
+                    recorder=recorder,
+                )
+                scoring_elapsed_ms = _elapsed_ms(scoring_started_at)
+                workflow_stats["objective_scoring_elapsed_ms"] = scoring_elapsed_ms
+                record_event(
+                    "workflow.stage.end",
+                    stage="objective_scoring",
+                    task_id=task_id,
+                    mode=mode,
+                    status="complete",
+                    result=_result_summary(objective_scores),
+                    elapsed_ms=scoring_elapsed_ms,
+                )
+                if not standalone:
+                    self.repository.update_result(
+                        task_id,
+                        {"objective_scores": objective_scores},
+                    )
+            except Exception as scoring_error:
+                scoring_elapsed_ms = _elapsed_ms(scoring_started_at)
+                workflow_stats["objective_scoring_elapsed_ms"] = scoring_elapsed_ms
+                set_evaluation_elapsed()
+                record_event(
+                    "workflow.stage.error",
+                    stage="objective_scoring",
+                    task_id=task_id,
+                    mode=mode,
+                    status="failed",
+                    error_type=type(scoring_error).__name__,
+                    error_message=str(scoring_error),
+                    elapsed_ms=scoring_elapsed_ms,
+                )
+                self.repository.fail(task_id, "review", str(scoring_error))
+                finalize_workflow(
+                    status="failed",
+                    failed_stage="review",
+                    error=scoring_error,
+                )
+                logger.error(
+                    "workflow.stage.error stage=objective_scoring mode=%s task_id=%s error_type=%s elapsed_ms=%d",
+                    mode,
+                    task_id,
+                    type(scoring_error).__name__,
+                    scoring_elapsed_ms,
+                )
+                return
+
+        veto_rule_reviews = None
+        if self.services.execute_veto_with_recorder is not None:
+            veto_started_at = time.perf_counter()
+            record_event(
+                "workflow.stage.start",
+                stage="veto_rule_execution",
+                task_id=task_id,
+                mode=mode,
+                file=task.bid_file.filename,
+            )
+            try:
+                veto_rule_reviews = self.services.execute_veto_with_recorder(
+                    task.tender_file,
+                    task.bid_file,
+                    evaluation_result,
+                    objective_scores=objective_scores,
+                    recorder=recorder,
+                )
+                veto_elapsed_ms = _elapsed_ms(veto_started_at)
+                workflow_stats["veto_rule_execution_elapsed_ms"] = veto_elapsed_ms
+                record_event(
+                    "workflow.stage.end",
+                    stage="veto_rule_execution",
+                    task_id=task_id,
+                    mode=mode,
+                    status="complete",
+                    result=_result_summary(veto_rule_reviews),
+                    elapsed_ms=veto_elapsed_ms,
+                )
+                if not standalone:
+                    self.repository.update_result(
+                        task_id,
+                        {"veto_rule_reviews": veto_rule_reviews},
+                    )
+            except Exception as veto_error:
+                veto_elapsed_ms = _elapsed_ms(veto_started_at)
+                workflow_stats["veto_rule_execution_elapsed_ms"] = veto_elapsed_ms
+                set_evaluation_elapsed()
+                record_event(
+                    "workflow.stage.error",
+                    stage="veto_rule_execution",
+                    task_id=task_id,
+                    mode=mode,
+                    status="failed",
+                    error_type=type(veto_error).__name__,
+                    error_message=str(veto_error),
+                    elapsed_ms=veto_elapsed_ms,
+                )
+                self.repository.fail(task_id, "review", str(veto_error))
+                finalize_workflow(
+                    status="failed",
+                    failed_stage="review",
+                    error=veto_error,
+                )
+                logger.error(
+                    "workflow.stage.error stage=veto_rule_execution mode=%s task_id=%s error_type=%s elapsed_ms=%d",
+                    mode,
+                    task_id,
+                    type(veto_error).__name__,
+                    veto_elapsed_ms,
+                )
+                return
+
+        final_result = dict(initial_result or {})
+        final_result["evaluation_rules"] = evaluation_result
+        if objective_scores is not None:
+            final_result["objective_scores"] = objective_scores
+        if veto_rule_reviews is not None:
+            final_result["veto_rule_reviews"] = veto_rule_reviews
+        self.repository.complete(task_id, final_result)
+        if standalone:
+            workflow_stats["review_elapsed_ms"] = 0
+        set_evaluation_elapsed()
+        record_event(
+            "workflow.review.skip",
+            task_id=task_id,
+            mode=mode,
+            reason=(
+                "evaluation_mode_does_not_run_subjective_scoring"
+                if veto_rule_reviews is not None
+                else "evaluation_mode_does_not_run_subjective_or_veto_scoring"
+            ),
+        )
+        record_event("workflow.evaluation.end", task_id=task_id, mode=mode)
+        finalize_workflow(status="complete")
+        logger.info(
+            "workflow.run.end status=complete mode=%s task_id=%s elapsed_ms=%d",
+            mode,
+            task_id,
+            _elapsed_ms(started_at),
+        )
 
     def run_subjective(self, task_id: str) -> None:
         started_at = time.perf_counter()

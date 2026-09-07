@@ -89,7 +89,7 @@
           <span class="section-number">02</span>
           <h2 id="mode-heading">选择校验方式</h2>
         </div>
-        <p>当前开放招标文件规则提取和标书合规性校验</p>
+        <p>当前开放标书合规性校验、评标规则校验和全面校验</p>
       </div>
 
       <div class="mode-grid">
@@ -116,10 +116,10 @@
           </span>
         </label>
 
-        <label class="mode-card mode-disabled" aria-disabled="true">
-          <input name="check_mode" type="radio" value="full" disabled>
+        <label class="mode-card mode-available">
+          <input name="check_mode" type="radio" value="full" required>
           <span class="mode-radio" aria-hidden="true"></span>
-          <span class="mode-status">开发中</span>
+          <span class="mode-status available">本轮可执行</span>
           <strong>全面校验</strong>
           <span class="mode-description">
             同时执行标书合规性校验和评标规则校验。
@@ -130,7 +130,7 @@
 
     <div id="form-error" class="error" role="alert" hidden></div>
     <div class="form-actions">
-      <p>文件仅用于当前任务，第一版不会调用任何模型或真实解析器。</p>
+      <p>文件仅用于当前任务，系统将按所选校验方式执行对应检查流程。</p>
       <button id="start-check" class="button primary" type="submit" disabled>
         开始校验
         <span aria-hidden="true">→</span>

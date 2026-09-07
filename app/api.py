@@ -804,7 +804,7 @@ def create_app(
         bid_file: UploadFile = File(...),
         check_mode: CheckModeInput = Form(...),
     ):
-        if check_mode not in {"compliance", "evaluation"}:
+        if check_mode not in {"compliance", "evaluation", "full"}:
             raise HTTPException(
                 status_code=409,
                 detail="该校验方式正在开发中。",
