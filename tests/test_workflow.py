@@ -442,6 +442,7 @@ def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
     calls = []
     rules = evaluation_result()
     objective = {"score_items": [], "stats": {"objective_item_count": 0}}
+    subjective = {"score_items": [], "stats": {"subjective_item_count": 0}}
     veto = {"veto_rule_reviews": [], "stats": {"formal_rule_count": 0}}
 
     def extract(_tender_file):
@@ -469,6 +470,15 @@ def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
         calls.append("objective")
         return objective
 
+    def score_subjective(
+        _tender_file, _bid_file, evaluation_rules, recorder=None
+    ):
+        del recorder
+        assert evaluation_rules is rules
+        assert calls[-1] == "objective"
+        calls.append("subjective")
+        return subjective
+
     def execute(
         _tender_file,
         _bid_file,
@@ -480,7 +490,7 @@ def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
         del recorder
         assert evaluation_rules is rules
         assert objective_scores is objective
-        assert calls[-1] == "objective"
+        assert calls[-1] == "subjective"
         calls.append("veto")
         return veto
 
@@ -490,6 +500,7 @@ def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
         review=review,
         extract_evaluation_with_recorder=evaluate,
         score_objective_with_recorder=score,
+        score_subjective_with_recorder=score_subjective,
         execute_veto_with_recorder=execute,
     )
     task = create_full_task(task_repository, tmp_path)
@@ -508,8 +519,9 @@ def test_full_workflow_runs_compliance_then_evaluation_and_merges_results(
     assert completed.result["review_result"] == {"mode": "compliance"}
     assert completed.result["evaluation_rules"] is not None
     assert completed.result["objective_scores"] == objective
+    assert completed.result["subjective_scores"] == subjective
     assert completed.result["veto_rule_reviews"] == veto
-    assert calls[-4:] == ["review", "evaluate", "objective", "veto"]
+    assert calls[-5:] == ["review", "evaluate", "objective", "subjective", "veto"]
 
 
 def test_full_workflow_does_not_start_evaluation_when_compliance_fails(
@@ -576,6 +588,45 @@ def test_full_workflow_keeps_compliance_result_when_evaluation_fails(
     assert failed.failed_stage == "review"
     assert failed.error_message == "评分阶段失败"
     assert failed.result["review_result"] == compliance_result
+
+
+def test_full_workflow_keeps_prior_results_when_subjective_scoring_fails(
+    task_repository, tmp_path
+):
+    compliance_result = {"mode": "compliance", "issues": ["kept"]}
+    rules = evaluation_result()
+    objective = {"score_items": [], "stats": {"objective_item_count": 0}}
+    calls = []
+
+    def score_subjective(*_args, **_kwargs):
+        calls.append("subjective")
+        raise RuntimeError("主观评分阶段失败")
+
+    services = BidCheckServices(
+        extract=lambda _file: empty_objects(),
+        parse=lambda _file: {"status": "success"},
+        review=lambda _requirements, _parsed_bid: compliance_result,
+        extract_evaluation_with_recorder=lambda _file, recorder=None: rules,
+        score_objective_with_recorder=lambda *_args, **_kwargs: objective,
+        score_subjective_with_recorder=score_subjective,
+        execute_veto_with_recorder=lambda *_args, **_kwargs: calls.append("veto"),
+    )
+    task = create_full_task(task_repository, tmp_path)
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    failed = task_repository.get(task.task_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.failed_stage == "review"
+    assert failed.error_message == "主观评分阶段失败"
+    assert failed.result["review_result"] == compliance_result
+    assert failed.result["evaluation_rules"] == rules
+    assert failed.result["objective_scores"] == objective
+    assert calls == ["subjective"]
 
 
 def test_run_subjective_does_not_call_other_evaluation_stages(

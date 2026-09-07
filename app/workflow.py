@@ -93,6 +93,7 @@ class BidCheckWorkflow:
             "evaluation_rules_elapsed_ms": None,
             "evaluation_elapsed_ms": None,
             "objective_scoring_elapsed_ms": None,
+            "subjective_scoring_elapsed_ms": None,
             "veto_rule_execution_elapsed_ms": None,
             "total_elapsed_ms": None,
         }
@@ -543,6 +544,73 @@ class BidCheckWorkflow:
                 )
                 return
 
+        subjective_scores = None
+        if not standalone:
+            subjective_started_at = time.perf_counter()
+            record_event(
+                "workflow.stage.start",
+                stage="subjective_scoring",
+                task_id=task_id,
+                mode=mode,
+                file=task.bid_file.filename,
+            )
+            try:
+                if self.services.score_subjective_with_recorder is None:
+                    raise RuntimeError("subjective scoring service not configured")
+                subjective_scores = self.services.score_subjective_with_recorder(
+                    task.tender_file,
+                    task.bid_file,
+                    evaluation_result,
+                    recorder=recorder,
+                )
+                subjective_elapsed_ms = _elapsed_ms(subjective_started_at)
+                workflow_stats["subjective_scoring_elapsed_ms"] = (
+                    subjective_elapsed_ms
+                )
+                record_event(
+                    "workflow.stage.end",
+                    stage="subjective_scoring",
+                    task_id=task_id,
+                    mode=mode,
+                    status="complete",
+                    result=_result_summary(subjective_scores),
+                    elapsed_ms=subjective_elapsed_ms,
+                )
+                self.repository.update_result(
+                    task_id,
+                    {"subjective_scores": subjective_scores},
+                )
+            except Exception as subjective_error:
+                subjective_elapsed_ms = _elapsed_ms(subjective_started_at)
+                workflow_stats["subjective_scoring_elapsed_ms"] = (
+                    subjective_elapsed_ms
+                )
+                set_evaluation_elapsed()
+                record_event(
+                    "workflow.stage.error",
+                    stage="subjective_scoring",
+                    task_id=task_id,
+                    mode=mode,
+                    status="failed",
+                    error_type=type(subjective_error).__name__,
+                    error_message=str(subjective_error),
+                    elapsed_ms=subjective_elapsed_ms,
+                )
+                self.repository.fail(task_id, "review", str(subjective_error))
+                finalize_workflow(
+                    status="failed",
+                    failed_stage="review",
+                    error=subjective_error,
+                )
+                logger.error(
+                    "workflow.stage.error stage=subjective_scoring mode=%s task_id=%s error_type=%s elapsed_ms=%d",
+                    mode,
+                    task_id,
+                    type(subjective_error).__name__,
+                    subjective_elapsed_ms,
+                )
+                return
+
         veto_rule_reviews = None
         if self.services.execute_veto_with_recorder is not None:
             veto_started_at = time.perf_counter()
@@ -610,22 +678,25 @@ class BidCheckWorkflow:
         final_result["evaluation_rules"] = evaluation_result
         if objective_scores is not None:
             final_result["objective_scores"] = objective_scores
+        if subjective_scores is not None:
+            final_result["subjective_scores"] = subjective_scores
         if veto_rule_reviews is not None:
             final_result["veto_rule_reviews"] = veto_rule_reviews
         self.repository.complete(task_id, final_result)
         if standalone:
             workflow_stats["review_elapsed_ms"] = 0
         set_evaluation_elapsed()
-        record_event(
-            "workflow.review.skip",
-            task_id=task_id,
-            mode=mode,
-            reason=(
-                "evaluation_mode_does_not_run_subjective_scoring"
-                if veto_rule_reviews is not None
-                else "evaluation_mode_does_not_run_subjective_or_veto_scoring"
-            ),
-        )
+        if standalone:
+            record_event(
+                "workflow.review.skip",
+                task_id=task_id,
+                mode=mode,
+                reason=(
+                    "evaluation_mode_does_not_run_subjective_scoring"
+                    if veto_rule_reviews is not None
+                    else "evaluation_mode_does_not_run_subjective_or_veto_scoring"
+                ),
+            )
         record_event("workflow.evaluation.end", task_id=task_id, mode=mode)
         finalize_workflow(status="complete")
         logger.info(

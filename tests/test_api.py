@@ -59,6 +59,7 @@ def test_full_mode_creates_task_and_runs_both_check_phases(client, repository):
     assert "review_result" in task.result
     assert "evaluation_rules" in task.result
     assert "objective_scores" in task.result
+    assert "subjective_scores" in task.result
     assert "veto_rule_reviews" in task.result
 
 
