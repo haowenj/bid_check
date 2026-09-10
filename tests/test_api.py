@@ -124,6 +124,68 @@ def test_get_unknown_task_returns_404(client):
     assert response.json()["detail"] == "标书检查任务不存在。"
 
 
+def test_retry_failed_task_from_failed_stage_returns_same_task_and_202(
+    client, repository, stored_task, workflow
+):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.update_result(
+        stored_task.task_id,
+        {"requirements": {"saved": True}, "bid_parse": {"saved": True}},
+    )
+    repository.fail(stored_task.task_id, "review", "合规检查失败")
+
+    with patch.object(workflow, "run") as run:
+        response = client.post(
+            f"/api/bid-check/tasks/{stored_task.task_id}/retry",
+            json={"retry_from": "failed_stage"},
+        )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["task_id"] == stored_task.task_id
+    assert payload["status"] == "pending"
+    assert repository.get(stored_task.task_id).task_id == stored_task.task_id
+    run.assert_called_once_with(stored_task.task_id, retry_from="review")
+
+
+def test_retry_rejects_running_task(client, repository, stored_task):
+    repository.update_stage(stored_task.task_id, "requirements", "running")
+
+    response = client.post(
+        f"/api/bid-check/tasks/{stored_task.task_id}/retry",
+        json={"retry_from": "start"},
+    )
+
+    assert response.status_code == 409
+    assert "失败" in response.json()["detail"]
+
+
+def test_retry_rejects_invalid_choice(client, repository, stored_task):
+    repository.fail(stored_task.task_id, "requirements", "要求提取失败")
+
+    response = client.post(
+        f"/api/bid-check/tasks/{stored_task.task_id}/retry",
+        json={"retry_from": "middle"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_retry_from_failed_stage_rejects_missing_prefix_artifact(
+    client, repository, stored_task
+):
+    repository.fail(stored_task.task_id, "review", "合规检查失败")
+
+    response = client.post(
+        f"/api/bid-check/tasks/{stored_task.task_id}/retry",
+        json={"retry_from": "failed_stage"},
+    )
+
+    assert response.status_code == 409
+    assert "从头开始" in response.json()["detail"]
+
+
 def test_subjective_score_endpoint_rejects_non_evaluation_task(client, stored_task):
     response = client.post(
         f"/api/bid-check/tasks/{stored_task.task_id}/subjective-score"
