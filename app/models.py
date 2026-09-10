@@ -5,7 +5,16 @@ from typing import Any, Literal, TypedDict
 
 CheckMode = Literal["compliance", "evaluation", "full"]
 TaskStatus = Literal["pending", "running", "complete", "failed"]
-StageName = Literal["requirements", "bid_parse", "review"]
+StageName = Literal[
+    "requirements",
+    "bid_parse",
+    "review",
+    "evaluation_rules",
+    "objective_scoring",
+    "subjective_scoring",
+    "veto_rule_execution",
+]
+RetryFrom = Literal["start", "failed_stage"]
 
 
 class TenderSource(TypedDict):
@@ -151,6 +160,10 @@ class BidCheckTask:
     requirements_status: TaskStatus
     bid_parse_status: TaskStatus
     review_status: TaskStatus
+    evaluation_rules_status: TaskStatus
+    objective_scoring_status: TaskStatus
+    subjective_scoring_status: TaskStatus
+    veto_rule_execution_status: TaskStatus
     failed_stage: StageName | None
     error_message: str | None
     result: dict[str, Any] | None
@@ -167,6 +180,10 @@ class BidCheckTask:
             "requirements_status": self.requirements_status,
             "bid_parse_status": self.bid_parse_status,
             "review_status": self.review_status,
+            "evaluation_rules_status": self.evaluation_rules_status,
+            "objective_scoring_status": self.objective_scoring_status,
+            "subjective_scoring_status": self.subjective_scoring_status,
+            "veto_rule_execution_status": self.veto_rule_execution_status,
             "failed_stage": self.failed_stage,
             "error_message": self.error_message,
             "created_at": self.created_at,

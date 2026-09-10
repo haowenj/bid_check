@@ -1,3 +1,5 @@
+import pytest
+
 from app.models import FileMetadata
 from app.repository import BidCheckRepository
 
@@ -112,6 +114,81 @@ def test_fail_records_failed_stage_and_message(tmp_path):
     assert failed.bid_parse_status == "failed"
     assert failed.failed_stage == "bid_parse"
     assert failed.error_message == "模拟投标文件解析失败"
+
+
+def test_prepare_retry_from_failed_stage_preserves_previous_results(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "full")
+    repository.update_stage("task-001", "requirements", "complete")
+    repository.update_stage("task-001", "bid_parse", "complete")
+    repository.update_stage("task-001", "review", "complete")
+    repository.update_stage("task-001", "evaluation_rules", "complete")
+    repository.update_result(
+        "task-001",
+        {
+            "requirements": {"id": "requirements-ok"},
+            "bid_parse": {"id": "bid-parse-ok"},
+            "review_result": {"id": "review-ok"},
+            "evaluation_rules": {"id": "rules-old"},
+            "objective_scores": {"id": "scores-old"},
+        },
+    )
+    repository.fail("task-001", "objective_scoring", "评分服务失败")
+
+    retried = repository.prepare_retry("task-001", "failed_stage")
+
+    assert retried.task_id == "task-001"
+    assert retried.status == "pending"
+    assert retried.requirements_status == "complete"
+    assert retried.bid_parse_status == "complete"
+    assert retried.review_status == "complete"
+    assert retried.evaluation_rules_status == "complete"
+    assert retried.objective_scoring_status == "pending"
+    assert retried.result == {
+        "requirements": {"id": "requirements-ok"},
+        "bid_parse": {"id": "bid-parse-ok"},
+        "review_result": {"id": "review-ok"},
+        "evaluation_rules": {"id": "rules-old"},
+    }
+    assert retried.failed_stage is None
+    assert retried.error_message is None
+
+
+def test_prepare_retry_from_start_resets_all_derived_states_and_results(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "full")
+    for stage in (
+        "requirements",
+        "bid_parse",
+        "review",
+        "evaluation_rules",
+        "objective_scoring",
+        "subjective_scoring",
+        "veto_rule_execution",
+    ):
+        repository.update_stage("task-001", stage, "complete")
+    repository.update_result("task-001", {"review_result": {"old": True}})
+    repository.fail("task-001", "veto_rule_execution", "否决规则失败")
+
+    retried = repository.prepare_retry("task-001", "start")
+
+    assert retried.status == "pending"
+    assert retried.result == {}
+    assert retried.failed_stage is None
+    assert retried.requirements_status == "pending"
+    assert retried.bid_parse_status == "pending"
+    assert retried.evaluation_rules_status == "pending"
+
+
+def test_prepare_retry_rejects_non_failed_task(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "compliance")
+
+    with pytest.raises(ValueError, match="failed"):
+        repository.prepare_retry("task-001", "start")
 
 
 def test_update_result_merges_subjective_scores_without_changing_stage_states(tmp_path):
