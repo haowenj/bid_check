@@ -228,7 +228,7 @@ class BidCheckRepository:
             """
         ).fetchone()
         table_sql = str(table_sql_row[0] or "") if table_sql_row else ""
-        if "veto_rule_execution" not in table_sql:
+        if "'veto_rule_execution'" not in table_sql:
             connection.execute(self._extended_schema_sql())
             connection.execute(
                 """

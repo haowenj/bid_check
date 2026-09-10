@@ -1,3 +1,6 @@
+import json
+import sqlite3
+
 import pytest
 
 from app.models import FileMetadata
@@ -189,6 +192,79 @@ def test_prepare_retry_rejects_non_failed_task(tmp_path):
 
     with pytest.raises(ValueError, match="failed"):
         repository.prepare_retry("task-001", "start")
+
+
+def test_repository_migrates_legacy_schema_to_evaluation_stage_columns(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    tender_file, bid_file = make_files()
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE bid_check_tasks (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL UNIQUE,
+            tender_file_json TEXT NOT NULL,
+            bid_file_json TEXT NOT NULL,
+            check_mode TEXT NOT NULL CHECK (
+                check_mode IN ('compliance', 'evaluation', 'full')
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'running', 'complete', 'failed')
+            ),
+            requirements_status TEXT NOT NULL CHECK (
+                requirements_status IN (
+                    'pending', 'running', 'complete', 'failed'
+                )
+            ),
+            bid_parse_status TEXT NOT NULL CHECK (
+                bid_parse_status IN (
+                    'pending', 'running', 'complete', 'failed'
+                )
+            ),
+            review_status TEXT NOT NULL CHECK (
+                review_status IN (
+                    'pending', 'running', 'complete', 'failed'
+                )
+            ),
+            failed_stage TEXT CHECK (
+                failed_stage IS NULL OR failed_stage IN (
+                    'requirements', 'bid_parse', 'review'
+                )
+            ),
+            error_message TEXT,
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO bid_check_tasks (
+            task_id, tender_file_json, bid_file_json, check_mode, status,
+            requirements_status, bid_parse_status, review_status,
+            failed_stage, error_message, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'evaluation', 'complete', 'complete', 'complete',
+                  'complete', NULL, NULL, ?, 'created', 'updated')
+        """,
+        (
+            "legacy-task",
+            json.dumps(tender_file.to_dict()),
+            json.dumps(bid_file.to_dict()),
+            json.dumps({"evaluation_rules": {"old": True}}),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    repository = BidCheckRepository(database_path)
+    migrated = repository.get("legacy-task")
+
+    assert migrated is not None
+    assert migrated.evaluation_rules_status == "complete"
+    assert migrated.objective_scoring_status == "pending"
+    repository.fail("legacy-task", "objective_scoring", "评分失败")
+    assert repository.get("legacy-task").failed_stage == "objective_scoring"
 
 
 def test_update_result_merges_subjective_scores_without_changing_stage_states(tmp_path):
