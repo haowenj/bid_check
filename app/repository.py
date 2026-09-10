@@ -558,7 +558,10 @@ class BidCheckRepository:
                     column = STAGE_COLUMNS[stage]
                     assignments.append(f"{column} = ?")
                     parameters.append("pending")
-            if "evaluation_rules" in reset_stages:
+            if (
+                task.check_mode == "evaluation"
+                and "evaluation_rules" in reset_stages
+            ):
                 assignments.append("requirements_status = ?")
                 parameters.append("pending")
             assignments.extend(

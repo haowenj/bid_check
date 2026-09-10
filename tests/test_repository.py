@@ -158,6 +158,29 @@ def test_prepare_retry_from_failed_stage_preserves_previous_results(tmp_path):
     assert retried.error_message is None
 
 
+def test_prepare_retry_from_full_review_preserves_requirements_status(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "full")
+    repository.update_stage("task-001", "requirements", "complete")
+    repository.update_stage("task-001", "bid_parse", "complete")
+    repository.update_result(
+        "task-001",
+        {
+            "requirements": {"id": "requirements-ok"},
+            "bid_parse": {"id": "bid-parse-ok"},
+        },
+    )
+    repository.fail("task-001", "review", "合规性检查失败")
+
+    retried = repository.prepare_retry("task-001", "failed_stage")
+
+    assert retried.requirements_status == "complete"
+    assert retried.bid_parse_status == "complete"
+    assert retried.review_status == "pending"
+    assert retried.evaluation_rules_status == "pending"
+
+
 def test_prepare_retry_from_start_resets_all_derived_states_and_results(tmp_path):
     repository = make_repository(tmp_path)
     tender_file, bid_file = make_files()
