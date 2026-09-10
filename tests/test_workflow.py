@@ -245,6 +245,139 @@ def test_review_failure_is_persisted(task_repository):
     assert task.error_message == "模拟合规性检查失败"
 
 
+def test_retry_from_failed_requirements_reuses_successful_bid_parse(task_repository):
+    calls = []
+    task_repository.update_stage("task-001", "bid_parse", "complete")
+    task_repository.update_result(
+        "task-001",
+        {"bid_parse": {"status": "saved", "artifact_dir": "saved"}},
+    )
+    task_repository.fail("task-001", "requirements", "要求提取失败")
+
+    def extract(file_metadata, recorder=None):
+        del file_metadata, recorder
+        calls.append("requirements")
+        return empty_objects()
+
+    def parse(_file_metadata):
+        calls.append("bid_parse")
+        raise AssertionError("成功的 bid_parse 不应被重跑")
+
+    workflow = BidCheckWorkflow(
+        task_repository,
+        BidCheckServices(
+            extract=extract,
+            parse=parse,
+            review=lambda requirements, parsed: {"ok": True},
+        ),
+    )
+    try:
+        workflow.run("task-001", retry_from="requirements")
+    finally:
+        workflow.shutdown()
+
+    assert calls == ["requirements"]
+    assert task_repository.get("task-001").status == "complete"
+
+
+def test_retry_from_objective_scoring_skips_successful_prefix(
+    task_repository, tmp_path
+):
+    task = create_full_task(task_repository, tmp_path)
+    task_repository.update_stage(task.task_id, "requirements", "complete")
+    task_repository.update_stage(task.task_id, "bid_parse", "complete")
+    task_repository.update_stage(task.task_id, "review", "complete")
+    task_repository.update_stage(task.task_id, "evaluation_rules", "complete")
+    task_repository.update_result(
+        task.task_id,
+        {
+            "requirements": empty_objects(),
+            "bid_parse": {"status": "success"},
+            "review_result": {"ok": True},
+            "evaluation_rules": evaluation_result(),
+        },
+    )
+    task_repository.fail(task.task_id, "objective_scoring", "客观评分失败")
+    calls = []
+
+    def evaluate(*args, **kwargs):
+        del args, kwargs
+        calls.append("evaluation_rules")
+        raise AssertionError("评标规则提取不应被重跑")
+
+    def score(*args, **kwargs):
+        del args, kwargs
+        calls.append("objective_scoring")
+        return {"score_items": []}
+
+    services = BidCheckServices(
+        extract=lambda _: empty_objects(),
+        parse=lambda _: {"status": "unused"},
+        review=lambda *_: {"unused": True},
+        extract_evaluation_with_recorder=evaluate,
+        score_objective_with_recorder=score,
+        score_subjective_with_recorder=lambda *args, **kwargs: {"score_items": []},
+        execute_veto_with_recorder=lambda *args, **kwargs: {
+            "veto_rule_reviews": []
+        },
+    )
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id, retry_from="objective_scoring")
+    finally:
+        workflow.shutdown()
+
+    assert calls == ["objective_scoring"]
+
+
+def test_full_workflow_records_subjective_failure_as_subjective_scoring(
+    task_repository, tmp_path
+):
+    task = create_full_task(task_repository, tmp_path)
+
+    def evaluate(_tender_file, recorder=None):
+        del recorder
+        return evaluation_result()
+
+    def score(_tender_file, _bid_file, _rules, recorder=None):
+        del recorder
+        return {"score_items": []}
+
+    def subjective(_tender_file, _bid_file, _rules, recorder=None):
+        del recorder
+        raise RuntimeError("主观评分服务失败")
+
+    def veto(
+        _tender_file,
+        _bid_file,
+        _rules,
+        objective_scores=None,
+        recorder=None,
+    ):
+        del objective_scores, recorder
+        return {"veto_rule_reviews": []}
+
+    services = BidCheckServices(
+        extract=lambda _file: empty_objects(),
+        parse=lambda _file: {"status": "success"},
+        review=lambda *_args: {"review": True},
+        extract_evaluation_with_recorder=evaluate,
+        score_objective_with_recorder=score,
+        score_subjective_with_recorder=subjective,
+        execute_veto_with_recorder=veto,
+    )
+    workflow = BidCheckWorkflow(task_repository, services)
+    try:
+        workflow.run(task.task_id)
+    finally:
+        workflow.shutdown()
+
+    failed = task_repository.get(task.task_id)
+    assert failed.status == "failed"
+    assert failed.failed_stage == "subjective_scoring"
+    assert failed.subjective_scoring_status == "failed"
+
+
 def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog):
     caplog.set_level(logging.INFO, logger="app.workflow")
     workflow = make_workflow(
@@ -585,7 +718,7 @@ def test_full_workflow_keeps_compliance_result_when_evaluation_fails(
     failed = task_repository.get(task.task_id)
     assert failed is not None
     assert failed.status == "failed"
-    assert failed.failed_stage == "review"
+    assert failed.failed_stage == "objective_scoring"
     assert failed.error_message == "评分阶段失败"
     assert failed.result["review_result"] == compliance_result
 
@@ -621,7 +754,7 @@ def test_full_workflow_keeps_prior_results_when_subjective_scoring_fails(
     failed = task_repository.get(task.task_id)
     assert failed is not None
     assert failed.status == "failed"
-    assert failed.failed_stage == "review"
+    assert failed.failed_stage == "subjective_scoring"
     assert failed.error_message == "主观评分阶段失败"
     assert failed.result["review_result"] == compliance_result
     assert failed.result["evaluation_rules"] == rules
