@@ -1605,10 +1605,10 @@
         <div class="parallel-label"><span>{% if task.check_mode == "evaluation" %}单链路提取{% else %}并行执行{% endif %}</span></div>
 
         <div class="parallel-stages" data-parallel-stages>
-          <article class="stage-card status-surface-{{ task.requirements_status }}" data-stage="requirements">
+          <article class="stage-card status-surface-{{ task.evaluation_rules_status if task.check_mode == 'evaluation' else task.requirements_status }}" data-stage="{{ 'evaluation_rules' if task.check_mode == 'evaluation' else 'requirements' }}">
             <span class="stage-number">2</span>
             <div><strong>{% if task.check_mode == "evaluation" %}提取评标规则{% else %}提取招标文件检查对象{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}定位完整评标章节、评分表和明确否决条款{% else %}识别完整模板、项目编制要求和补充材料{% endif %}</small></div>
-            {{ status_badge(task.requirements_status) }}
+            {{ status_badge(task.evaluation_rules_status if task.check_mode == 'evaluation' else task.requirements_status) }}
           </article>
           <article class="stage-card status-surface-{{ task.bid_parse_status }}" data-stage="bid_parse">
             <span class="stage-number">3</span>
@@ -1624,6 +1624,46 @@
           <div><strong>{% if task.check_mode == "evaluation" %}生成评标规则产出物{% else %}执行合规性检查{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}不执行投标文件评分或否决判断{% else %}汇合两个前置步骤的结构化结果{% endif %}</small></div>
           {{ status_badge(task.review_status) }}
         </article>
+
+        {% if task.check_mode == "full" %}
+          <div class="connector connector-down" aria-hidden="true"></div>
+          <div class="evaluation-workflow-stages" data-evaluation-stages>
+            <article class="stage-card status-surface-{{ task.evaluation_rules_status }}" data-stage="evaluation_rules">
+              <span class="stage-number">5</span>
+              <div><strong>提取评标规则</strong><small>定位评分项、评分条件和否决性规则</small></div>
+              {{ status_badge(task.evaluation_rules_status) }}
+            </article>
+            <article class="stage-card status-surface-{{ task.objective_scoring_status }}" data-stage="objective_scoring">
+              <span class="stage-number">6</span>
+              <div><strong>客观评分</strong><small>根据规则和投标文件证据执行客观评分</small></div>
+              {{ status_badge(task.objective_scoring_status) }}
+            </article>
+            <article class="stage-card status-surface-{{ task.subjective_scoring_status }}" data-stage="subjective_scoring">
+              <span class="stage-number">7</span>
+              <div><strong>主观评分</strong><small>生成 AI 辅助评分建议</small></div>
+              {{ status_badge(task.subjective_scoring_status) }}
+            </article>
+            <article class="stage-card status-surface-{{ task.veto_rule_execution_status }}" data-stage="veto_rule_execution">
+              <span class="stage-number">8</span>
+              <div><strong>执行否决规则</strong><small>核对明确触发的否决性条件</small></div>
+              {{ status_badge(task.veto_rule_execution_status) }}
+            </article>
+          </div>
+        {% elif task.check_mode == "evaluation" %}
+          <div class="connector connector-down" aria-hidden="true"></div>
+          <div class="evaluation-workflow-stages" data-evaluation-stages>
+            <article class="stage-card status-surface-{{ task.objective_scoring_status }}" data-stage="objective_scoring">
+              <span class="stage-number">5</span>
+              <div><strong>客观评分</strong><small>根据规则和投标文件证据执行客观评分</small></div>
+              {{ status_badge(task.objective_scoring_status) }}
+            </article>
+            <article class="stage-card status-surface-{{ task.veto_rule_execution_status }}" data-stage="veto_rule_execution">
+              <span class="stage-number">6</span>
+              <div><strong>执行否决规则</strong><small>核对明确触发的否决性条件</small></div>
+              {{ status_badge(task.veto_rule_execution_status) }}
+            </article>
+          </div>
+        {% endif %}
 
         <div class="connector connector-down" aria-hidden="true"></div>
 

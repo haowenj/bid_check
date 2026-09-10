@@ -71,6 +71,16 @@
             {% else %}
               <button class="task-delete-button" type="button" disabled title="任务执行中暂不可删除">删除</button>
             {% endif %}
+            {% if row.retry_available %}
+              <button
+                class="task-retry-button"
+                type="button"
+                data-retry-task="{{ task.task_id }}"
+                data-retry-task-name="{{ task.bid_file.filename }}"
+                data-retry-stage="{{ task.failed_stage }}"
+                data-retry-stage-label="{{ row.failed_stage_label or '失败阶段' }}"
+              >重试</button>
+            {% endif %}
           </article>
         {% endfor %}
       </div>
@@ -97,6 +107,29 @@
     </form>
   </dialog>
   <div class="task-delete-feedback" data-delete-feedback role="alert" hidden></div>
+
+  <dialog class="task-retry-dialog" data-retry-dialog aria-labelledby="retry-dialog-heading">
+    <form method="dialog" data-retry-form>
+      <span class="eyebrow">RETRY TASK</span>
+      <h2 id="retry-dialog-heading">选择重试起点</h2>
+      <p class="task-retry-target" data-retry-target></p>
+      <div class="task-retry-options">
+        <label class="task-retry-option">
+          <input type="radio" name="retry_from" value="failed_stage" checked>
+          <span><strong>从失败阶段开始</strong><small data-retry-stage-help>会复用之前成功阶段产物。</small></span>
+        </label>
+        <label class="task-retry-option">
+          <input type="radio" name="retry_from" value="start">
+          <span><strong>从头开始</strong><small>重新执行该任务的全部检查阶段。</small></span>
+        </label>
+      </div>
+      <div class="task-retry-actions">
+        <button class="button" type="button" data-retry-cancel>取消</button>
+        <button class="button primary" type="button" data-retry-confirm>开始重试</button>
+      </div>
+    </form>
+  </dialog>
+  <div class="task-retry-feedback" data-retry-feedback role="alert" hidden></div>
 {% endblock %}
 
 {% block scripts %}
@@ -156,6 +189,80 @@
           feedback.hidden = false;
           current.button.disabled = false;
           current.button.textContent = "删除";
+          pending = null;
+        } finally {
+          confirmButton.disabled = false;
+          cancelButton.disabled = false;
+        }
+      });
+    })();
+  </script>
+  <script>
+    (() => {
+      const dialog = document.querySelector("[data-retry-dialog]");
+      if (!dialog) return;
+      const target = dialog.querySelector("[data-retry-target]");
+      const stageHelp = dialog.querySelector("[data-retry-stage-help]");
+      const cancelButton = dialog.querySelector("[data-retry-cancel]");
+      const confirmButton = dialog.querySelector("[data-retry-confirm]");
+      const feedback = document.querySelector("[data-retry-feedback]");
+      const form = dialog.querySelector("[data-retry-form]");
+      let pending = null;
+
+      const closeDialog = () => {
+        pending = null;
+        dialog.close();
+      };
+
+      document.querySelectorAll("[data-retry-task]").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          pending = {
+            button,
+            taskId: button.dataset.retryTask,
+            taskName: button.dataset.retryTaskName,
+            stageLabel: button.dataset.retryStageLabel,
+          };
+          target.textContent = `${pending.taskName}（任务 ${pending.taskId.slice(0, 8)}）`;
+          stageHelp.textContent = `会复用“${pending.stageLabel}”之前已经成功的阶段产物。`;
+          feedback.hidden = true;
+          form.querySelector('[value="failed_stage"]').checked = true;
+          dialog.showModal();
+        });
+      });
+
+      cancelButton.addEventListener("click", closeDialog);
+      dialog.addEventListener("cancel", () => {
+        pending = null;
+      });
+      confirmButton.addEventListener("click", async () => {
+        if (!pending) return;
+        const current = pending;
+        const retryFrom = form.querySelector('input[name="retry_from"]:checked').value;
+        confirmButton.disabled = true;
+        cancelButton.disabled = true;
+        current.button.disabled = true;
+        current.button.textContent = "重试中…";
+        try {
+          const response = await fetch(
+            `/api/bid-check/tasks/${encodeURIComponent(current.taskId)}/retry`,
+            {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({retry_from: retryFrom}),
+            },
+          );
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(payload.detail || "任务重试失败，请稍后重试。");
+          closeDialog();
+          window.location.reload();
+        } catch (error) {
+          dialog.close();
+          feedback.textContent = error.message;
+          feedback.hidden = false;
+          current.button.disabled = false;
+          current.button.textContent = "重试";
           pending = null;
         } finally {
           confirmButton.disabled = false;

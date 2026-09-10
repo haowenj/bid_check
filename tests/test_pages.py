@@ -126,6 +126,21 @@ def test_failed_task_page_names_failed_stage(client, repository, stored_task):
     assert "模拟招标文件检查对象提取失败" in response.text
 
 
+def test_failed_task_list_has_retry_options(client, repository, stored_task):
+    repository.update_stage(stored_task.task_id, "requirements", "complete")
+    repository.update_stage(stored_task.task_id, "bid_parse", "complete")
+    repository.fail(stored_task.task_id, "subjective_scoring", "主观评分失败")
+
+    response = client.get("/bid-check/tasks")
+
+    assert response.status_code == 200
+    assert 'data-retry-task="stored-task"' in response.text
+    assert "从头开始" in response.text
+    assert "从失败阶段开始" in response.text
+    assert "主观评分" in response.text
+    assert "会复用之前成功阶段产物" in response.text
+
+
 def test_complete_page_renders_requirements_without_fake_verdict(
     client,
     repository,
