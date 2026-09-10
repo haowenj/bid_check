@@ -185,6 +185,22 @@ def test_prepare_retry_from_start_resets_all_derived_states_and_results(tmp_path
     assert retried.evaluation_rules_status == "pending"
 
 
+def test_prepare_retry_from_failed_stage_resets_both_failed_parallel_branches(tmp_path):
+    repository = make_repository(tmp_path)
+    tender_file, bid_file = make_files()
+    repository.create("task-001", tender_file, bid_file, "full")
+    repository.fail("task-001", "requirements", "要求提取失败")
+    repository.fail("task-001", "bid_parse", "投标文件解析失败")
+
+    retried = repository.prepare_retry("task-001", "failed_stage")
+
+    assert retried.status == "pending"
+    assert retried.requirements_status == "pending"
+    assert retried.bid_parse_status == "pending"
+    assert retried.review_status == "pending"
+    assert retried.failed_stage is None
+
+
 def test_prepare_retry_rejects_non_failed_task(tmp_path):
     repository = make_repository(tmp_path)
     tender_file, bid_file = make_files()
