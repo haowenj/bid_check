@@ -794,10 +794,11 @@ def create_app(
     def bid_check_task_page(request: Request, task_id: str):
         task = active_repository.get(task_id)
         if task is None:
-            raise HTTPException(
-                status_code=404,
-                detail="标书检查任务不存在。",
-            )
+            # A detail URL can remain open after the task is deleted from a
+            # second tab. Redirect the stale page to the list instead of
+            # rendering against a missing task (which can surface as a 500 in
+            # some proxy/browser combinations).
+            return RedirectResponse("/bid-check/tasks", status_code=303)
         bid_document = _load_bid_document_for_page(task)
         result = task.result if isinstance(task.result, dict) else {}
         file_requirement_data = _load_file_requirement_review_for_page(task)

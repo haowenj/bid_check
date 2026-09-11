@@ -1847,9 +1847,25 @@ def test_complete_page_hides_collapsed_bid_document_debug_sections(
 
 
 def test_unknown_task_page_returns_404(client):
-    response = client.get("/bid-check/tasks/not-found")
+    response = client.get("/bid-check/tasks/not-found", follow_redirects=False)
 
-    assert response.status_code == 404
+    assert response.status_code == 303
+    assert response.headers["location"] == "/bid-check/tasks"
+
+
+def test_deleted_task_detail_redirects_to_task_list(client, repository, stored_task):
+    repository.complete(stored_task.task_id, {})
+
+    delete_response = client.delete(f"/api/bid-check/tasks/{stored_task.task_id}")
+    assert delete_response.status_code == 200
+
+    response = client.get(
+        f"/bid-check/tasks/{stored_task.task_id}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/bid-check/tasks"
 
 
 def test_complete_page_renders_generic_attachment_status_and_evidence_count(
