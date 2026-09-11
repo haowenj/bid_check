@@ -84,6 +84,19 @@ CHECK_MODE_LABELS = {
 }
 
 
+def _evaluation_progress_status(task: BidCheckTask) -> str | None:
+    """Return the display-only progress for the full-check evaluation phase."""
+
+    if task.check_mode != "full":
+        return None
+    if task.status == "complete":
+        return "complete"
+    if task.status == "failed":
+        result = task.result if isinstance(task.result, dict) else {}
+        return "failed" if "review_result" in result else "pending"
+    return "running" if task.review_status == "complete" else "pending"
+
+
 def _load_bid_document_for_page(task: BidCheckTask) -> dict[str, Any] | None:
     """Load a compact, section-oriented view of the bid parse artifact."""
 
@@ -827,6 +840,7 @@ def create_app(
                 "file_requirement_original_file": file_requirement_data["original_file"],
                 "file_requirement_stats": file_requirement_data["stats"],
                 "failed_stage_label": STAGE_LABELS.get(task.failed_stage),
+                "evaluation_progress_status": _evaluation_progress_status(task),
             },
         )
 
@@ -898,6 +912,7 @@ def create_app(
                 detail="标书检查任务不存在。",
             )
         payload = task.to_dict()
+        payload["evaluation_progress_status"] = _evaluation_progress_status(task)
         file_requirement_data = _load_file_requirement_review_for_page(task)
         if (
             file_requirement_data["source"] == "artifact"

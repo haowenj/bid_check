@@ -11,6 +11,21 @@ from app.evaluation_summary import (
 from app.models import FileMetadata
 
 
+def _create_full_task(settings, repository, task_id="full-task"):
+    task_dir = settings.tasks_dir / task_id
+    task_dir.mkdir(parents=True)
+    tender_path = task_dir / "tender.docx"
+    bid_path = task_dir / "bid.docx"
+    tender_path.write_bytes(b"tender")
+    bid_path.write_bytes(b"bid")
+    return repository.create(
+        task_id,
+        FileMetadata("招标文件.docx", 6, str(tender_path)),
+        FileMetadata("投标文件.docx", 3, str(bid_path)),
+        "full",
+    )
+
+
 def test_root_redirects_to_bid_check(client):
     response = client.get("/", follow_redirects=False)
 
@@ -110,6 +125,43 @@ def test_running_task_page_shows_parallel_workflow(
     assert "data-parallel-stages" in response.text
     assert response.text.count("运行中") >= 2
     assert f'data-task-id="{stored_task.task_id}"' in response.text
+
+
+def test_running_full_task_page_shows_evaluation_workflow_stage(
+    client,
+    repository,
+    settings,
+):
+    task = _create_full_task(settings, repository)
+    repository.update_stage(task.task_id, "requirements", "complete")
+    repository.update_stage(task.task_id, "bid_parse", "complete")
+    repository.update_stage(task.task_id, "review", "running")
+    repository.update_stage(task.task_id, "review", "complete")
+
+    response = client.get(f"/bid-check/tasks/{task.task_id}")
+
+    assert response.status_code == 200
+    assert 'data-stage="evaluation"' in response.text
+    assert "评分与否决检查" in response.text
+    assert "提取评标规则、执行客观评分、主观评分和否决项检查" in response.text
+    assert 'data-stage="result"' in response.text
+
+
+def test_full_task_api_reports_evaluation_progress_status(
+    client,
+    repository,
+    settings,
+):
+    task = _create_full_task(settings, repository, "full-api-task")
+    repository.update_stage(task.task_id, "requirements", "complete")
+    repository.update_stage(task.task_id, "bid_parse", "complete")
+    repository.update_stage(task.task_id, "review", "running")
+    repository.update_stage(task.task_id, "review", "complete")
+
+    response = client.get(f"/api/bid-check/tasks/{task.task_id}")
+
+    assert response.status_code == 200
+    assert response.json()["evaluation_progress_status"] == "running"
 
 
 def test_failed_task_page_names_failed_stage(client, repository, stored_task):

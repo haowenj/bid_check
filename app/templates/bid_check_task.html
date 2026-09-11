@@ -1625,10 +1625,20 @@
           {{ status_badge(task.review_status) }}
         </article>
 
+        {% if task.check_mode == "full" %}
+          <div class="connector connector-down" aria-hidden="true"></div>
+
+          <article class="stage-card status-surface-{{ evaluation_progress_status }}" data-stage="evaluation">
+            <span class="stage-number">5</span>
+            <div><strong>评分与否决检查</strong><small>提取评标规则、执行客观评分、主观评分和否决项检查</small></div>
+            {{ status_badge(evaluation_progress_status) }}
+          </article>
+        {% endif %}
+
         <div class="connector connector-down" aria-hidden="true"></div>
 
         <article class="stage-card status-surface-{{ 'failed' if task.status == 'failed' else 'pending' }}" data-stage="result">
-          <span class="stage-number">5</span>
+          <span class="stage-number">{{ 6 if task.check_mode == "full" else 5 }}</span>
           <div><strong>{% if task.check_mode == "evaluation" %}评标规则结果{% else %}检查对象结果{% endif %}</strong><small>{% if task.check_mode == "evaluation" %}展示评分层级、否决规则和来源 block{% else %}展示模板、项目要求和补充材料{% endif %}</small></div>
           {{ status_badge("failed" if task.status == "failed" else "pending") }}
         </article>

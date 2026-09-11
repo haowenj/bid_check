@@ -52,6 +52,7 @@ async function pollTask() {
     updateStage('requirements', payload.requirements_status);
     updateStage('bid_parse', payload.bid_parse_status);
     updateStage('review', payload.review_status);
+    updateStage('evaluation', payload.evaluation_progress_status);
     showPollingWarning('');
     window.setTimeout(pollTask, 700);
   } catch (error) {
