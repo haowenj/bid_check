@@ -16,6 +16,7 @@ services:
       LLM_ENABLE_THINKING: "${LLM_ENABLE_THINKING:-false}"
       LLM_MAX_TOKENS: "${LLM_MAX_TOKENS:-8192}"
       LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-90}"
+      LLM_MAX_CONCURRENCY: "${LLM_MAX_CONCURRENCY:-5}"
       APP_DATA_DIR: /app/data
       APP_DATABASE_PATH: /app/data/bid_check.db
       APP_TASKS_DIR: /app/data/tasks

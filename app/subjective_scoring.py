@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.llm_concurrency import llm_request_slot
 from app.models import FileMetadata
 from app.objective_scoring import load_reusable_bid_evidence
 
@@ -1389,8 +1390,9 @@ class OpenAICompatibleSubjectiveScoreLLM:
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+            with llm_request_slot():
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
             choice = response_payload.get("choices", [{}])[0]
             self.last_usage = response_payload.get("usage")
             if recorder is not None and call_id is not None:

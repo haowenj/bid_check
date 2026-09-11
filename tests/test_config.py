@@ -56,3 +56,11 @@ def test_load_settings_does_not_invent_mineru_endpoint_when_unconfigured(tmp_pat
     assert settings.mineru_backend == "hybrid-engine"
     assert settings.mineru_server_url is None
     assert settings.mineru_api_key is None
+
+
+def test_load_settings_uses_default_and_env_override_for_llm_concurrency(tmp_path, monkeypatch):
+    default_settings = load_settings(tmp_path)
+    assert default_settings.llm_max_concurrency == 5
+
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "2")
+    assert load_settings(tmp_path).llm_max_concurrency == 2

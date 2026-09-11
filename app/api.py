@@ -39,6 +39,7 @@ from app.compliance_extraction import (
     extract_tender_compliance_objects,
 )
 from app.config import Settings, load_settings
+from app.llm_concurrency import configure_llm_concurrency
 from app.evaluation_rule_extraction import (
     DeterministicEvaluationRuleLLM,
     OpenAICompatibleEvaluationRuleLLM,
@@ -520,6 +521,7 @@ def build_default_workflow(
     document_parser: DocumentParser | None = None,
     bid_document_parser: MinerUBidDocumentParser | None = None,
 ) -> BidCheckWorkflow:
+    configure_llm_concurrency(settings.llm_max_concurrency)
     parser = document_parser or MinerUDocumentParser(
         settings.mineru_url,
         mineru_api_key=settings.mineru_api_key,

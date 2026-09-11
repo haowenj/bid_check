@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.file_requirement_review import run_file_requirement_review
+from app.llm_concurrency import llm_request_slot
 from app.navigation_content import (
     filter_navigation_sections,
     filter_navigation_templates,
@@ -912,8 +913,9 @@ class OpenAICompatibleAttachmentReviewLLM:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+            with llm_request_slot():
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
             content = response_payload["choices"][0]["message"]["content"]
             return json.loads(content) if isinstance(content, str) else content
         except TimeoutError as exc:

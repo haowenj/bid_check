@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.llm_concurrency import llm_request_slot
 from app.compliance_extraction import (
     DocumentParser,
     MinerUDocumentParser,
@@ -1205,20 +1206,21 @@ class OpenAICompatibleEvaluationRuleLLM:
             recorder.attach_llm_input(call_id, payload)
         started_at = time.perf_counter()
         try:
-            with urllib.request.urlopen(
-                urllib.request.Request(
-                    f"{self.base_url}/chat/completions",
-                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                        "Connection": "close",
-                    },
-                    method="POST",
-                ),
-                timeout=self.timeout_seconds,
-            ) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+            with llm_request_slot():
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"{self.base_url}/chat/completions",
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                            "Connection": "close",
+                        },
+                        method="POST",
+                    ),
+                    timeout=self.timeout_seconds,
+                ) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
             choice = response_payload.get("choices", [{}])[0]
             self.last_usage = response_payload.get("usage")
             if recorder is not None and call_id is not None:

@@ -27,6 +27,7 @@ from xml.etree import ElementTree
 import httpx
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.llm_concurrency import llm_request_slot
 from app.models import (
     FileMetadata,
     FileRequirement,
@@ -3472,26 +3473,27 @@ class OpenAICompatibleLLM:
                     type(recorder_error).__name__,
                 )
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
-            ) as response:
-                response_text = response.read().decode("utf-8")
-                try:
-                    response_payload = json.loads(response_text)
-                except json.JSONDecodeError:
-                    if recorder is not None and call_id is not None:
-                        try:
-                            recorder.attach_llm_response(
-                                call_id,
-                                raw_response=response_text,
-                            )
-                        except Exception as recorder_error:
-                            logger.error(
-                                "artifact.llm.output.error call_id=%s error_type=%s",
-                                call_id,
-                                type(recorder_error).__name__,
-                            )
-                    raise
+            with llm_request_slot():
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
+                    response_text = response.read().decode("utf-8")
+                    try:
+                        response_payload = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        if recorder is not None and call_id is not None:
+                            try:
+                                recorder.attach_llm_response(
+                                    call_id,
+                                    raw_response=response_text,
+                                )
+                            except Exception as recorder_error:
+                                logger.error(
+                                    "artifact.llm.output.error call_id=%s error_type=%s",
+                                    call_id,
+                                    type(recorder_error).__name__,
+                                )
+                        raise
             if recorder is not None and call_id is not None:
                 try:
                     choice = response_payload.get("choices", [{}])[0]
@@ -3634,8 +3636,9 @@ class OpenAICompatibleLLM:
         if recorder is not None and call_id is not None:
             recorder.attach_llm_input(call_id, payload)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+            with llm_request_slot():
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    response_payload = json.loads(response.read().decode("utf-8"))
             if recorder is not None and call_id is not None:
                 choice = response_payload.get("choices", [{}])[0]
                 recorder.attach_llm_response(
@@ -3718,26 +3721,27 @@ class OpenAICompatibleLLM:
                     type(recorder_error).__name__,
                 )
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
-            ) as response:
-                response_text = response.read().decode("utf-8")
-                try:
-                    response_payload = json.loads(response_text)
-                except json.JSONDecodeError:
-                    if recorder is not None and call_id is not None:
-                        try:
-                            recorder.attach_llm_response(
-                                call_id,
-                                raw_response=response_text,
-                            )
-                        except Exception as recorder_error:
-                            logger.error(
-                                "artifact.llm.output.error call_id=%s error_type=%s",
-                                call_id,
-                                type(recorder_error).__name__,
-                            )
-                    raise
+            with llm_request_slot():
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
+                    response_text = response.read().decode("utf-8")
+                    try:
+                        response_payload = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        if recorder is not None and call_id is not None:
+                            try:
+                                recorder.attach_llm_response(
+                                    call_id,
+                                    raw_response=response_text,
+                                )
+                            except Exception as recorder_error:
+                                logger.error(
+                                    "artifact.llm.output.error call_id=%s error_type=%s",
+                                    call_id,
+                                    type(recorder_error).__name__,
+                                )
+                        raise
             if recorder is not None and call_id is not None:
                 try:
                     choice = response_payload.get("choices", [{}])[0]

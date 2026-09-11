@@ -26,6 +26,7 @@ class Settings:
     llm_enable_thinking: bool = False
     llm_max_tokens: int = 8192
     llm_timeout_seconds: float = 90.0
+    llm_max_concurrency: int = 5
     compliance_max_batches: int = 8
 
 
@@ -114,6 +115,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         ),
         llm_timeout_seconds=float(
             _env_value(project_env, "LLM_TIMEOUT_SECONDS", "90") or "90"
+        ),
+        llm_max_concurrency=int(
+            _env_value(project_env, "LLM_MAX_CONCURRENCY", "5") or "5"
         ),
         compliance_max_batches=int(
             _env_value(project_env, "COMPLIANCE_MAX_BATCHES", "8") or "8"
