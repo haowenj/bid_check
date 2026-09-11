@@ -245,23 +245,34 @@ def test_review_failure_is_persisted(task_repository):
     assert task.error_message == "模拟合规性检查失败"
 
 
-def test_retry_from_failed_requirements_reuses_successful_bid_parse(task_repository):
+def test_retry_reuses_saved_bid_parse_and_reruns_checks(task_repository):
     calls = []
-    task_repository.update_stage("task-001", "bid_parse", "complete")
-    task_repository.update_result(
-        "task-001",
-        {"bid_parse": {"status": "saved", "artifact_dir": "saved"}},
+    task = task_repository.get("task-001")
+    artifact_dir = Path(task.tender_file.storage_path).parent / "bid_document_cleaning"
+    artifact_dir.mkdir()
+    (artifact_dir / "structured_document.json").write_text(
+        json.dumps({"blocks": [], "sections": [], "stats": {}}),
+        encoding="utf-8",
     )
-    task_repository.fail("task-001", "requirements", "要求提取失败")
+    (artifact_dir / "cleaning_summary.json").write_text(
+        json.dumps({"stats": {}, "diagnostics": {}}),
+        encoding="utf-8",
+    )
+    task_repository.fail("task-001", "review", "合规性检查失败")
 
-    def extract(file_metadata, recorder=None):
-        del file_metadata, recorder
+    def extract(file_metadata):
+        del file_metadata
         calls.append("requirements")
         return empty_objects()
 
     def parse(_file_metadata):
         calls.append("bid_parse")
-        raise AssertionError("成功的 bid_parse 不应被重跑")
+        raise AssertionError("已完成的 bid_parse 不应被重跑")
+
+    def extract_retry(file_metadata, recorder=None):
+        del file_metadata, recorder
+        calls.append("requirements_retry")
+        return empty_objects()
 
     workflow = BidCheckWorkflow(
         task_repository,
@@ -269,68 +280,106 @@ def test_retry_from_failed_requirements_reuses_successful_bid_parse(task_reposit
             extract=extract,
             parse=parse,
             review=lambda requirements, parsed: {"ok": True},
+            extract_retry_with_recorder=extract_retry,
         ),
     )
     try:
-        workflow.run("task-001", retry_from="requirements")
+        workflow.run("task-001", reuse_parsed=True)
     finally:
         workflow.shutdown()
 
-    assert calls == ["requirements"]
+    assert calls == ["requirements_retry"]
     assert task_repository.get("task-001").status == "complete"
 
 
-def test_retry_from_objective_scoring_skips_successful_prefix(
+def test_retry_reuses_parsed_inputs_and_reruns_full_check_chain(
     task_repository, tmp_path
 ):
     task = create_full_task(task_repository, tmp_path)
-    task_repository.update_stage(task.task_id, "requirements", "complete")
-    task_repository.update_stage(task.task_id, "bid_parse", "complete")
-    task_repository.update_stage(task.task_id, "review", "complete")
-    task_repository.update_stage(task.task_id, "evaluation_rules", "complete")
-    task_repository.update_result(
-        task.task_id,
-        {
-            "requirements": empty_objects(),
-            "bid_parse": {"status": "success"},
-            "review_result": {"ok": True},
-            "evaluation_rules": evaluation_result(),
-        },
+    artifact_dir = Path(task.bid_file.storage_path).parent / "bid_document_cleaning"
+    artifact_dir.mkdir()
+    (artifact_dir / "structured_document.json").write_text(
+        json.dumps({"blocks": [], "sections": [], "stats": {}}),
+        encoding="utf-8",
     )
-    task_repository.fail(task.task_id, "objective_scoring", "客观评分失败")
-    calls = []
+    (artifact_dir / "cleaning_summary.json").write_text(
+        json.dumps({"stats": {}, "diagnostics": {}}),
+        encoding="utf-8",
+    )
+    task_repository.fail(task.task_id, "review", "合规性检查失败")
+    calls: list[str] = []
 
-    def evaluate(*args, **kwargs):
+    def fail_extract(*args, **kwargs):
         del args, kwargs
-        calls.append("evaluation_rules")
-        raise AssertionError("评标规则提取不应被重跑")
+        raise AssertionError("普通要求提取不应被调用")
+
+    def retry_extract(*args, **kwargs):
+        del args, kwargs
+        calls.append("requirements_retry")
+        return empty_objects()
+
+    def fail_parse(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("已存在解析产物时不应重跑投标文件解析")
+
+    def review(*args, **kwargs):
+        del args, kwargs
+        calls.append("review")
+        return {"review": True}
+
+    def fail_evaluate(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("普通评标规则提取不应被调用")
+
+    def retry_evaluate(*args, **kwargs):
+        del args, kwargs
+        calls.append("evaluation_retry")
+        return evaluation_result()
 
     def score(*args, **kwargs):
         del args, kwargs
-        calls.append("objective_scoring")
+        calls.append("objective")
         return {"score_items": []}
 
+    def subjective(*args, **kwargs):
+        del args, kwargs
+        calls.append("subjective")
+        return {"score_items": []}
+
+    def veto(*args, **kwargs):
+        del args, kwargs
+        calls.append("veto")
+        return {"veto_rule_reviews": []}
+
     services = BidCheckServices(
-        extract=lambda _: empty_objects(),
-        parse=lambda _: {"status": "unused"},
-        review=lambda *_: {"unused": True},
-        extract_evaluation_with_recorder=evaluate,
+        extract=fail_extract,
+        parse=fail_parse,
+        review=review,
+        extract_retry_with_recorder=retry_extract,
+        extract_evaluation_with_recorder=fail_evaluate,
+        extract_evaluation_retry_with_recorder=retry_evaluate,
         score_objective_with_recorder=score,
-        score_subjective_with_recorder=lambda *args, **kwargs: {"score_items": []},
-        execute_veto_with_recorder=lambda *args, **kwargs: {
-            "veto_rule_reviews": []
-        },
+        score_subjective_with_recorder=subjective,
+        execute_veto_with_recorder=veto,
     )
     workflow = BidCheckWorkflow(task_repository, services)
     try:
-        workflow.run(task.task_id, retry_from="objective_scoring")
+        workflow.run(task.task_id, reuse_parsed=True)
     finally:
         workflow.shutdown()
 
-    assert calls == ["objective_scoring"]
+    assert calls == [
+        "requirements_retry",
+        "review",
+        "evaluation_retry",
+        "objective",
+        "subjective",
+        "veto",
+    ]
+    assert task_repository.get(task.task_id).status == "complete"
 
 
-def test_full_workflow_records_subjective_failure_as_subjective_scoring(
+def test_full_workflow_records_subjective_failure_as_review(
     task_repository, tmp_path
 ):
     task = create_full_task(task_repository, tmp_path)
@@ -374,8 +423,8 @@ def test_full_workflow_records_subjective_failure_as_subjective_scoring(
 
     failed = task_repository.get(task.task_id)
     assert failed.status == "failed"
-    assert failed.failed_stage == "subjective_scoring"
-    assert failed.subjective_scoring_status == "failed"
+    assert failed.failed_stage == "review"
+    assert failed.review_status == "failed"
 
 
 def test_workflow_logs_stage_boundaries_and_final_status(task_repository, caplog):
@@ -473,6 +522,7 @@ def test_evaluation_workflow_extracts_tender_only_and_skips_bid_parse(
     assert completed.status == "complete"
     assert completed.result["evaluation_rules"] == evaluation_result()
     assert calls == [("evaluate", "招标文件.docx")]
+    assert completed.requirements_status == "complete"
     assert completed.bid_parse_status == "complete"
     assert completed.review_status == "complete"
 
@@ -718,7 +768,7 @@ def test_full_workflow_keeps_compliance_result_when_evaluation_fails(
     failed = task_repository.get(task.task_id)
     assert failed is not None
     assert failed.status == "failed"
-    assert failed.failed_stage == "objective_scoring"
+    assert failed.failed_stage == "review"
     assert failed.error_message == "评分阶段失败"
     assert failed.result["review_result"] == compliance_result
 
@@ -754,7 +804,7 @@ def test_full_workflow_keeps_prior_results_when_subjective_scoring_fails(
     failed = task_repository.get(task.task_id)
     assert failed is not None
     assert failed.status == "failed"
-    assert failed.failed_stage == "subjective_scoring"
+    assert failed.failed_stage == "review"
     assert failed.error_message == "主观评分阶段失败"
     assert failed.result["review_result"] == compliance_result
     assert failed.result["evaluation_rules"] == rules

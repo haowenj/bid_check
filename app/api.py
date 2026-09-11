@@ -21,7 +21,6 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
 
 from app.attachment_review import (
     DeterministicAttachmentReviewLLM,
@@ -46,7 +45,7 @@ from app.evaluation_rule_extraction import (
     extract_tender_evaluation_rules,
 )
 from app.evaluation_summary import load_evaluation_summary
-from app.models import BidCheckTask, FileMetadata, StageName
+from app.models import BidCheckTask, FileMetadata
 from app.objective_scoring import (
     load_reusable_bid_evidence,
     load_reusable_tender_evidence,
@@ -71,10 +70,6 @@ STAGE_LABELS = {
     "requirements": "提取招标文件检查对象",
     "bid_parse": "解析投标文件",
     "review": "执行合规性检查",
-    "evaluation_rules": "提取评标规则",
-    "objective_scoring": "客观评分",
-    "subjective_scoring": "主观评分",
-    "veto_rule_execution": "执行否决规则",
 }
 TASK_STATUS_LABELS = {
     "pending": "未开始",
@@ -87,10 +82,6 @@ CHECK_MODE_LABELS = {
     "evaluation": "评标规则校验",
     "full": "全面校验",
 }
-
-
-class RetryTaskRequest(BaseModel):
-    retry_from: Literal["start", "failed_stage"]
 
 
 def _load_bid_document_for_page(task: BidCheckTask) -> dict[str, Any] | None:
@@ -482,133 +473,6 @@ def _task_issue_counts(task: BidCheckTask) -> dict[str, int]:
     }
 
 
-_RETRY_RESULT_KEYS = {
-    "requirements": "requirements",
-    "bid_parse": "bid_parse",
-    "review": "review_result",
-    "evaluation_rules": "evaluation_rules",
-    "objective_scoring": "objective_scores",
-    "subjective_scoring": "subjective_scores",
-    "veto_rule_execution": "veto_rule_reviews",
-}
-
-
-def _stage_has_saved_result(task: BidCheckTask, stage: StageName) -> bool:
-    result = task.result if isinstance(task.result, dict) else {}
-    if isinstance(result.get(_RETRY_RESULT_KEYS[stage]), dict):
-        return True
-    task_root = Path(task.tender_file.storage_path).parent
-    artifact_paths = {
-        "requirements": (
-            task_root / "compliance_extraction" / "07_result.json",
-        ),
-        "bid_parse": (
-            task_root / "bid_document_cleaning" / "structured_document.json",
-            task_root / "bid_document_cleaning" / "cleaning_summary.json",
-        ),
-        "evaluation_rules": (
-            task_root / "compliance_extraction" / "11_evaluation_rules.json",
-        ),
-        "objective_scoring": (
-            task_root / "compliance_extraction" / "objective_scores.json",
-        ),
-        "subjective_scoring": (
-            task_root / "compliance_extraction" / "subjective_scores.json",
-        ),
-        "veto_rule_execution": (
-            task_root / "compliance_extraction" / "veto_rule_reviews.json",
-        ),
-    }
-    paths = artifact_paths.get(stage)
-    return bool(paths) and all(path.is_file() for path in paths)
-
-
-def _resolved_retry_stage(task: BidCheckTask) -> StageName:
-    failed_stage = task.failed_stage
-    if task.check_mode == "evaluation" and failed_stage == "requirements":
-        failed_stage = "evaluation_rules"
-    if failed_stage is None:
-        raise HTTPException(
-            status_code=409,
-            detail="任务没有可识别的失败阶段，请选择从头开始。",
-        )
-    if failed_stage not in _RETRY_RESULT_KEYS:
-        raise HTTPException(
-            status_code=409,
-            detail="任务失败阶段无法安全恢复，请选择从头开始。",
-        )
-    if task.check_mode == "compliance" and failed_stage not in {
-        "requirements",
-        "bid_parse",
-        "review",
-    }:
-        raise HTTPException(
-            status_code=409,
-            detail="该失败阶段不属于当前任务，请选择从头开始。",
-        )
-    if task.check_mode == "evaluation" and failed_stage not in {
-        "evaluation_rules",
-        "objective_scoring",
-        "veto_rule_execution",
-    }:
-        raise HTTPException(
-            status_code=409,
-            detail="该失败阶段不属于当前任务，请选择从头开始。",
-        )
-    return failed_stage
-
-
-def _retry_prefix_stages(task: BidCheckTask, stage: StageName) -> tuple[StageName, ...]:
-    if stage in {"requirements", "bid_parse"}:
-        sibling = "bid_parse" if stage == "requirements" else "requirements"
-        sibling_status = getattr(task, STAGE_COLUMNS_FOR_RETRY[sibling])
-        return (sibling,) if sibling_status == "complete" else ()
-    if task.check_mode == "compliance":
-        order: tuple[StageName, ...] = ("requirements", "bid_parse", "review")
-    elif task.check_mode == "evaluation":
-        order = (
-            "evaluation_rules",
-            "objective_scoring",
-            "veto_rule_execution",
-        )
-    else:
-        order = (
-            "requirements",
-            "bid_parse",
-            "review",
-            "evaluation_rules",
-            "objective_scoring",
-            "subjective_scoring",
-            "veto_rule_execution",
-        )
-    return order[: order.index(stage)]
-
-
-STAGE_COLUMNS_FOR_RETRY = {
-    "requirements": "requirements_status",
-    "bid_parse": "bid_parse_status",
-    "review": "review_status",
-    "evaluation_rules": "evaluation_rules_status",
-    "objective_scoring": "objective_scoring_status",
-    "subjective_scoring": "subjective_scoring_status",
-    "veto_rule_execution": "veto_rule_execution_status",
-}
-
-
-def _validate_retry_prefix(task: BidCheckTask, stage: StageName) -> None:
-    for prefix_stage in _retry_prefix_stages(task, stage):
-        if getattr(task, STAGE_COLUMNS_FOR_RETRY[prefix_stage]) != "complete":
-            raise HTTPException(
-                status_code=409,
-                detail="失败阶段之前的阶段未完成，请选择从头开始。",
-            )
-        if not _stage_has_saved_result(task, prefix_stage):
-            raise HTTPException(
-                status_code=409,
-                detail="失败阶段之前的产物不可复用，请选择从头开始。",
-            )
-
-
 def _build_task_list_rows(tasks: list[BidCheckTask]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task in tasks:
@@ -718,6 +582,20 @@ def build_default_workflow(
             max_batches=settings.compliance_max_batches,
         )
 
+    def extract_requirements_for_retry(
+        file_metadata: FileMetadata,
+        recorder=None,
+    ):
+        return extract_tender_compliance_objects(
+            file_metadata,
+            parser=parser,
+            llm=llm,
+            cache=None,
+            parser_cache=parser_cache,
+            recorder=recorder,
+            max_batches=settings.compliance_max_batches,
+        )
+
     def extract_evaluation(
         file_metadata: FileMetadata,
         recorder=None,
@@ -727,6 +605,20 @@ def build_default_workflow(
             parser=parser,
             llm=evaluation_llm,
             cache=evaluation_cache,
+            parser_cache=parser_cache,
+            recorder=recorder,
+            max_batches=settings.compliance_max_batches,
+        )
+
+    def extract_evaluation_for_retry(
+        file_metadata: FileMetadata,
+        recorder=None,
+    ):
+        return extract_tender_evaluation_rules(
+            file_metadata,
+            parser=parser,
+            llm=evaluation_llm,
+            cache=None,
             parser_cache=parser_cache,
             recorder=recorder,
             max_batches=settings.compliance_max_batches,
@@ -825,7 +717,9 @@ def build_default_workflow(
             performance_text_llm=template_review_llm,
         ),
         extract_with_recorder=extract_requirements,
+        extract_retry_with_recorder=extract_requirements_for_retry,
         extract_evaluation_with_recorder=extract_evaluation,
+        extract_evaluation_retry_with_recorder=extract_evaluation_for_retry,
         score_objective_with_recorder=score_objective,
         score_subjective_with_recorder=score_subjective,
         execute_veto_with_recorder=execute_veto,
@@ -1027,7 +921,6 @@ def create_app(
     )
     def retry_bid_check_task(
         task_id: str,
-        retry_request: RetryTaskRequest,
         background_tasks: BackgroundTasks,
     ):
         task = active_repository.get(task_id)
@@ -1042,21 +935,8 @@ def create_app(
                 detail="只有失败任务可以重试。",
             )
 
-        if retry_request.retry_from == "failed_stage":
-            retry_stage = _resolved_retry_stage(task)
-            _validate_retry_prefix(task, retry_stage)
-        else:
-            retry_stage = (
-                "evaluation_rules"
-                if task.check_mode == "evaluation"
-                else "requirements"
-            )
-
         try:
-            retried_task = active_repository.prepare_retry(
-                task_id,
-                retry_request.retry_from,
-            )
+            retried_task = active_repository.prepare_retry(task_id)
         except KeyError as exc:
             raise HTTPException(
                 status_code=404,
@@ -1068,7 +948,7 @@ def create_app(
         background_tasks.add_task(
             active_workflow.run,
             task_id,
-            retry_from=retry_stage,
+            reuse_parsed=True,
         )
         return retried_task.to_dict()
 

@@ -12,7 +12,6 @@ from app.models import (
     BidCheckTask,
     CheckMode,
     FileMetadata,
-    RetryFrom,
     StageName,
     TaskStatus,
 )
@@ -23,37 +22,12 @@ STAGE_COLUMNS: dict[StageName, str] = {
     "requirements": "requirements_status",
     "bid_parse": "bid_parse_status",
     "review": "review_status",
-    "evaluation_rules": "evaluation_rules_status",
-    "objective_scoring": "objective_scoring_status",
-    "subjective_scoring": "subjective_scoring_status",
-    "veto_rule_execution": "veto_rule_execution_status",
-}
-FULL_STAGE_ORDER: tuple[StageName, ...] = (
-    "requirements",
-    "bid_parse",
-    "review",
-    "evaluation_rules",
-    "objective_scoring",
-    "subjective_scoring",
-    "veto_rule_execution",
-)
-MODE_STAGE_ORDER: dict[CheckMode, tuple[StageName, ...]] = {
-    "compliance": ("requirements", "bid_parse", "review"),
-    "evaluation": (
-        "evaluation_rules",
-        "objective_scoring",
-        "veto_rule_execution",
-    ),
-    "full": FULL_STAGE_ORDER,
-}
-RESULT_KEY_BY_STAGE: dict[StageName, str] = {
-    "requirements": "requirements",
-    "bid_parse": "bid_parse",
-    "review": "review_result",
-    "evaluation_rules": "evaluation_rules",
-    "objective_scoring": "objective_scores",
-    "subjective_scoring": "subjective_scores",
-    "veto_rule_execution": "veto_rule_reviews",
+    # Evaluation sub-stages remain accepted for reading old callers, but the
+    # task state is intentionally kept at the original three-stage granularity.
+    "evaluation_rules": "review_status",
+    "objective_scoring": "review_status",
+    "subjective_scoring": "review_status",
+    "veto_rule_execution": "review_status",
 }
 EVALUATION_STATUS_COLUMNS = (
     "evaluation_rules_status",
@@ -412,9 +386,6 @@ class BidCheckRepository:
         total_status = "running" if status == "running" else None
         assignments = [f"{column} = ?", "status = COALESCE(?, status)"]
         parameters: list[Any] = [status, total_status]
-        if stage == "evaluation_rules":
-            assignments.append("requirements_status = ?")
-            parameters.append(status)
         assignments.extend(["updated_at = ?"])
         parameters.extend([self._now(), task_id])
         with self._write_lock, self._connect() as connection:
@@ -482,41 +453,10 @@ class BidCheckRepository:
             )
         return self._get_required(task_id)
 
-    @staticmethod
-    def _retry_reset_stages(
-        task: BidCheckTask,
-        start_stage: StageName,
-        retry_from: RetryFrom,
-    ) -> set[StageName]:
-        stage_order = MODE_STAGE_ORDER[task.check_mode]
-        if retry_from == "start":
-            return set(stage_order)
-
-        if start_stage not in stage_order:
-            raise ValueError("failed stage is not applicable to this task")
-        stage_index = stage_order.index(start_stage)
-        if start_stage in {"requirements", "bid_parse"}:
-            reset_stages = {
-                stage
-                for stage in ("requirements", "bid_parse")
-                if stage in stage_order
-                and (
-                    stage == start_stage
-                    or getattr(task, STAGE_COLUMNS[stage]) == "failed"
-                )
-            }
-            reset_stages.update(stage_order[2:])
-            return reset_stages
-        return set(stage_order[stage_index:])
-
     def prepare_retry(
         self,
         task_id: str,
-        retry_from: RetryFrom,
     ) -> BidCheckTask:
-        if retry_from not in {"start", "failed_stage"}:
-            raise ValueError("unsupported retry mode")
-
         with self._write_lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM bid_check_tasks WHERE task_id = ?",
@@ -527,43 +467,17 @@ class BidCheckRepository:
                 raise KeyError(task_id)
             if task.status != "failed":
                 raise ValueError("only failed tasks can be retried")
-
-            start_stage = task.failed_stage
-            if retry_from == "start":
-                start_stage = MODE_STAGE_ORDER[task.check_mode][0]
-            elif task.check_mode == "evaluation" and start_stage == "requirements":
-                start_stage = "evaluation_rules"
-            if start_stage is None:
-                raise ValueError("failed stage is unavailable")
-
-            reset_stages = self._retry_reset_stages(
-                task,
-                start_stage,
-                retry_from,
-            )
-            existing_result = task.result if isinstance(task.result, dict) else {}
-            retry_result = {
-                key: value
-                for key, value in existing_result.items()
-                if not any(
-                    key == RESULT_KEY_BY_STAGE[stage]
-                    for stage in reset_stages
-                )
-            }
-
             assignments = ["status = 'pending'"]
             parameters: list[Any] = []
-            for stage in FULL_STAGE_ORDER:
-                if stage in reset_stages:
-                    column = STAGE_COLUMNS[stage]
+            for column in (
+                "requirements_status",
+                "bid_parse_status",
+                "review_status",
+                *EVALUATION_STATUS_COLUMNS,
+            ):
+                if column not in assignments:
                     assignments.append(f"{column} = ?")
                     parameters.append("pending")
-            if (
-                task.check_mode == "evaluation"
-                and "evaluation_rules" in reset_stages
-            ):
-                assignments.append("requirements_status = ?")
-                parameters.append("pending")
             assignments.extend(
                 [
                     "failed_stage = NULL",
@@ -574,7 +488,7 @@ class BidCheckRepository:
             )
             parameters.extend(
                 [
-                    json.dumps(retry_result, ensure_ascii=False),
+                    json.dumps({}, ensure_ascii=False),
                     self._now(),
                     task_id,
                 ]
@@ -599,7 +513,8 @@ class BidCheckRepository:
     ) -> BidCheckTask:
         if stage not in STAGE_COLUMNS:
             raise ValueError(f"unsupported stage: {stage}")
-        column = STAGE_COLUMNS[stage]
+        persisted_stage = stage if stage in {"requirements", "bid_parse", "review"} else "review"
+        column = STAGE_COLUMNS[persisted_stage]
         with self._write_lock, self._connect() as connection:
             cursor = connection.execute(
                 f"""
@@ -610,7 +525,7 @@ class BidCheckRepository:
                     updated_at = ?
                 WHERE task_id = ?
                 """,
-                (stage, message, self._now(), task_id),
+                (persisted_stage, message, self._now(), task_id),
             )
             if cursor.rowcount != 1:
                 raise KeyError(task_id)

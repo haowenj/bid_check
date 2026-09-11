@@ -1006,6 +1006,37 @@ class _BatchSpecificFailingEvaluationLLM:
         }
 
 
+class _FormatThenSuccessEvaluationLLM:
+    model = "format-then-success-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def extract(self, candidates):
+        assert len(candidates) == 1
+        self.calls += 1
+        if self.calls == 1:
+            from app.evaluation_rule_extraction import EvaluationRuleExtractionError
+
+            raise EvaluationRuleExtractionError(
+                "LLM 评标规则提取失败：模型响应不是有效 JSON。"
+            ) from json.JSONDecodeError("invalid", "{", 1)
+        return {
+            "score_categories": [],
+            "score_items": [],
+            "veto_rules": [],
+            "uncertain_rules": [
+                {
+                    "rule_type": "test",
+                    "description": "重试后规则",
+                    "original_rule": "评分规则1",
+                    "uncertainty_reason": "test",
+                    "source_block_ids": ["r1"],
+                }
+            ],
+        }
+
+
 def test_evaluation_batches_run_concurrently_with_global_cap_and_stable_order(
     tmp_path,
 ):
@@ -1073,6 +1104,34 @@ def test_evaluation_batch_failure_identifies_batch_and_keeps_call_stats(tmp_path
     assert summary["stats"]["llm_total_calls"] == 2
     assert summary["stats"]["llm_completed_calls"] == 1
     assert summary["stats"]["llm_failed_calls"] == 1
+
+
+def test_evaluation_batch_retries_invalid_json_response(tmp_path):
+    from app.evaluation_rule_extraction import extract_tender_evaluation_rules
+
+    task_dir = tmp_path / "task-format-retry"
+    task_dir.mkdir()
+    tender = task_dir / "tender.docx"
+    tender.write_bytes(b"tender")
+    recorder = ComplianceExtractionRecorder(task_dir)
+    llm = _FormatThenSuccessEvaluationLLM()
+
+    result = extract_tender_evaluation_rules(
+        FileMetadata("招标文件.docx", tender.stat().st_size, str(tender)),
+        parser=_ParallelEvaluationParser(candidate_count=1),
+        llm=llm,
+        recorder=recorder,
+        max_batches=1,
+        max_batch_chars=1,
+        max_retries=1,
+    )
+
+    assert llm.calls == 2
+    assert result["uncertain_rules"][0]["description"] == "重试后规则"
+    assert result["stats"]["llm_total_calls"] == 2
+    assert result["stats"]["llm_completed_calls"] == 1
+    assert result["stats"]["llm_failed_calls"] == 1
+    assert result["stats"]["llm_retries"] == 1
 
 
 def test_evaluation_request_semaphore_caps_concurrent_tasks_at_five(tmp_path):

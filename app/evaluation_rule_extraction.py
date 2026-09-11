@@ -43,6 +43,12 @@ EVALUATION_LLM_MAX_CONCURRENCY = 5
 _EVALUATION_LLM_SEMAPHORE = threading.BoundedSemaphore(
     EVALUATION_LLM_MAX_CONCURRENCY
 )
+_RETRYABLE_EVALUATION_FORMAT_MARKERS = (
+    "不是有效 JSON",
+    "响应结构异常",
+    "Schema 校验失败",
+    "结果不是 JSON 对象",
+)
 
 _EVALUATION_TITLE_RE = re.compile(
     r"评标办法|评审办法|综合评估法|综合评分法|评分标准|评审标准|"
@@ -1434,10 +1440,18 @@ def _merge_normalized_outputs(
 
 def _is_transient_evaluation_error(error: EvaluationRuleExtractionError) -> bool:
     cause = error.__cause__
-    return isinstance(
+    if isinstance(
         cause,
-        (TimeoutError, ConnectionError, OSError, urllib.error.URLError),
-    )
+        (
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+        ),
+    ):
+        return True
+    return any(marker in str(error) for marker in _RETRYABLE_EVALUATION_FORMAT_MARKERS)
 
 
 def _run_evaluation_batch(
