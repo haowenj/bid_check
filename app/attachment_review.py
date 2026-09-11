@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.file_requirement_review import run_file_requirement_review
 from app.llm_concurrency import llm_request_slot
+from app.llm_protocol import build_thinking_params, normalize_llm_provider
 from app.navigation_content import (
     filter_navigation_sections,
     filter_navigation_templates,
@@ -838,6 +839,8 @@ def build_attachment_request_payload(
     user_prompt: str,
     images: list[dict[str, Any]],
     max_tokens: int = 8192,
+    provider: str = "dashscope",
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     for image in images:
@@ -858,10 +861,9 @@ def build_attachment_request_payload(
                     "text": f"image_id={image_id} 的图片资源当前无法读取。",
                 }
             )
-    return {
+    payload = {
         "model": model,
         "temperature": 0,
-        "enable_thinking": False,
         "max_tokens": max(256, min(max_tokens, 8192)),
         "response_format": {"type": "json_object"},
         "messages": [
@@ -869,6 +871,8 @@ def build_attachment_request_payload(
             {"role": "user", "content": content},
         ],
     }
+    payload.update(build_thinking_params(provider, enable_thinking))
+    return payload
 
 
 class OpenAICompatibleAttachmentReviewLLM:
@@ -882,12 +886,16 @@ class OpenAICompatibleAttachmentReviewLLM:
         model: str = "qwen3.8-27b",
         timeout_seconds: float = 90,
         max_tokens: int = 8192,
+        provider: str = "dashscope",
+        enable_thinking: bool = False,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
+        self.provider = normalize_llm_provider(provider)
+        self.enable_thinking = bool(enable_thinking)
 
     def review_attachment(
         self,
@@ -901,6 +909,8 @@ class OpenAICompatibleAttachmentReviewLLM:
             user_prompt=user_prompt,
             images=images,
             max_tokens=self.max_tokens,
+            provider=self.provider,
+            enable_thinking=self.enable_thinking,
         )
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -1206,6 +1216,8 @@ def _review_one_attachment(
                         system_prompt=ATTACHMENT_REVIEW_SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                         images=images,
+                        provider=getattr(llm, "provider", "dashscope"),
+                        enable_thinking=getattr(llm, "enable_thinking", False),
                     ),
                 )
             raw_output = llm.review_attachment(

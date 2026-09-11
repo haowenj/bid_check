@@ -10,6 +10,7 @@ from app.attachment_review import (
     ATTACHMENT_REVIEW_SYSTEM_PROMPT,
     OpenAICompatibleAttachmentReviewLLM,
     build_attachment_review_user_prompt,
+    build_attachment_request_payload,
     extract_attachment_requirements,
     is_complex_attachment_scope,
     run_attachment_review,
@@ -17,6 +18,20 @@ from app.attachment_review import (
     template_has_attachment_requirement,
 )
 from app.compliance_artifacts import ComplianceExtractionRecorder
+
+
+def test_attachment_payload_uses_vllm_thinking_parameter_shape():
+    payload = build_attachment_request_payload(
+        model="qwen3.8-27b",
+        system_prompt="system",
+        user_prompt="user",
+        images=[],
+        provider="vllm",
+        enable_thinking=False,
+    )
+
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "enable_thinking" not in payload
 
 
 class RecordingAttachmentLLM:

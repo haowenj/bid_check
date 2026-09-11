@@ -18,6 +18,7 @@ from typing import Any, Literal, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.llm_concurrency import llm_request_slot
+from app.llm_protocol import build_thinking_params, normalize_llm_provider
 from app.compliance_extraction import (
     DocumentParser,
     MinerUDocumentParser,
@@ -1127,12 +1128,16 @@ class OpenAICompatibleEvaluationRuleLLM:
         model: str = "gpt-4o-mini",
         timeout_seconds: float = 90,
         max_tokens: int = 8192,
+        provider: str = "dashscope",
+        enable_thinking: bool = False,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max(256, min(max_tokens, 8192))
+        self.provider = normalize_llm_provider(provider)
+        self.enable_thinking = bool(enable_thinking)
         self._call_context = threading.local()
         self._last_usage = threading.local()
 
@@ -1191,7 +1196,6 @@ class OpenAICompatibleEvaluationRuleLLM:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "enable_thinking": False,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -1199,6 +1203,7 @@ class OpenAICompatibleEvaluationRuleLLM:
                 {"role": "user", "content": prompt},
             ],
         }
+        payload.update(build_thinking_params(self.provider, self.enable_thinking))
         context = self._call_context_value()
         recorder = context.get("recorder")
         call_id = context.get("call_id")

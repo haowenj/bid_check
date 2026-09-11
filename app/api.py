@@ -548,6 +548,8 @@ def build_default_workflow(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             model=settings.llm_model,
+            provider=settings.llm_provider,
+            enable_thinking=settings.llm_enable_thinking,
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
         )
@@ -556,6 +558,8 @@ def build_default_workflow(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             model=settings.llm_model,
+            provider=settings.llm_provider,
+            enable_thinking=settings.llm_enable_thinking,
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
         )
@@ -563,6 +567,8 @@ def build_default_workflow(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             model=settings.llm_model,
+            provider=settings.llm_provider,
+            enable_thinking=settings.llm_enable_thinking,
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=max(settings.llm_timeout_seconds, 180.0),
         )
@@ -577,6 +583,8 @@ def build_default_workflow(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             model=settings.llm_model,
+            provider=settings.llm_provider,
+            enable_thinking=settings.llm_enable_thinking,
             max_tokens=settings.llm_max_tokens,
             timeout_seconds=max(settings.llm_timeout_seconds, 180.0),
         )

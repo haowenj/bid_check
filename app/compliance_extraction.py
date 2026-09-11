@@ -28,6 +28,7 @@ import httpx
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
 from app.llm_concurrency import llm_request_slot
+from app.llm_protocol import build_thinking_params, normalize_llm_provider
 from app.models import (
     FileMetadata,
     FileRequirement,
@@ -3394,12 +3395,16 @@ class OpenAICompatibleLLM:
         model: str = "gpt-4o-mini",
         timeout_seconds: float = 90,
         max_tokens: int = 8192,
+        provider: str = "dashscope",
+        enable_thinking: bool = False,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max(256, min(max_tokens, 8192))
+        self.provider = normalize_llm_provider(provider)
+        self.enable_thinking = bool(enable_thinking)
         self._call_context = threading.local()
 
     def set_call_context(
@@ -3442,7 +3447,6 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "enable_thinking": False,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -3450,6 +3454,7 @@ class OpenAICompatibleLLM:
                 {"role": "user", "content": prompt},
             ],
         }
+        payload.update(build_thinking_params(self.provider, self.enable_thinking))
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -3612,7 +3617,6 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "enable_thinking": False,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -3620,6 +3624,7 @@ class OpenAICompatibleLLM:
                 {"role": "user", "content": prompt},
             ],
         }
+        payload.update(build_thinking_params(self.provider, self.enable_thinking))
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -3690,7 +3695,6 @@ class OpenAICompatibleLLM:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "enable_thinking": False,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -3698,6 +3702,7 @@ class OpenAICompatibleLLM:
                 {"role": "user", "content": user_prompt},
             ],
         }
+        payload.update(build_thinking_params(self.provider, self.enable_thinking))
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

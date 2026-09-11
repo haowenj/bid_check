@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from app.llm_protocol import DEFAULT_LLM_PROVIDER, normalize_llm_provider
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -23,6 +25,7 @@ class Settings:
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
+    llm_provider: str = DEFAULT_LLM_PROVIDER
     llm_enable_thinking: bool = False
     llm_max_tokens: int = 8192
     llm_timeout_seconds: float = 90.0
@@ -109,6 +112,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         ),
         llm_model=_env_value(project_env, "LLM_MODEL", "gpt-4o-mini")
         or "gpt-4o-mini",
+        llm_provider=normalize_llm_provider(
+            _env_value(project_env, "LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+        ),
         llm_enable_thinking=_env_bool(project_env, "LLM_ENABLE_THINKING", False),
         llm_max_tokens=int(
             _env_value(project_env, "LLM_MAX_TOKENS", "8192") or "8192"

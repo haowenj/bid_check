@@ -20,6 +20,7 @@ from app.attachment_review import (
     build_attachment_request_payload,
 )
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.llm_protocol import build_thinking_params
 from app.template_matching import normalize_module_title
 
 PERFORMANCE_CASE_TITLE = "21.1 信达旺大厦云平台运营及维护服务"
@@ -2388,6 +2389,8 @@ def _review_case(
                         system_prompt=PERFORMANCE_REVIEW_SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                         images=model_images,
+                        provider=getattr(llm, "provider", "dashscope"),
+                        enable_thinking=getattr(llm, "enable_thinking", False),
                     ),
                 )
             raw_output = llm.review_attachment(
@@ -2615,7 +2618,10 @@ def _review_case_with_full_ocr(
                     {
                         "model": text_model,
                         "temperature": 0,
-                        "enable_thinking": False,
+                        **build_thinking_params(
+                            getattr(text_llm, "provider", "dashscope"),
+                            getattr(text_llm, "enable_thinking", False),
+                        ),
                         "response_format": {"type": "json_object"},
                         "messages": [
                             {
@@ -2828,6 +2834,10 @@ def _review_case_with_full_ocr(
                             system_prompt=PERFORMANCE_VISUAL_REVIEW_SYSTEM_PROMPT,
                             user_prompt=visual_prompt,
                             images=model_images,
+                            provider=getattr(visual_llm, "provider", "dashscope"),
+                            enable_thinking=getattr(
+                                visual_llm, "enable_thinking", False
+                            ),
                         ),
                     )
                 raw_output = visual_llm.review_attachment(

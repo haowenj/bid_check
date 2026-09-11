@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.compliance_artifacts import ComplianceExtractionRecorder
+from app.llm_protocol import build_thinking_params
 from app.navigation_content import (
     filter_navigation_sections,
     filter_navigation_templates,
@@ -948,17 +949,25 @@ def _downgrade_unverified_not_applicable(
     return downgraded
 
 
-def _review_request_payload(model: str, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-    return {
+def _review_request_payload(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    provider: str = "dashscope",
+    enable_thinking: bool = False,
+) -> dict[str, Any]:
+    payload = {
         "model": model,
         "temperature": 0,
-        "enable_thinking": False,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
     }
+    payload.update(build_thinking_params(provider, enable_thinking))
+    return payload
 
 
 def _is_retryable_template_review_error(exc: Exception) -> bool:
@@ -1039,6 +1048,8 @@ def _review_matched_template(
                         model,
                         TEMPLATE_TEXT_REVIEW_SYSTEM_PROMPT,
                         user_prompt,
+                        provider=getattr(llm, "provider", "dashscope"),
+                        enable_thinking=getattr(llm, "enable_thinking", False),
                     ),
                 )
             if callable(set_call_context):
@@ -1182,6 +1193,8 @@ def _review_exception_template(
                         model,
                         TEMPLATE_TEXT_EXCEPTION_REVIEW_SYSTEM_PROMPT,
                         user_prompt,
+                        provider=getattr(llm, "provider", "dashscope"),
+                        enable_thinking=getattr(llm, "enable_thinking", False),
                     ),
                 )
             if callable(set_call_context):

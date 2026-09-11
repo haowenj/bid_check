@@ -1906,6 +1906,61 @@ def test_openai_compatible_client_sends_template_review_prompts(monkeypatch):
     ]
 
 
+def test_openai_compatible_client_uses_vllm_thinking_parameter_shape(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "status": "pass",
+                                        "summary": "文本完整。",
+                                        "issues": [],
+                                        "semantic_match": {
+                                            "status": "matched",
+                                            "reason": "模块用途与模板对应。",
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(extraction_module.urllib.request, "urlopen", fake_urlopen)
+    llm = OpenAICompatibleLLM(
+        api_key="test-key",
+        base_url="https://vllm.example/v1",
+        model="test-model",
+        provider="vllm",
+        enable_thinking=False,
+    )
+
+    llm.review_template("system", "user")
+
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "enable_thinking" not in captured["payload"]
+
+
 def test_default_workflow_uses_template_text_review_service(settings, repository):
     workflow = build_default_workflow(settings, repository)
     try:
