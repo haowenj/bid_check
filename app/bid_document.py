@@ -21,6 +21,13 @@ from typing import Any
 
 import httpx
 
+from app.mineru_v1 import (
+    MINERU_V1_PROTOCOL_LABEL,
+    MINERU_V1_PROTOCOL_VERSION,
+    read_structured_archive,
+    run_v1_task,
+)
+
 _SOURCE_KEY = "_bid_source"
 MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
 MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
@@ -86,6 +93,8 @@ def _expanded_payload_items(payload: Any) -> list[tuple[int, Any, list[Any]]]:
             for child_index, child in enumerate(value):
                 visit(child, [*source_path, child_index])
             return
+        if isinstance(value, dict):
+            source_path = value.get("mineru_source_path", source_path)
         expanded.append((raw_item_index, value, source_path))
         raw_item_index += 1
 
@@ -1112,6 +1121,7 @@ class MinerUBidDocumentParser:
         self.timeout_seconds = float(timeout_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self._http_client = http_client
+        self._service_protocol = MINERU_TASKS_PROTOCOL_LABEL
 
     def parse(self, path: Path, *, output_dir: Path) -> dict[str, Any]:
         source_path = Path(path).expanduser().resolve()
@@ -1132,8 +1142,12 @@ class MinerUBidDocumentParser:
         source_sha256 = _sha256_file(source_path)
         diagnostics = {
             "parser": "mineru_bid_document_cleaner",
-            "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
-            "protocol_version": MINERU_TASKS_PROTOCOL_VERSION,
+            "service_protocol": self._service_protocol,
+            "protocol_version": (
+                MINERU_V1_PROTOCOL_VERSION
+                if self._service_protocol == MINERU_V1_PROTOCOL_LABEL
+                else MINERU_TASKS_PROTOCOL_VERSION
+            ),
             "task_id": task_id,
             "mineru_backend": self.mineru_backend,
             "content_member": content_member,
@@ -1178,7 +1192,7 @@ class MinerUBidDocumentParser:
             "cleaning_log": artifact_dir / "cleaning_log.json",
             "merge_log": artifact_dir / "merge_log.json",
         }
-        # The raw content list is copied byte-for-byte from the MinerU ZIP.
+        # Preserve the source JSON bytes, including 4.x structured_content.
         _write_bytes_atomic(artifacts["raw_content_list"], raw_content_bytes)
         _write_json_atomic(artifacts["cleaned_content_list"], cleaned)
         _write_json_atomic(artifacts["merged_content_list"], merged)
@@ -1509,6 +1523,7 @@ class MinerUBidDocumentParser:
             follow_redirects=False,
         )
         try:
+            self._service_protocol = MINERU_TASKS_PROTOCOL_LABEL
             try:
                 with path.open("rb") as source:
                     response = client.post(
@@ -1529,6 +1544,14 @@ class MinerUBidDocumentParser:
                 raise BidDocumentCleaningError(
                     f"MinerU 任务提交失败：{type(exc).__name__}。"
                 ) from exc
+            if response.status_code in {404, 405}:
+                self._service_protocol = MINERU_V1_PROTOCOL_LABEL
+                return run_v1_task(
+                    client, path, base_url=base_url, headers=headers,
+                    timeout_seconds=self.timeout_seconds,
+                    poll_interval_seconds=self.poll_interval_seconds,
+                    error_type=BidDocumentCleaningError,
+                )
             if response.status_code != 202:
                 raise BidDocumentCleaningError(
                     f"MinerU 任务提交失败：HTTP {response.status_code}。"
@@ -1653,9 +1676,14 @@ class MinerUBidDocumentParser:
                     )
                 ]
                 if not content_members:
-                    raise BidDocumentCleaningError(
-                        "MinerU 结果 ZIP 未返回 content list。"
+                    payload, raw_content_bytes, content_member = read_structured_archive(
+                        archive, safe_members, BidDocumentCleaningError
                     )
+                    return payload, raw_content_bytes, content_member, {
+                        "unsafe_zip_member_count": len(unsafe_members),
+                        "unsafe_zip_members": unsafe_members[:20],
+                        "content_format": "structured_content",
+                    }
                 v2_members = [
                     info
                     for info in content_members

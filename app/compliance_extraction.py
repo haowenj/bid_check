@@ -38,6 +38,11 @@ from app.models import (
     TenderTemplate,
 )
 from app.navigation_content import classify_navigation_item
+from app.mineru_v1 import (
+    MINERU_V1_PROTOCOL_LABEL,
+    read_structured_archive,
+    run_v1_task,
+)
 
 logger = logging.getLogger(__name__)
 REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v5-single-file"
@@ -722,7 +727,7 @@ def _mineru_payload_diagnostics(payload: Sequence[dict[str, Any]]) -> dict[str, 
 
 
 class MinerUDocumentParser:
-    """Use the project's MinerU ``/tasks`` service for every document parse."""
+    """Use MinerU 3.x tasks, falling back to the 4.x upload/job API."""
 
     def __init__(
         self,
@@ -756,11 +761,11 @@ class MinerUDocumentParser:
 
     @property
     def cache_descriptor(self) -> dict[str, Any]:
-        transport = "mineru_tasks"
+        transport = "mineru_auto"
         return {
             "parser": self.parser_name,
             "transport": transport,
-            "protocol": MINERU_TASKS_PROTOCOL_VERSION,
+            "protocol": "mineru-auto-v2",
             "url": (self.mineru_url or "").strip(),
             "backend": self.mineru_backend,
             "server_url": (self.mineru_server_url or "").strip(),
@@ -773,6 +778,11 @@ class MinerUDocumentParser:
             self.parser_name,
             path.name,
         )
+        self.parse_diagnostics = {
+            "parser": self.parser_name,
+            "mineru_called": False,
+            "service_protocol": None,
+        }
         try:
             if (self.mineru_url or "").strip():
                 blocks = self._parse_with_mineru_service(path)
@@ -781,24 +791,10 @@ class MinerUDocumentParser:
                     "MinerU 服务未配置，请配置 MINERU_URL。"
                 )
         except ComplianceExtractionError:
-            self.parse_diagnostics = {
-                "parser": self.parser_name,
-                "mineru_called": False,
-                "service_protocol": MINERU_TASKS_PROTOCOL_LABEL
-                if (self.mineru_url or "").strip()
-                else None,
-                "elapsed_ms": _elapsed_ms(started_at),
-            }
+            self.parse_diagnostics["elapsed_ms"] = _elapsed_ms(started_at)
             raise
         except Exception as exc:
-            self.parse_diagnostics = {
-                "parser": self.parser_name,
-                "mineru_called": bool((self.mineru_url or "").strip()),
-                "service_protocol": MINERU_TASKS_PROTOCOL_LABEL
-                if (self.mineru_url or "").strip()
-                else None,
-                "elapsed_ms": _elapsed_ms(started_at),
-            }
+            self.parse_diagnostics["elapsed_ms"] = _elapsed_ms(started_at)
             raise ComplianceExtractionError(
                 f"MinerU 文档解析失败：{type(exc).__name__}。"
             ) from exc
@@ -862,6 +858,9 @@ class MinerUDocumentParser:
             follow_redirects=False,
         )
         try:
+            self.parse_diagnostics.update(
+                mineru_called=True, service_protocol=MINERU_TASKS_PROTOCOL_LABEL
+            )
             try:
                 with path.open("rb") as source:
                     response = client.post(
@@ -882,6 +881,15 @@ class MinerUDocumentParser:
                 raise ComplianceExtractionError(
                     f"MinerU 任务提交失败：{type(exc).__name__}。"
                 ) from exc
+            if response.status_code in {404, 405}:
+                self.parse_diagnostics["service_protocol"] = MINERU_V1_PROTOCOL_LABEL
+                raw, task_id = run_v1_task(
+                    client, path, base_url=base_url, headers=headers,
+                    timeout_seconds=self.timeout_seconds,
+                    poll_interval_seconds=self.poll_interval_seconds,
+                    error_type=ComplianceExtractionError,
+                )
+                return self._blocks_from_result(path, raw, task_id, MINERU_V1_PROTOCOL_LABEL)
             if response.status_code != 202:
                 raise ComplianceExtractionError(
                     f"MinerU 任务提交失败：HTTP {response.status_code}。"
@@ -938,25 +946,30 @@ class MinerUDocumentParser:
                 raise ComplianceExtractionError(
                     f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
                 )
-            content_list = self._content_list_from_zip(result_response.content)
-            blocks = _blocks_from_mineru_payload(content_list)
-            blocks, project_front_table_recovered = _recover_project_front_table(
-                path, blocks
+            return self._blocks_from_result(
+                path, result_response.content, task_id, MINERU_TASKS_PROTOCOL_LABEL
             )
-            self.parse_diagnostics.update(
-                {
-                    "parser": "mineru",
-                    "mineru_called": True,
-                    "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
-                    "task_id": task_id,
-                    "project_front_table_recovered": project_front_table_recovered,
-                    **_mineru_payload_diagnostics(content_list),
-                }
-            )
-            return blocks
         finally:
             if owns_client:
                 client.close()
+
+    def _blocks_from_result(
+        self, path: Path, raw: bytes, task_id: str, protocol: str
+    ) -> list[StructuredBlock]:
+        content_list = self._content_list_from_zip(raw)
+        blocks = _blocks_from_mineru_payload(content_list)
+        blocks, recovered = _recover_project_front_table(path, blocks)
+        self.parse_diagnostics.update(
+            {
+                "parser": "mineru",
+                "mineru_called": True,
+                "service_protocol": protocol,
+                "task_id": task_id,
+                "project_front_table_recovered": recovered,
+                **_mineru_payload_diagnostics(content_list),
+            }
+        )
+        return blocks
 
     @staticmethod
     def _json_object(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -988,6 +1001,7 @@ class MinerUDocumentParser:
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                 members = []
+                safe_members = []
                 for info in archive.infolist():
                     if info.is_dir():
                         continue
@@ -997,14 +1011,16 @@ class MinerUDocumentParser:
                         raise ComplianceExtractionError(
                             "MinerU 结果 ZIP 包含不安全路径。"
                         )
+                    safe_members.append(info)
                     if normalized.lower().endswith(
                         ("_content_list.json", "_content_list_v2.json", "content_list.json")
                     ):
                         members.append(info)
                 if not members:
-                    raise ComplianceExtractionError(
-                        "MinerU 结果 ZIP 未返回 content list。"
+                    payload, _, _ = read_structured_archive(
+                        archive, safe_members, ComplianceExtractionError
                     )
+                    return _flatten_mineru_content_list(payload)
                 v2_members = [
                     info
                     for info in members

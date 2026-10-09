@@ -24,12 +24,12 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 - 仅支持招标文件和投标文件 `.docx` 上传；
 - “标书合规性校验”“评标规则校验”和“全面校验”均可执行；全面校验按“合规检查 → 评标检查”串行编排，复用合规阶段已经生成的投标文件解析、检查产物和事实，不重复执行合规检查；评标阶段继续复用现有客观评分、主观评分和否决规则执行逻辑；
 - “评标规则校验”从招标文件的 MinerU 结构块中提取评分规则和具有明确后果的否决性规则，并继续执行现有客观评分和否决规则流程；主观评分仍可通过独立接口触发；“全面校验”会在客观评分后自动执行主观评分，再执行否决规则检查；
-- 招标文件要求提取只调用项目现有 MinerU `/tasks` 服务链路；MinerU 配置从环境变量读取，调用失败时任务明确失败；
+- 招标文件要求提取调用 MinerU 服务：先尝试 3.x `/tasks`，提交接口返回 404/405 时切换到 4.x `/v1/uploads` 和 `/v1/parse/jobs`；MinerU 配置从环境变量读取，调用失败时任务明确失败；
 - 配置 `LLM_API_KEY` 后，招标对象提取仅在模板边界、模板命名或前附表行存在歧义时使用 OpenAI-compatible Chat Completions；模板文本检查对全部明确匹配且有可靠模块内容的模板各执行一次完整模块对照调用，并发数为 3；未配置时使用安全的 uncertain fallback；
 - MinerU/结构解析结果和各阶段提取结果分别按招标文件内容哈希缓存；
 - 结果页展示完整模板、项目专用编制要求、模板外补充证明材料，以及当前单份投标文件自身的文件级要求；文件级检查仅使用用户原始上传文件的文件名、后缀和 `Path.stat().st_size`，不使用 MinerU 中间文件。
 - 文件级要求提取从结构化招标文件中保留投标人须知/前附表、投标文件编制制作递交、电子投标文件、上传加密解密等完整候选区域，专用 LLM 只返回明确约束当前单份文件的大小、格式、文件名等规则；文件数量、分别提交、备份、多格式组合、U 盘/光盘、纸质副本、密封包装和平台上传能力说明均不进入正式规则。
-- 投标文件清洗阶段已接入真实 MinerU `/tasks` 结果：保留原始 content list、清洗日志、跨页合并日志、章节结构、独立表格和独立图片索引；本阶段不执行模板匹配、附件/字段校验、RAG、LLM 判断、签字盖章识别或最终检查规则。
+- 投标文件清洗和图片 OCR 共用 MinerU 3.x/4.x 兼容流程：保留原始结果 JSON、清洗日志、跨页合并日志、章节结构、独立表格和独立图片索引；本阶段不执行模板匹配、附件/字段校验、RAG、LLM 判断、签字盖章识别或最终检查规则。
 - 当前模板文本检查以一个完整招标模板和一个已匹配投标文件模块为一次 LLM 调用；模型先在同一次调用中确认两者的语义、用途和核心内容是否对应，只有确认后才判断文本层面的填写、占位残留、正文遗漏、实质性修改和条件适用性。语义不匹配或不确定只记录为候选状态，不形成业务 fail；本阶段不判断签字、盖章、图片、附件真实性或外部状态。
 - 当前附件检查从完整模板正文中识别明确的普通证明材料要求，仅处理已经明确匹配且不属于 21/21.x 业绩合同内部审查范围的模板；每个模块将正文、表格和结构化关联图片提交给多模态模型，先在同一次调用中确认候选确实是投标时额外提供的独立证明材料，再保存视觉事实并形成附件要求结论。模板正文、表格填写、承诺函、普通签字盖章和未来履约义务不会仅因关键词命中而进入附件业务检查；不判断证件或银行账户真实性，也不处理业绩合同。
 - 21.x 业绩合同检查当前启用 `21.1`～`21.6`：DOCX 首次经过 MinerU 解析时同步对图片做 OCR，并将结果按 `image_id`、图片块和 `section_path` 写入 `structured_document`；检查阶段按每个 21.x 子章节独立收集全部图片及完整 OCR，按原始顺序一次提交给现有文本 LLM，由文本模型提取合同事实、证明材料和签署页候选，不再用关键词筛选结果删减合同正文。只有文本模型定位出的少量签署候选图片，以及 OCR unavailable 图片，交给现有视觉模型，不重复调用图片 OCR。金额、时间、甲乙方和服务内容等事实必须带有对应 `image_id` 及 OCR 原文证据；同时核对业绩情况表当前行与合同项目、合同相对方、金额和服务期限的一致性，不能以顺序对应代替事实一致。签字、盖章和签署日期仍由视觉模型确认。检查证明文件顺序、合同服务内容、实施时间、合同金额、合同签页、合同签署日期及框架合同条件性结算材料；不同 21.x 之间不共享证据。结果写入 `10_performance_reviews.json`，并与现有模板文本/普通附件检查结果汇合展示。
@@ -52,6 +52,10 @@ MinerU 使用项目既有服务配置：
 - `MINERU_TIMEOUT_SECONDS`、`MINERU_POLL_INTERVAL_SECONDS`：任务超时与轮询间隔；
 - `LLM_API_KEY`：启用 OpenAI-compatible LLM；同时可设置 `LLM_BASE_URL`、`LLM_MODEL`、`LLM_PROVIDER`（默认 `dashscope`，可选 `vllm`）、`LLM_ENABLE_THINKING`、`LLM_MAX_TOKENS`（默认 8192）、`LLM_TIMEOUT_SECONDS`、`LLM_MAX_CONCURRENCY`（默认 5，限制单个应用进程内同时进行的 LLM 请求数）。
 - `LLM_PROVIDER=dashscope` 时按 DashScope 约定发送顶层 `enable_thinking`；配置为 `vllm` 时按 Qwen/vLLM 约定发送 `chat_template_kwargs.enable_thinking`。项目根目录可放置本地 `.env`，当前真实运行配置使用 DashScope、`LLM_MODEL=qwen3.8-27b` 和 `LLM_ENABLE_THINKING=false`。`.env` 不纳入 Git。
+
+MinerU 4.x 的服务地址填写根地址（例如 `http://127.0.0.1:7100`），不要添加 `/tasks`。4.x 请求使用 `standard` tier 和 `auto` OCR，由服务端管理模型；3.x 的 `backend`、`server_url` 参数不传给 4.x。仅提交 `/tasks` 返回 404/405 时切换协议，认证、限流和服务器错误直接报错。状态查询连接中断时，在超时范围内继续轮询同一个任务。4.x 单文件任务必须完整成功，`partial`、`failed`、`canceled` 都明确失败。
+
+4.x ZIP 中的 `structured_content.json` 转为现有结构块，保留页码、标题层级、图片引用和原始块；同包有 `middle_json.json` 时补回表格 HTML 和文本样式。解析缓存使用新的兼容协议标识，避免旧缓存遮蔽协议变化。
 - `COMPLIANCE_MAX_BATCHES`：候选批次数，范围 1–10，默认 8。
 
 MinerU 未配置、调用失败或结果无法解析时，任务会失败并保留错误原因；不会切换到其他解析器。未配置 LLM 时，系统使用确定性、来源受限的本地对象提取器。解析摘要和执行日志会记录实际解析器（`mineru`）、传输协议、是否真实调用 MinerU、耗时和结构统计。
@@ -60,7 +64,7 @@ MinerU 未配置、调用失败或结果无法解析时，任务会失败并保�
 
 投标文件解析成功后，在投标文件所在任务目录生成 `bid_document_cleaning/`：
 
-- `raw_content_list.json`：从 MinerU ZIP 原样复制的 content list 字节；
+- `raw_content_list.json`：从 MinerU ZIP 原样复制的 content list 字节；4.x 使用原始 `structured_content.json` 字节；
 - `cleaned_content_list.json`、`cleaning_log.json`：仅移除确定性的页码、页眉、空白块和单标点噪声，并逐项记录来源；
 - `merged_content_list.json`、`merge_log.json`：只合并跨连续页、位于页边缘且正文未完结的相邻段落；保留参与合并的原始索引、页码、bbox 和 source path；
 - `structured_document.json`：包含 `blocks[]`、`sections[]`、`tables[]`、`images[]` 和 `unsupported_items[]`。表格不拍平为普通正文，图片保留 `img_path`、资源状态、章节路径和来源关系，并在 `images[]` 中保存一次性 MinerU OCR 的 `ocr_status`、`ocr_source`、`ocr_text`、`ocr_blocks[]` 及其图片块关联；
