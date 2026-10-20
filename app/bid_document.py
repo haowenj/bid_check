@@ -4,13 +4,11 @@ import copy
 import hashlib
 import io
 import json
-import mimetypes
 import os
 import re
 import tempfile
 import time
 import unicodedata
-import urllib.parse
 import zipfile
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,17 +20,15 @@ from typing import Any
 import httpx
 
 from app.mineru_v1 import (
+    DEFAULT_GPUSTACK_MODEL,
     MINERU_V1_PROTOCOL_LABEL,
+    mineru_headers,
     MINERU_V1_PROTOCOL_VERSION,
     read_structured_archive,
     run_v1_task,
 )
 
 _SOURCE_KEY = "_bid_source"
-MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
-MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
-DEFAULT_MINERU_BACKEND = "hybrid-engine"
-SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
 DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 2.0
 DOCUMENT_SCHEMA_VERSION = "bid-document-v1"
@@ -1108,20 +1104,17 @@ class MinerUBidDocumentParser:
         mineru_url: str | None = None,
         *,
         mineru_api_key: str | None = None,
-        mineru_backend: str | None = None,
-        mineru_server_url: str | None = None,
+        mineru_gpustack_model: str = DEFAULT_GPUSTACK_MODEL,
         timeout_seconds: float = DEFAULT_MINERU_TIMEOUT_SECONDS,
         poll_interval_seconds: float = DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
         http_client: httpx.Client | None = None,
     ) -> None:
         self.mineru_url = mineru_url
         self.mineru_api_key = mineru_api_key
-        self.mineru_backend = mineru_backend or DEFAULT_MINERU_BACKEND
-        self.mineru_server_url = mineru_server_url
+        self.mineru_gpustack_model = mineru_gpustack_model
         self.timeout_seconds = float(timeout_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self._http_client = http_client
-        self._service_protocol = MINERU_TASKS_PROTOCOL_LABEL
 
     def parse(self, path: Path, *, output_dir: Path) -> dict[str, Any]:
         source_path = Path(path).expanduser().resolve()
@@ -1142,14 +1135,10 @@ class MinerUBidDocumentParser:
         source_sha256 = _sha256_file(source_path)
         diagnostics = {
             "parser": "mineru_bid_document_cleaner",
-            "service_protocol": self._service_protocol,
-            "protocol_version": (
-                MINERU_V1_PROTOCOL_VERSION
-                if self._service_protocol == MINERU_V1_PROTOCOL_LABEL
-                else MINERU_TASKS_PROTOCOL_VERSION
-            ),
+            "service_protocol": MINERU_V1_PROTOCOL_LABEL,
+            "protocol_version": MINERU_V1_PROTOCOL_VERSION,
             "task_id": task_id,
-            "mineru_backend": self.mineru_backend,
+            "mineru_gpustack_model": self.mineru_gpustack_model,
             "content_member": content_member,
             **zip_diagnostics,
         }
@@ -1427,7 +1416,20 @@ class MinerUBidDocumentParser:
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
         image_sha256 = _sha256_file(image_path)
-        cache_path = cache_dir / f"{image_sha256}.json"
+        parser_descriptor = {
+            "protocol": MINERU_V1_PROTOCOL_VERSION,
+            "url": (self.mineru_url or "").strip().rstrip("/"),
+            "gpustack_model": self.mineru_gpustack_model.strip(),
+            "tier": "standard",
+            "ocr_mode": "ocr",
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(
+                {"image_sha256": image_sha256, "parser": parser_descriptor},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cache_path = cache_dir / f"{cache_key}.json"
         cache_payload: dict[str, Any] | None = None
         if cache_path.is_file():
             try:
@@ -1436,6 +1438,7 @@ class MinerUBidDocumentParser:
                     isinstance(candidate, dict)
                     and candidate.get("schema_version") == IMAGE_OCR_SCHEMA_VERSION
                     and candidate.get("image_sha256") == image_sha256
+                    and candidate.get("parser") == parser_descriptor
                     and isinstance(candidate.get("blocks"), list)
                 ):
                     cache_payload = candidate
@@ -1450,7 +1453,7 @@ class MinerUBidDocumentParser:
                 "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
             }
 
-        result_zip, _task_id = self._run_mineru_task(image_path)
+        result_zip, _task_id = self._run_mineru_task(image_path, ocr_mode="ocr")
         payload, _raw_content_bytes, _content_member, _diagnostics = (
             self._content_list_from_zip(result_zip)
         )
@@ -1461,6 +1464,7 @@ class MinerUBidDocumentParser:
             {
                 "schema_version": IMAGE_OCR_SCHEMA_VERSION,
                 "image_sha256": image_sha256,
+                "parser": parser_descriptor,
                 "blocks": blocks,
             },
         )
@@ -1472,178 +1476,31 @@ class MinerUBidDocumentParser:
             "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
         }
 
-    def _run_mineru_task(self, path: Path) -> tuple[bytes, str]:
+    def _run_mineru_task(self, path: Path, *, ocr_mode: str = "auto") -> tuple[bytes, str]:
         if not (self.mineru_url or "").strip():
             raise BidDocumentCleaningError("MinerU 服务未配置，请配置 MINERU_URL。")
-        if self.mineru_backend not in SUPPORTED_MINERU_BACKENDS:
-            raise BidDocumentCleaningError(
-                "MinerU backend 仅支持 hybrid-engine 或 hybrid-http-client。"
-            )
-        if self.mineru_backend == "hybrid-http-client" and not (
-            self.mineru_server_url or ""
-        ).strip():
-            raise BidDocumentCleaningError(
-                "hybrid-http-client 模式下必须配置 MinerU server_url。"
-            )
         if self.timeout_seconds <= 0 or self.poll_interval_seconds < 0:
             raise BidDocumentCleaningError("MinerU 超时或轮询间隔配置无效。")
-
         base_url = str(self.mineru_url).strip().rstrip("/")
-        headers = (
-            {"Authorization": f"Bearer {self.mineru_api_key.strip()}"}
-            if self.mineru_api_key and self.mineru_api_key.strip()
-            else {}
-        )
-        form = {
-            "parse_method": "auto",
-            "effort": "medium",
-            "formula_enable": "true",
-            "table_enable": "true",
-            "image_analysis": "false",
-            "return_md": "false",
-            "return_middle_json": "false",
-            "return_model_output": "false",
-            "return_content_list": "true",
-            "return_images": "true",
-            "response_format_zip": "true",
-            "backend": self.mineru_backend,
-        }
-        if self.mineru_backend == "hybrid-http-client":
-            form["server_url"] = str(self.mineru_server_url).strip().rstrip("/")
-
+        headers = mineru_headers(self.mineru_api_key, self.mineru_gpustack_model)
         owns_client = self._http_client is None
         client = self._http_client or httpx.Client(
             timeout=httpx.Timeout(
-                connect=30.0,
-                read=self.timeout_seconds,
-                write=self.timeout_seconds,
-                pool=30.0,
+                connect=30.0, read=self.timeout_seconds,
+                write=self.timeout_seconds, pool=30.0,
             ),
-            trust_env=False,
-            follow_redirects=False,
+            trust_env=False, follow_redirects=False,
         )
         try:
-            self._service_protocol = MINERU_TASKS_PROTOCOL_LABEL
-            try:
-                with path.open("rb") as source:
-                    response = client.post(
-                        f"{base_url}/tasks",
-                        data=form,
-                        files={
-                            "files": (
-                                path.name,
-                                source,
-                                mimetypes.guess_type(path.name)[0]
-                                or "application/octet-stream",
-                            )
-                        },
-                        headers=headers,
-                        follow_redirects=False,
-                    )
-            except (OSError, httpx.HTTPError) as exc:
-                raise BidDocumentCleaningError(
-                    f"MinerU 任务提交失败：{type(exc).__name__}。"
-                ) from exc
-            if response.status_code in {404, 405}:
-                self._service_protocol = MINERU_V1_PROTOCOL_LABEL
-                return run_v1_task(
-                    client, path, base_url=base_url, headers=headers,
-                    timeout_seconds=self.timeout_seconds,
-                    poll_interval_seconds=self.poll_interval_seconds,
-                    error_type=BidDocumentCleaningError,
-                )
-            if response.status_code != 202:
-                raise BidDocumentCleaningError(
-                    f"MinerU 任务提交失败：HTTP {response.status_code}。"
-                )
-            submission = self._json_object(response, "任务提交")
-            task_id = submission.get("task_id")
-            status_url = self._trusted_task_url(
-                submission.get("status_url"), base_url
+            return run_v1_task(
+                client, path, base_url=base_url, headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                poll_interval_seconds=self.poll_interval_seconds,
+                error_type=BidDocumentCleaningError, ocr_mode=ocr_mode,
             )
-            result_url = self._trusted_task_url(
-                submission.get("result_url"), base_url
-            )
-            if not isinstance(task_id, str) or not task_id:
-                raise BidDocumentCleaningError("MinerU 返回了无效任务响应。")
-
-            deadline = time.monotonic() + self.timeout_seconds
-            while time.monotonic() < deadline:
-                try:
-                    status_response = client.get(
-                        status_url,
-                        headers=headers,
-                        follow_redirects=False,
-                    )
-                except httpx.HTTPError as exc:
-                    raise BidDocumentCleaningError(
-                        f"MinerU 任务状态查询失败：{type(exc).__name__}。"
-                    ) from exc
-                if status_response.status_code != 200:
-                    raise BidDocumentCleaningError(
-                        f"MinerU 任务状态查询失败：HTTP {status_response.status_code}。"
-                    )
-                status_payload = self._json_object(status_response, "任务状态")
-                status = status_payload.get("status")
-                if status == "completed":
-                    break
-                if status == "failed":
-                    raise BidDocumentCleaningError("MinerU 任务处理失败。")
-                if status not in {"pending", "processing"}:
-                    raise BidDocumentCleaningError(
-                        f"MinerU 返回未知任务状态：{status!r}。"
-                    )
-                if self.poll_interval_seconds:
-                    time.sleep(self.poll_interval_seconds)
-            else:
-                raise BidDocumentCleaningError("MinerU 任务等待超时。")
-
-            try:
-                result_response = client.get(
-                    result_url,
-                    headers=headers,
-                    follow_redirects=False,
-                )
-            except httpx.HTTPError as exc:
-                raise BidDocumentCleaningError(
-                    f"MinerU 结果下载失败：{type(exc).__name__}。"
-                ) from exc
-            if result_response.status_code != 200:
-                raise BidDocumentCleaningError(
-                    f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
-                )
-            return result_response.content, task_id
         finally:
             if owns_client:
                 client.close()
-
-    @staticmethod
-    def _json_object(response: httpx.Response, label: str) -> dict[str, Any]:
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise BidDocumentCleaningError(
-                f"MinerU {label}响应不是有效 JSON。"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise BidDocumentCleaningError(f"MinerU {label}响应必须是 JSON 对象。")
-        return payload
-
-    @staticmethod
-    def _trusted_task_url(value: Any, base_url: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise BidDocumentCleaningError("MinerU 返回了无效任务 URL。")
-        base = urllib.parse.urlsplit(f"{base_url}/")
-        resolved = urllib.parse.urlsplit(
-            urllib.parse.urljoin(f"{base_url}/", value)
-        )
-        if (
-            resolved.scheme,
-            resolved.hostname,
-            resolved.port,
-        ) != (base.scheme, base.hostname, base.port) or resolved.fragment:
-            raise BidDocumentCleaningError("MinerU 返回了不可信任务 URL。")
-        return urllib.parse.urlunsplit(resolved)
 
     @staticmethod
     def _content_list_from_zip(
@@ -1874,8 +1731,7 @@ def parse_bid_document(
         parser = MinerUBidDocumentParser(
             settings.mineru_url,
             mineru_api_key=settings.mineru_api_key,
-            mineru_backend=settings.mineru_backend,
-            mineru_server_url=settings.mineru_server_url,
+            mineru_gpustack_model=settings.mineru_gpustack_model,
             timeout_seconds=settings.mineru_timeout_seconds,
             poll_interval_seconds=settings.mineru_poll_interval_seconds,
         )

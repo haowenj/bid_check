@@ -1923,7 +1923,7 @@ def test_mineru_parser_requires_real_mineru_by_default(tmp_path):
     assert parser.parse_diagnostics["mineru_called"] is False
 
 
-def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metadata(tmp_path):
+def test_mineru_service_parser_uses_v4_and_preserves_metadata(tmp_path, mineru_archive_handler):
     path = tmp_path / "tender.docx"
     path.write_bytes(b"document bytes")
     archive_bytes = io.BytesIO()
@@ -1942,30 +1942,11 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
             ),
         )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/tasks":
-            return httpx.Response(
-                202,
-                json={
-                    "task_id": "task-1",
-                    "status_url": "https://mineru.example/tasks/task-1",
-                    "result_url": "https://mineru.example/tasks/task-1/result",
-                },
-            )
-        if request.method == "GET" and request.url.path.endswith("/result"):
-            return httpx.Response(
-                200,
-                content=archive_bytes.getvalue(),
-                headers={"content-type": "application/zip"},
-            )
-        if request.method == "GET" and request.url.path.endswith("task-1"):
-            return httpx.Response(200, json={"status": "completed"})
-        return httpx.Response(404)
+    handler = mineru_archive_handler(archive_bytes.getvalue())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     parser = extraction_module.MinerUDocumentParser(
         mineru_url="https://mineru.example",
-        mineru_backend="hybrid-engine",
         http_client=client,
         poll_interval_seconds=0,
     )
@@ -1987,12 +1968,12 @@ def test_mineru_service_parser_uses_existing_tasks_protocol_and_preserves_metada
     assert parser.parse_diagnostics["mineru_raw_table_count"] == 1
     assert parser.parser_name == "mineru"
     assert parser.parse_diagnostics["mineru_called"] is True
-    assert parser.parse_diagnostics["service_protocol"] == "mineru_tasks"
+    assert parser.parse_diagnostics["service_protocol"] == "mineru_v1"
     assert "command" not in parser.cache_descriptor
     client.close()
 
 
-def test_mineru_parser_recovers_docx_front_table_when_mineru_omits_it(tmp_path):
+def test_mineru_parser_recovers_docx_front_table_when_mineru_omits_it(tmp_path, mineru_archive_handler):
     path = tmp_path / "tender.docx"
     document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -2024,26 +2005,11 @@ def test_mineru_parser_recovers_docx_front_table_when_mineru_omits_it(tmp_path):
             ),
         )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/tasks":
-            return httpx.Response(
-                202,
-                json={
-                    "task_id": "task-front-table-recovery",
-                    "status_url": "https://mineru.example/tasks/task-front-table-recovery",
-                    "result_url": "https://mineru.example/tasks/task-front-table-recovery/result",
-                },
-            )
-        if request.method == "GET" and request.url.path.endswith("/result"):
-            return httpx.Response(200, content=archive_bytes.getvalue())
-        if request.method == "GET" and request.url.path.endswith("task-front-table-recovery"):
-            return httpx.Response(200, json={"status": "completed"})
-        return httpx.Response(404)
+    handler = mineru_archive_handler(archive_bytes.getvalue())
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     parser = extraction_module.MinerUDocumentParser(
         mineru_url="https://mineru.example",
-        mineru_backend="hybrid-engine",
         http_client=client,
         poll_interval_seconds=0,
     )

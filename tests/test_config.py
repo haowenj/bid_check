@@ -14,8 +14,8 @@ def test_load_settings_reads_project_and_mineru_env_before_process_environment(
         "LLM_PROVIDER=vllm\n"
         "LLM_ENABLE_THINKING=false\n"
         "MINERU_URL=https://mineru.file.example\n"
-        "MINERU_BACKEND=hybrid-http-client\n"
-        "MINERU_SERVER_URL=https://mineru-server.file.example\n",
+        "MINERU_GPUSTACK_MODEL=mineru-custom\n"
+        "MINERU_API_KEY=mineru-file-key\n",
         encoding="utf-8",
     )
     for key in (
@@ -25,8 +25,8 @@ def test_load_settings_reads_project_and_mineru_env_before_process_environment(
         "LLM_PROVIDER",
         "LLM_ENABLE_THINKING",
         "MINERU_URL",
-        "MINERU_BACKEND",
-        "MINERU_SERVER_URL",
+        "MINERU_GPUSTACK_MODEL",
+        "MINERU_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -38,8 +38,8 @@ def test_load_settings_reads_project_and_mineru_env_before_process_environment(
     assert settings.llm_provider == "vllm"
     assert settings.llm_enable_thinking is False
     assert settings.mineru_url == "https://mineru.file.example"
-    assert settings.mineru_backend == "hybrid-http-client"
-    assert settings.mineru_server_url == "https://mineru-server.file.example"
+    assert settings.mineru_gpustack_model == "mineru-custom"
+    assert settings.mineru_api_key == "mineru-file-key"
 
     monkeypatch.setenv("LLM_MODEL", "process-model")
     assert load_settings(tmp_path).llm_model == "qwen3.8-27b"
@@ -56,8 +56,7 @@ def test_load_settings_does_not_invent_mineru_endpoint_when_unconfigured(tmp_pat
     settings = load_settings(tmp_path)
 
     assert settings.mineru_url is None
-    assert settings.mineru_backend == "hybrid-engine"
-    assert settings.mineru_server_url is None
+    assert settings.mineru_gpustack_model == "mineru4"
     assert settings.mineru_api_key is None
     assert settings.llm_provider == "dashscope"
 

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import build_default_workflow, create_app
 from app.compliance_extraction import (
-    MINERU_TASKS_PROTOCOL_LABEL,
-    MINERU_TASKS_PROTOCOL_VERSION,
     StructuredBlock,
 )
+from app.mineru_v1 import MINERU_V1_PROTOCOL_LABEL, MINERU_V1_PROTOCOL_VERSION
 from app.config import Settings
 from app.mock_services import (
     extract_tender_objects,
@@ -19,6 +21,48 @@ from app.models import FileMetadata
 from app.repository import BidCheckRepository
 
 
+@pytest.fixture
+def mineru_archive_handler():
+    """Serve hand-built result ZIPs through the real 4.x HTTP boundary."""
+    def build(archive_bytes, *, image_archive=None, submitted_jobs=None):
+        uploads = {}
+
+        def handler(request):
+            route = request.url.path
+            assert route.startswith("/v1/")
+            if request.method == "POST" and route == "/v1/uploads":
+                number = str(len(uploads) + 1)
+                uploads[number] = json.loads(request.content)
+                return httpx.Response(200, json={"id": f"upload-{number}", "status": "pending"})
+            if request.method == "PUT":
+                return httpx.Response(200, json={})
+            if route.endswith("/complete"):
+                number = route.split("/")[3].rsplit("-", 1)[-1]
+                return httpx.Response(200, json={"status": "completed", "file": {"id": f"input-{number}"}})
+            if request.method == "POST" and route == "/v1/parse/jobs":
+                data = json.loads(request.content)
+                number = data["files"][0]["source"]["file_id"].rsplit("-", 1)[-1]
+                if submitted_jobs is not None:
+                    submitted_jobs.append(f"task-{number}")
+                return httpx.Response(202, json={"job_id": f"task-{number}", "status": "queued"})
+            if route.startswith("/v1/parse/jobs/"):
+                number = route.rsplit("-", 1)[-1]
+                return httpx.Response(200, json={
+                    "status": "completed", "files": [{"status": "completed", "output_files": {"zip": {"file_id": f"output-{number}"}}}],
+                })
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"deleted": True})
+            if route.startswith("/v1/files/") and route.endswith("/content"):
+                number = route.split("/")[3].rsplit("-", 1)[-1]
+                content = image_archive if image_archive is not None and uploads[number]["mime_type"].startswith("image/") else archive_bytes
+                return httpx.Response(200, content=content)
+            raise AssertionError(f"Unexpected MinerU request: {request.method} {route}")
+
+        return handler
+
+    return build
+
+
 class FixtureMineruParser:
     parser_name = "mineru"
 
@@ -26,18 +70,17 @@ class FixtureMineruParser:
     def cache_descriptor(self):
         return {
             "parser": "mineru",
-            "transport": MINERU_TASKS_PROTOCOL_LABEL,
-            "protocol": MINERU_TASKS_PROTOCOL_VERSION,
+            "transport": MINERU_V1_PROTOCOL_LABEL,
+            "protocol": MINERU_V1_PROTOCOL_VERSION,
             "url": "https://fixture-mineru.example",
-            "backend": "hybrid-engine",
-            "server_url": "",
+            "gpustack_model": "mineru4",
         }
 
     def __init__(self):
         self.parse_diagnostics = {
             "parser": "mineru",
             "mineru_called": True,
-            "service_protocol": MINERU_TASKS_PROTOCOL_LABEL,
+            "service_protocol": MINERU_V1_PROTOCOL_LABEL,
             "elapsed_ms": 0,
         }
 

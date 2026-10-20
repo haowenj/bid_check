@@ -7,7 +7,6 @@ import hashlib
 import json
 import mimetypes
 import time
-import urllib.parse
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -15,7 +14,17 @@ from typing import Any
 import httpx
 
 MINERU_V1_PROTOCOL_LABEL = "mineru_v1"
-MINERU_V1_PROTOCOL_VERSION = "mineru-api-v1"
+MINERU_V1_PROTOCOL_VERSION = "mineru-api-v2"
+DEFAULT_GPUSTACK_MODEL = "mineru4"
+
+
+def mineru_headers(api_key: str | None, gpustack_model: str | None) -> dict[str, str]:
+    headers = {}
+    if api_key and api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    if gpustack_model and gpustack_model.strip():
+        headers["X-GPUStack-Model"] = gpustack_model.strip()
+    return headers
 
 
 def run_v1_task(
@@ -27,7 +36,10 @@ def run_v1_task(
     timeout_seconds: float,
     poll_interval_seconds: float,
     error_type: type[RuntimeError],
+    ocr_mode: str = "auto",
 ) -> tuple[bytes, str]:
+    if ocr_mode not in {"auto", "ocr"}:
+        raise error_type("MinerU OCR 模式配置无效。")
     def request(method: str, route: str, label: str, **kwargs) -> httpx.Response:
         try:
             response = client.request(
@@ -82,28 +94,14 @@ def run_v1_task(
         )
         upload_id = identifier(upload, "id", "upload id")
         if upload.get("status") == "pending":
-            url = upload.get("upload_url") or f"/v1/uploads/{upload_id}/content"
-            if not isinstance(url, str) or upload.get("upload_method", "PUT") != "PUT":
-                raise error_type("MinerU 4.x 返回了无效上传 URL 或方法。")
-            url = urllib.parse.urljoin(f"{base_url}/", url)
-            base = urllib.parse.urlsplit(base_url)
-            target = urllib.parse.urlsplit(url)
-            def origin(value: urllib.parse.SplitResult) -> tuple[str, str | None, int]:
-                port = value.port or (443 if value.scheme == "https" else 80)
-                return value.scheme, value.hostname, port
-
-            if origin(base) != origin(target) or target.fragment or target.username or target.password:
-                raise error_type("MinerU 返回了不可信上传 URL。")
-            upload_headers = upload.get("upload_headers") or {"Content-Type": "application/octet-stream"}
-            if not isinstance(upload_headers, dict) or not all(
-                isinstance(k, str) and isinstance(v, str)
-                for k, v in upload_headers.items()
-            ):
-                raise error_type("MinerU 4.x 返回了无效上传 headers。")
+            # Self-hosted 4.x uses this fixed route. Keep the configured
+            # reverse-proxy prefix and authentication for the byte upload.
+            url = f"{base_url}/v1/uploads/{upload_id}/content"
             try:
                 with path.open("rb") as source:
                     response = client.put(
-                        url, content=source, headers={**upload_headers, **headers},
+                        url, content=source,
+                        headers={**headers, "Content-Type": "application/octet-stream"},
                         follow_redirects=False,
                     )
             except (OSError, httpx.HTTPError) as exc:
@@ -123,7 +121,7 @@ def run_v1_task(
             json={
                 "files": [{"source": {"type": "file_id", "file_id": input_file_id}}],
                 "tier": "standard",
-                "ocr_mode": "auto",
+                "ocr_mode": ocr_mode,
                 "output_formats": ["zip"],
             },
         )

@@ -556,6 +556,7 @@ def test_structure_content_list_registers_table_images_with_section_and_table_pr
 
 def test_mineru_bid_parser_extracts_table_embedded_images_once_and_marks_asset_ready(
     tmp_path,
+    mineru_archive_handler,
 ):
     from app.bid_document import MinerUBidDocumentParser
 
@@ -597,21 +598,7 @@ def test_mineru_bid_parser_extracts_table_embedded_images_once_and_marks_asset_r
         archive.writestr("results/images/table-only-proof.png", b"table-only-proof")
     zip_bytes = zip_buffer.getvalue()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/tasks":
-            return httpx.Response(
-                202,
-                json={
-                    "task_id": "task-table-image",
-                    "status_url": "/tasks/task-table-image",
-                    "result_url": "/tasks/task-table-image/result",
-                },
-            )
-        if request.url.path == "/tasks/task-table-image":
-            return httpx.Response(200, json={"status": "completed"})
-        if request.url.path == "/tasks/task-table-image/result":
-            return httpx.Response(200, content=zip_bytes)
-        return httpx.Response(404)
+    handler = mineru_archive_handler(zip_bytes)
 
     client = httpx.Client(
         transport=httpx.MockTransport(handler),
@@ -638,7 +625,7 @@ def test_mineru_bid_parser_extracts_table_embedded_images_once_and_marks_asset_r
     assert structured["images"][0]["source_table_id"] == "t0001"
 
 
-def test_mineru_bid_parser_ocr_images_once_and_embeds_image_provenance(tmp_path):
+def test_mineru_bid_parser_ocr_images_once_and_embeds_image_provenance(tmp_path, mineru_archive_handler):
     from app.bid_document import MinerUBidDocumentParser
 
     bid_path = tmp_path / "bid.docx"
@@ -684,31 +671,9 @@ def test_mineru_bid_parser_ocr_images_once_and_embeds_image_provenance(tmp_path)
     image_ocr_zip = zip_result(image_ocr_payload)
     submitted_tasks: list[str] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/tasks":
-            task_id = f"task-{len(submitted_tasks) + 1}"
-            submitted_tasks.append(task_id)
-            return httpx.Response(
-                202,
-                json={
-                    "task_id": task_id,
-                    "status_url": f"/tasks/{task_id}",
-                    "result_url": f"/tasks/{task_id}/result",
-                },
-            )
-        if request.url.path.startswith("/tasks/") and request.url.path.count("/") == 2:
-            return httpx.Response(200, json={"status": "completed"})
-        if request.url.path.endswith("/result"):
-            task_id = request.url.path.split("/")[-2]
-            return httpx.Response(
-                200,
-                content=(
-                    document_zip
-                    if int(task_id.rsplit("-", 1)[-1]) % 2 == 1
-                    else image_ocr_zip
-                ),
-                )
-        return httpx.Response(404)
+    handler = mineru_archive_handler(
+        document_zip, image_archive=image_ocr_zip, submitted_jobs=submitted_tasks,
+    )
 
     client = httpx.Client(
         transport=httpx.MockTransport(handler),
@@ -751,7 +716,7 @@ def test_mineru_bid_parser_ocr_images_once_and_embeds_image_provenance(tmp_path)
     assert second_result["diagnostics"]["image_ocr"]["cache_hit_count"] == 1
 
 
-def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
+def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path, mineru_archive_handler):
     from app.bid_document import MinerUBidDocumentParser
 
     bid_path = tmp_path / "bid.docx"
@@ -796,21 +761,7 @@ def test_mineru_bid_parser_writes_exact_raw_result_and_safe_assets(tmp_path):
         archive.writestr("../outside.jpg", b"must-not-extract")
     zip_bytes = zip_buffer.getvalue()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/tasks":
-            return httpx.Response(
-                202,
-                json={
-                    "task_id": "task-1",
-                    "status_url": "/tasks/task-1",
-                    "result_url": "/tasks/task-1/result",
-                },
-            )
-        if request.url.path == "/tasks/task-1":
-            return httpx.Response(200, json={"status": "completed"})
-        if request.url.path == "/tasks/task-1/result":
-            return httpx.Response(200, content=zip_bytes)
-        return httpx.Response(404)
+    handler = mineru_archive_handler(zip_bytes)
 
     client = httpx.Client(
         transport=httpx.MockTransport(handler),

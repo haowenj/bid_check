@@ -525,8 +525,7 @@ def build_default_workflow(
     parser = document_parser or MinerUDocumentParser(
         settings.mineru_url,
         mineru_api_key=settings.mineru_api_key,
-        mineru_backend=settings.mineru_backend,
-        mineru_server_url=settings.mineru_server_url,
+        mineru_gpustack_model=settings.mineru_gpustack_model,
         timeout_seconds=settings.mineru_timeout_seconds,
         poll_interval_seconds=settings.mineru_poll_interval_seconds,
     )
@@ -538,8 +537,7 @@ def build_default_workflow(
     bid_parser = bid_document_parser or MinerUBidDocumentParser(
         settings.mineru_url,
         mineru_api_key=settings.mineru_api_key,
-        mineru_backend=settings.mineru_backend,
-        mineru_server_url=settings.mineru_server_url,
+        mineru_gpustack_model=settings.mineru_gpustack_model,
         timeout_seconds=settings.mineru_timeout_seconds,
         poll_interval_seconds=settings.mineru_poll_interval_seconds,
     )

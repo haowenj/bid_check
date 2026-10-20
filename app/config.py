@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -17,9 +17,8 @@ class Settings:
     tasks_dir: Path
     mock_delay_seconds: float = 0.35
     mineru_url: str | None = None
-    mineru_api_key: str | None = None
-    mineru_backend: str = "hybrid-engine"
-    mineru_server_url: str | None = None
+    mineru_api_key: str | None = field(default=None, repr=False)
+    mineru_gpustack_model: str = "mineru4"
     mineru_timeout_seconds: float = 1800.0
     mineru_poll_interval_seconds: float = 2.0
     llm_api_key: str | None = None
@@ -94,11 +93,9 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         ),
         mineru_url=_env_value(project_env, "MINERU_URL") or None,
         mineru_api_key=_env_value(project_env, "MINERU_API_KEY") or None,
-        mineru_backend=(
-            _env_value(project_env, "MINERU_BACKEND", "hybrid-engine")
-            or "hybrid-engine"
+        mineru_gpustack_model=(
+            _env_value(project_env, "MINERU_GPUSTACK_MODEL", "mineru4") or ""
         ),
-        mineru_server_url=_env_value(project_env, "MINERU_SERVER_URL") or None,
         mineru_timeout_seconds=float(
             _env_value(project_env, "MINERU_TIMEOUT_SECONDS", "1800") or "1800"
         ),

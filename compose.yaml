@@ -22,8 +22,7 @@ services:
       APP_DATABASE_PATH: /app/data/bid_check.db
       APP_TASKS_DIR: /app/data/tasks
       MINERU_URL: "${MINERU_URL:-http://host.docker.internal:7100}"
-      MINERU_BACKEND: "${MINERU_BACKEND:-hybrid-engine}"
-      MINERU_SERVER_URL: "${MINERU_SERVER_URL:-}"
+      MINERU_GPUSTACK_MODEL: "${MINERU_GPUSTACK_MODEL-mineru4}"
       MINERU_API_KEY: "${MINERU_API_KEY:-}"
       MINERU_TIMEOUT_SECONDS: "${MINERU_TIMEOUT_SECONDS:-1800}"
       MINERU_POLL_INTERVAL_SECONDS: "${MINERU_POLL_INTERVAL_SECONDS:-2}"

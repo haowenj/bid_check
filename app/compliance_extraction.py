@@ -4,7 +4,6 @@ import hashlib
 import io
 import json
 import logging
-import mimetypes
 import os
 import re
 import threading
@@ -39,7 +38,10 @@ from app.models import (
 )
 from app.navigation_content import classify_navigation_item
 from app.mineru_v1 import (
+    DEFAULT_GPUSTACK_MODEL,
     MINERU_V1_PROTOCOL_LABEL,
+    MINERU_V1_PROTOCOL_VERSION,
+    mineru_headers,
     read_structured_archive,
     run_v1_task,
 )
@@ -51,10 +53,6 @@ REQUIREMENT_PROMPT_VERSION = "tender-compliance-objects-prompt-v5-single-file"
 # downstream deterministic result.
 REQUIREMENT_CACHE_VERSION = f"tender-compliance-objects-v26:{REQUIREMENT_PROMPT_VERSION}"
 PARSED_DOCUMENT_CACHE_VERSION = "mineru-parse-v6"
-MINERU_TASKS_PROTOCOL_VERSION = "mineru-tasks-v1"
-MINERU_TASKS_PROTOCOL_LABEL = "mineru_tasks"
-DEFAULT_MINERU_BACKEND = "hybrid-engine"
-SUPPORTED_MINERU_BACKENDS = {"hybrid-engine", "hybrid-http-client"}
 DEFAULT_MINERU_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MINERU_POLL_INTERVAL_SECONDS = 2.0
 
@@ -727,23 +725,21 @@ def _mineru_payload_diagnostics(payload: Sequence[dict[str, Any]]) -> dict[str, 
 
 
 class MinerUDocumentParser:
-    """Use MinerU 3.x tasks, falling back to the 4.x upload/job API."""
+    """Parse documents using the self-hosted MinerU 4.x upload/job API."""
 
     def __init__(
         self,
         mineru_url: str | None = None,
         *,
         mineru_api_key: str | None = None,
-        mineru_backend: str | None = None,
-        mineru_server_url: str | None = None,
+        mineru_gpustack_model: str = DEFAULT_GPUSTACK_MODEL,
         timeout_seconds: float = DEFAULT_MINERU_TIMEOUT_SECONDS,
         poll_interval_seconds: float = DEFAULT_MINERU_POLL_INTERVAL_SECONDS,
         http_client: httpx.Client | None = None,
     ):
         self.mineru_url = mineru_url
         self.mineru_api_key = mineru_api_key
-        self.mineru_backend = mineru_backend or DEFAULT_MINERU_BACKEND
-        self.mineru_server_url = mineru_server_url
+        self.mineru_gpustack_model = mineru_gpustack_model
         self.timeout_seconds = float(timeout_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
         self._http_client = http_client
@@ -761,14 +757,14 @@ class MinerUDocumentParser:
 
     @property
     def cache_descriptor(self) -> dict[str, Any]:
-        transport = "mineru_auto"
         return {
             "parser": self.parser_name,
-            "transport": transport,
-            "protocol": "mineru-auto-v2",
+            "transport": MINERU_V1_PROTOCOL_LABEL,
+            "protocol": MINERU_V1_PROTOCOL_VERSION,
             "url": (self.mineru_url or "").strip(),
-            "backend": self.mineru_backend,
-            "server_url": (self.mineru_server_url or "").strip(),
+            "gpustack_model": self.mineru_gpustack_model.strip(),
+            "tier": "standard",
+            "ocr_mode": "auto",
         }
 
     def parse(self, path: Path) -> list[StructuredBlock]:
@@ -810,145 +806,30 @@ class MinerUDocumentParser:
         return blocks
 
     def _parse_with_mineru_service(self, path: Path) -> list[StructuredBlock]:
-        if self.mineru_backend not in SUPPORTED_MINERU_BACKENDS:
-            raise ComplianceExtractionError(
-                "MinerU backend 仅支持 hybrid-engine 或 hybrid-http-client。"
-            )
-        if self.mineru_backend == "hybrid-http-client" and not (
-            self.mineru_server_url or ""
-        ).strip():
-            raise ComplianceExtractionError(
-                "hybrid-http-client 模式下必须配置 MinerU server_url。"
-            )
         if self.timeout_seconds <= 0 or self.poll_interval_seconds < 0:
             raise ComplianceExtractionError("MinerU 超时或轮询间隔配置无效。")
-
         base_url = str(self.mineru_url).strip().rstrip("/")
-        headers = (
-            {"Authorization": f"Bearer {self.mineru_api_key.strip()}"}
-            if self.mineru_api_key and self.mineru_api_key.strip()
-            else {}
-        )
-        form = {
-            "parse_method": "auto",
-            "effort": "medium",
-            "formula_enable": "true",
-            "table_enable": "true",
-            "image_analysis": "false",
-            "return_md": "false",
-            "return_middle_json": "false",
-            "return_model_output": "false",
-            "return_content_list": "true",
-            "return_images": "true",
-            "response_format_zip": "true",
-            "backend": self.mineru_backend,
-        }
-        if self.mineru_backend == "hybrid-http-client":
-            form["server_url"] = str(self.mineru_server_url).strip().rstrip("/")
-
+        headers = mineru_headers(self.mineru_api_key, self.mineru_gpustack_model)
         owns_client = self._http_client is None
         client = self._http_client or httpx.Client(
             timeout=httpx.Timeout(
-                connect=30.0,
-                read=self.timeout_seconds,
-                write=self.timeout_seconds,
-                pool=30.0,
+                connect=30.0, read=self.timeout_seconds,
+                write=self.timeout_seconds, pool=30.0,
             ),
-            trust_env=False,
-            follow_redirects=False,
+            trust_env=False, follow_redirects=False,
         )
         try:
             self.parse_diagnostics.update(
-                mineru_called=True, service_protocol=MINERU_TASKS_PROTOCOL_LABEL
+                mineru_called=True, service_protocol=MINERU_V1_PROTOCOL_LABEL
             )
-            try:
-                with path.open("rb") as source:
-                    response = client.post(
-                        f"{base_url}/tasks",
-                        data=form,
-                        files={
-                            "files": (
-                                path.name,
-                                source,
-                                mimetypes.guess_type(path.name)[0]
-                                or "application/octet-stream",
-                            )
-                        },
-                        headers=headers,
-                        follow_redirects=False,
-                    )
-            except (OSError, httpx.HTTPError) as exc:
-                raise ComplianceExtractionError(
-                    f"MinerU 任务提交失败：{type(exc).__name__}。"
-                ) from exc
-            if response.status_code in {404, 405}:
-                self.parse_diagnostics["service_protocol"] = MINERU_V1_PROTOCOL_LABEL
-                raw, task_id = run_v1_task(
-                    client, path, base_url=base_url, headers=headers,
-                    timeout_seconds=self.timeout_seconds,
-                    poll_interval_seconds=self.poll_interval_seconds,
-                    error_type=ComplianceExtractionError,
-                )
-                return self._blocks_from_result(path, raw, task_id, MINERU_V1_PROTOCOL_LABEL)
-            if response.status_code != 202:
-                raise ComplianceExtractionError(
-                    f"MinerU 任务提交失败：HTTP {response.status_code}。"
-                )
-            submission = self._json_object(response, "任务提交")
-            task_id = submission.get("task_id")
-            status_url = self._trusted_task_url(submission.get("status_url"), base_url)
-            result_url = self._trusted_task_url(submission.get("result_url"), base_url)
-            if not isinstance(task_id, str) or not task_id:
-                raise ComplianceExtractionError("MinerU 返回了无效任务响应。")
-
-            deadline = time.monotonic() + self.timeout_seconds
-            while time.monotonic() < deadline:
-                try:
-                    status_response = client.get(
-                        status_url,
-                        headers=headers,
-                        follow_redirects=False,
-                    )
-                except httpx.HTTPError as exc:
-                    raise ComplianceExtractionError(
-                        f"MinerU 任务状态查询失败：{type(exc).__name__}。"
-                    ) from exc
-                if status_response.status_code != 200:
-                    raise ComplianceExtractionError(
-                        f"MinerU 任务状态查询失败：HTTP {status_response.status_code}。"
-                    )
-                status_payload = self._json_object(status_response, "任务状态")
-                status = status_payload.get("status")
-                if status == "completed":
-                    break
-                if status == "failed":
-                    raise ComplianceExtractionError("MinerU 任务处理失败。")
-                if status not in {"pending", "processing"}:
-                    raise ComplianceExtractionError(
-                        f"MinerU 返回未知任务状态：{status!r}。"
-                    )
-                if self.poll_interval_seconds:
-                    time.sleep(self.poll_interval_seconds)
-            else:
-                raise ComplianceExtractionError("MinerU 任务等待超时。")
-
-            try:
-                result_response = client.get(
-                    result_url,
-                    headers=headers,
-                    follow_redirects=False,
-                )
-            except httpx.HTTPError as exc:
-                raise ComplianceExtractionError(
-                    f"MinerU 结果下载失败：{type(exc).__name__}。"
-                ) from exc
-            if result_response.status_code != 200:
-                raise ComplianceExtractionError(
-                    f"MinerU 结果下载失败：HTTP {result_response.status_code}。"
-                )
-            return self._blocks_from_result(
-                path, result_response.content, task_id, MINERU_TASKS_PROTOCOL_LABEL
+            raw, task_id = run_v1_task(
+                client, path, base_url=base_url, headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                poll_interval_seconds=self.poll_interval_seconds,
+                error_type=ComplianceExtractionError,
+                ocr_mode="auto",
             )
+            return self._blocks_from_result(path, raw, task_id, MINERU_V1_PROTOCOL_LABEL)
         finally:
             if owns_client:
                 client.close()
@@ -970,31 +851,6 @@ class MinerUDocumentParser:
             }
         )
         return blocks
-
-    @staticmethod
-    def _json_object(response: httpx.Response, label: str) -> dict[str, Any]:
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise ComplianceExtractionError(f"MinerU {label}响应不是有效 JSON。") from exc
-        if not isinstance(payload, dict):
-            raise ComplianceExtractionError(f"MinerU {label}响应必须是 JSON 对象。")
-        return payload
-
-    @staticmethod
-    def _trusted_task_url(value: Any, base_url: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ComplianceExtractionError("MinerU 返回了无效任务 URL。")
-        base = urllib.parse.urlsplit(f"{base_url}/")
-        resolved = urllib.parse.urljoin(f"{base_url}/", value)
-        parsed = urllib.parse.urlsplit(resolved)
-        if (
-            parsed.scheme,
-            parsed.hostname,
-            parsed.port,
-        ) != (base.scheme, base.hostname, base.port) or parsed.fragment:
-            raise ComplianceExtractionError("MinerU 返回了不可信任务 URL。")
-        return resolved
 
     @staticmethod
     def _content_list_from_zip(raw: bytes) -> list[dict[str, Any]]:

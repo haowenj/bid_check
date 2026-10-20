@@ -41,17 +41,17 @@ def _archive(*, ocr=False, middle=True):
     return buffer.getvalue(), raw
 
 
-def _v4_handler(*, legacy_status=404, reused=False, job_status="completed", middle=True):
+def _v4_handler(*, prefix="", model="mineru4", reused=False, job_status="completed", middle=True):
     requests = []
     uploads = {}
     polls = {}
 
     def handler(request):
         requests.append(request)
-        route = request.url.path
+        assert request.url.path.startswith(f"{prefix}/v1/")
+        route = request.url.path.removeprefix(prefix)
         assert request.headers.get("Authorization") == "Bearer test-key"
-        if route == "/tasks":
-            return httpx.Response(legacy_status)
+        assert request.headers.get("X-GPUStack-Model") == model
         if route == "/v1/uploads":
             data = json.loads(request.content)
             assert data["sha256sum"] and data["bytes"] > 0
@@ -62,7 +62,7 @@ def _v4_handler(*, legacy_status=404, reused=False, job_status="completed", midd
             if reused:
                 response["file"] = {"id": f"input-{number}"}
             else:
-                response.update(upload_url=f"/v1/uploads/upload-{number}/content", upload_method="PUT", upload_headers={"Content-Type": "application/octet-stream"})
+                response.update(upload_url="http://wrong-worker.example/incorrect-upload", upload_method="PUT", upload_headers={"Content-Type": "application/octet-stream"})
             return httpx.Response(200, json=response)
         if request.method == "PUT":
             number = route.split("/")[3].split("-")[-1]
@@ -77,6 +77,7 @@ def _v4_handler(*, legacy_status=404, reused=False, job_status="completed", midd
             assert data["tier"] == "standard"
             assert "backend" not in data and "server_url" not in data
             number = data["files"][0]["source"]["file_id"].split("-")[-1]
+            assert data["ocr_mode"] == ("ocr" if uploads[number]["mime_type"].startswith("image/") else "auto")
             return httpx.Response(202, json={"job_id": f"job-{number}", "status": "queued"})
         if route.startswith("/v1/parse/jobs/"):
             number = route.split("-")[-1]
@@ -94,112 +95,19 @@ def _v4_handler(*, legacy_status=404, reused=False, job_status="completed", midd
     return handler, requests
 
 
-def _parser(kind, client):
+def _parser(kind, client, prefix=""):
     cls = MinerUDocumentParser if kind == "tender" else MinerUBidDocumentParser
-    return cls("https://mineru.example", mineru_api_key="test-key", http_client=client, poll_interval_seconds=0)
+    return cls(f"https://mineru.example{prefix}", mineru_api_key="test-key", http_client=client, poll_interval_seconds=0)
 
 
 @pytest.mark.parametrize("kind", ["tender", "bid"])
-@pytest.mark.parametrize("backend", ["hybrid-engine", "hybrid-http-client"])
-def test_v3_retains_upload_poll_download_without_v4_requests(tmp_path, kind, backend):
+@pytest.mark.parametrize("prefix", ["", "/model/proxy", "/custom/base"])
+def test_v4_direct_call_preserves_document_and_ocr(tmp_path, kind, prefix):
     path = tmp_path / "document.docx"
     path.write_bytes(b"document bytes")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("result_content_list.json", json.dumps([
-            {"type": "text", "text": "投标文件格式", "text_level": 1, "page_idx": 0},
-            {"type": "text", "text": "投标人名称：____", "page_idx": 0},
-            {"type": "table", "table_body": "<table><tr><td>项目</td></tr></table>", "page_idx": 0},
-        ], ensure_ascii=False))
-    requests = []
-    statuses = iter(["pending", "processing", "completed"])
-
-    def handler(request):
-        requests.append(request)
-        assert request.headers.get("Authorization") == "Bearer test-key"
-        if request.method == "POST" and request.url.path == "/tasks":
-            assert backend.encode() in request.content
-            assert b"document bytes" in request.content
-            if backend == "hybrid-http-client":
-                assert b"https://engine.example" in request.content
-            return httpx.Response(202, json={
-                "task_id": "legacy-task",
-                "status_url": "/tasks/legacy-task",
-                "result_url": "/tasks/legacy-task/result",
-            })
-        if request.url.path == "/tasks/legacy-task":
-            return httpx.Response(200, json={"status": next(statuses)})
-        if request.url.path == "/tasks/legacy-task/result":
-            return httpx.Response(200, content=buffer.getvalue())
-        raise AssertionError(f"Unexpected request: {request.method} {request.url.path}")
-
+    handler, requests = _v4_handler(prefix=prefix)
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        cls = MinerUDocumentParser if kind == "tender" else MinerUBidDocumentParser
-        parser = cls(
-            "https://mineru.example", mineru_api_key="test-key",
-            mineru_backend=backend,
-            mineru_server_url="https://engine.example" if backend == "hybrid-http-client" else None,
-            http_client=client, poll_interval_seconds=0,
-        )
-        if kind == "tender":
-            blocks = parser.parse(path)
-            assert [b.type for b in blocks] == ["heading", "paragraph", "table"]
-            diagnostics = parser.parse_diagnostics
-        else:
-            result = parser.parse(path, output_dir=tmp_path / "cleaning")
-            assert result["stats"]["structured_block_count"] == 3
-            diagnostics = result["diagnostics"]
-        assert diagnostics["service_protocol"] == "mineru_tasks"
-        assert diagnostics["task_id"] == "legacy-task"
-        assert not client.is_closed
-    assert [r.url.path for r in requests] == [
-        "/tasks", "/tasks/legacy-task", "/tasks/legacy-task",
-        "/tasks/legacy-task", "/tasks/legacy-task/result",
-    ]
-
-
-@pytest.mark.parametrize("kind", ["tender", "bid"])
-@pytest.mark.parametrize("failed_stage", ["status", "result"])
-def test_v3_status_or_result_404_does_not_resubmit_to_v4(tmp_path, kind, failed_stage):
-    path = tmp_path / "document.docx"
-    path.write_bytes(b"doc")
-    requests = []
-
-    def handler(request):
-        requests.append(request)
-        if request.url.path == "/tasks":
-            return httpx.Response(202, json={
-                "task_id": "legacy-task",
-                "status_url": "/tasks/legacy-task",
-                "result_url": "/tasks/legacy-task/result",
-            })
-        if request.url.path == "/tasks/legacy-task":
-            if failed_stage == "status":
-                return httpx.Response(404)
-            return httpx.Response(200, json={"status": "completed"})
-        if request.url.path == "/tasks/legacy-task/result":
-            return httpx.Response(404)
-        raise AssertionError(f"Unexpected request: {request.method} {request.url.path}")
-
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        parser = _parser(kind, client)
-        error = ComplianceExtractionError if kind == "tender" else BidDocumentCleaningError
-        with pytest.raises(error, match="HTTP 404"):
-            if kind == "tender":
-                parser.parse(path)
-            else:
-                parser.parse(path, output_dir=tmp_path / "cleaning")
-    assert all(r.url.path.startswith("/tasks") for r in requests)
-
-
-@pytest.mark.parametrize("kind", ["tender", "bid"])
-@pytest.mark.parametrize("legacy_status", [404, 405])
-def test_v4_fallback_preserves_document_and_ocr(tmp_path, kind, legacy_status):
-    path = tmp_path / "document.docx"
-    path.write_bytes(b"document bytes")
-    handler, requests = _v4_handler(legacy_status=legacy_status)
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        parser = _parser(kind, client)
+        parser = _parser(kind, client, prefix)
         if kind == "tender":
             blocks = parser.parse(path)
             assert [b.type for b in blocks] == ["heading", "paragraph", "table", "image"]
@@ -224,16 +132,20 @@ def test_v4_fallback_preserves_document_and_ocr(tmp_path, kind, legacy_status):
         assert diagnostics["service_protocol"] == "mineru_v1"
         assert diagnostics["task_id"] == "job-1"
         assert not client.is_closed
-    assert any(r.method == "DELETE" and r.url.path == "/v1/files/output-1" for r in requests)
-    assert any(r.method == "DELETE" and r.url.path == "/v1/files/input-1" for r in requests)
+    assert any(r.method == "DELETE" and r.url.path == f"{prefix}/v1/files/output-1" for r in requests)
+    assert any(r.method == "DELETE" and r.url.path == f"{prefix}/v1/files/input-1" for r in requests)
 
 
 @pytest.mark.parametrize("kind", ["tender", "bid"])
-@pytest.mark.parametrize("status", [401, 403, 429, 500])
-def test_other_legacy_errors_do_not_switch_protocol(tmp_path, kind, status):
+@pytest.mark.parametrize("status", [401, 403, 404, 405, 429, 500])
+def test_v4_submission_errors_fail_without_other_protocol_requests(tmp_path, kind, status):
     path = tmp_path / "document.docx"
     path.write_bytes(b"doc")
-    handler, requests = _v4_handler(legacy_status=status)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status)
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         parser = _parser(kind, client)
         error = ComplianceExtractionError if kind == "tender" else BidDocumentCleaningError
@@ -242,7 +154,7 @@ def test_other_legacy_errors_do_not_switch_protocol(tmp_path, kind, status):
                 parser.parse(path)
             else:
                 parser.parse(path, output_dir=tmp_path / "out")
-    assert [r.url.path for r in requests] == ["/tasks"]
+    assert [r.url.path for r in requests] == ["/v1/uploads"]
 
 
 @pytest.mark.parametrize("status", ["failed", "canceled", "partial", "unexpected"])
@@ -315,3 +227,28 @@ def test_v4_polling_http_error_is_not_retried(tmp_path):
         with pytest.raises(ComplianceExtractionError, match="HTTP 500"):
             _parser("tender", client).parse(path)
     assert len(polls) == 1
+
+
+@pytest.mark.parametrize("changed_setting", ["model", "url"])
+def test_image_ocr_cache_is_scoped_to_endpoint_and_model(tmp_path, changed_setting):
+    image = tmp_path / "proof.png"
+    image.write_bytes(b"image bytes")
+    cache_dir = tmp_path / "ocr_cache"
+    first_handler, _ = _v4_handler()
+    with httpx.Client(transport=httpx.MockTransport(first_handler)) as client:
+        first = _parser("bid", client)._ocr_one_image({}, image, cache_dir)
+    assert first["status"] == "available" and first["cache_hit"] is False
+
+    prefix = "/new-service" if changed_setting == "url" else ""
+    model = "mineru4-new" if changed_setting == "model" else "mineru4"
+    handler, requests = _v4_handler(prefix=prefix, model=model)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        parser = MinerUBidDocumentParser(
+            f"https://mineru.example{prefix}", mineru_api_key="test-key",
+            mineru_gpustack_model=model, http_client=client, poll_interval_seconds=0,
+        )
+        refreshed = parser._ocr_one_image({}, image, cache_dir)
+        cached = parser._ocr_one_image({}, image, cache_dir)
+    assert refreshed["cache_hit"] is False
+    assert cached["cache_hit"] is True
+    assert [r.method for r in requests].count("PUT") == 1
