@@ -8,8 +8,19 @@ import zipfile
 import httpx
 import pytest
 
-from app.bid_document import BidDocumentCleaningError, MinerUBidDocumentParser
-from app.compliance_extraction import ComplianceExtractionError, MinerUDocumentParser
+from app.bid_document import (
+    BidDocumentCleaningError,
+    MinerUBidDocumentParser,
+    flatten_mineru_content_list,
+    structure_content_list,
+)
+from app.compliance_extraction import (
+    ComplianceExtractionError,
+    MinerUDocumentParser,
+    _blocks_from_mineru_payload,
+    _template_fields,
+)
+from app.template_placeholder_residual import _block_text
 
 
 def _archive(*, ocr=False, middle=True):
@@ -176,10 +187,106 @@ def test_v4_reused_upload_does_not_delete_existing_input(tmp_path):
     handler, requests = _v4_handler(reused=True, middle=False)
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         blocks = _parser("tender", client).parse(path)
-    assert blocks[2].text.startswith("| 字段")
+    assert blocks[2].text.startswith("<table>")
     assert blocks[2].metadata["table_caption"] == ["项目表"]
     assert not any(r.method == "PUT" or r.url.path.endswith("/complete") for r in requests)
     assert not any(r.method == "DELETE" and "input-" in r.url.path for r in requests)
+
+
+def _table_archive(body, *, middle_body=None, middle_bbox=None):
+    bbox = [1, 2, 30, 40]
+    raw = json.dumps({"pages": [{"page_idx": 2, "blocks": [{
+        "type": "table", "bbox": bbox, "content": body,
+        "captions": [{"content": "项目表"}],
+    }]}]}, ensure_ascii=False).encode()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("results/structured_content.json", raw)
+        if middle_body is not None:
+            archive.writestr("results/middle_json.json", json.dumps({"pages": [{
+                "page_idx": 2, "blocks": [{
+                    "type": "table", "bbox": bbox if middle_bbox is None else middle_bbox,
+                    "content": [{"type": "table_body", "content": middle_body}],
+                }],
+            }]}, ensure_ascii=False))
+    return buffer.getvalue(), raw
+
+
+@pytest.mark.parametrize("kind", ["tender", "bid"])
+def test_markdown_table_preserves_rows_fields_and_placeholders(kind):
+    body = (
+        "| 序号 | 关键元器件名称 | 关键元器件型号 | 生产厂商 | 备注 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 1 | CPU | ____ | | |\n"
+        "| 2 | GPU | | | |"
+    )
+    archive, raw = _table_archive(body)
+    if kind == "tender":
+        items = MinerUDocumentParser._content_list_from_zip(archive)
+    else:
+        items, source, member, _ = MinerUBidDocumentParser._content_list_from_zip(archive)
+        assert source == raw
+        assert member == "results/structured_content.json"
+        items = flatten_mineru_content_list(items)
+    blocks = _blocks_from_mineru_payload(items)
+    assert _template_fields(blocks) == ["关键元器件型号", "生产厂商", "备注"]
+    document = structure_content_list(items, source_filename="document.pdf")
+    table = document["tables"][0]
+    assert table["rows"] == [
+        ["序号", "关键元器件名称", "关键元器件型号", "生产厂商", "备注"],
+        ["1", "CPU", "____", "", ""],
+        ["2", "GPU", "", "", ""],
+    ]
+    assert "____" in _block_text({"type": "table", "rows": table["rows"]})
+    assert items[0]["mineru_structured_block"]["content"] == body
+    assert items[0]["table_caption"] == ["项目表"]
+    assert table["page_idx"] == 2
+    assert table["bbox"] == [1, 2, 30, 40]
+
+
+@pytest.mark.parametrize("body", [
+    "| 字段 | 值 |\n| :--- | ---: |\n| A \\| B | $x$ &amp; 2 |",
+    "字段 | 值\n--- | ---\nA \\| B | $x$ &amp; 2",
+])
+def test_markdown_table_handles_escaped_pipes_and_entities(body):
+    archive, _ = _table_archive(body)
+    items, _, _, _ = MinerUBidDocumentParser._content_list_from_zip(archive)
+    document = structure_content_list(flatten_mineru_content_list(items), source_filename="document.pdf")
+    assert document["tables"][0]["rows"] == [["字段", "值"], ["A | B", "$x$ & 2"]]
+
+
+@pytest.mark.parametrize("middle_body,middle_bbox,expected", [
+    ('<table><tr><td rowspan="2">原始 HTML</td></tr></table>', None, "html"),
+    ("| 名称 |\n| --- |\n| middle Markdown |", None, "structured"),
+    ("", None, "structured"),
+    ("<table><tr><td>其他表格</td></tr></table>", [5, 6, 7, 8], "structured"),
+])
+def test_markdown_table_uses_only_matching_middle_html(middle_body, middle_bbox, expected):
+    body = "| 名称 |\n| --- |\n| structured 内容 |"
+    archive, _ = _table_archive(body, middle_body=middle_body, middle_bbox=middle_bbox)
+    items, _, _, _ = MinerUBidDocumentParser._content_list_from_zip(archive)
+    if expected == "html":
+        assert items[0]["table_body"] == middle_body
+    else:
+        document = structure_content_list(flatten_mineru_content_list(items), source_filename="document.pdf")
+        assert document["tables"][0]["rows"] == [["名称"], ["structured 内容"]]
+
+
+def test_structured_html_table_is_not_overwritten_by_middle():
+    body = '<table><tr><td colspan="2">原始表格</td></tr></table>'
+    archive, raw = _table_archive(body, middle_body="<table><tr><td>其他内容</td></tr></table>")
+    items, source, _, _ = MinerUBidDocumentParser._content_list_from_zip(archive)
+    assert items[0]["table_body"] == body
+    assert source == raw
+
+
+@pytest.mark.parametrize("kind", ["tender", "bid"])
+def test_invalid_nonempty_table_fails_explicitly(kind):
+    archive, _ = _table_archive("无法识别的表格正文")
+    parser = MinerUDocumentParser if kind == "tender" else MinerUBidDocumentParser
+    error = ComplianceExtractionError if kind == "tender" else BidDocumentCleaningError
+    with pytest.raises(error, match="表格.*Markdown"):
+        parser._content_list_from_zip(archive)
 
 
 def test_structured_zip_rejects_multiple_documents():

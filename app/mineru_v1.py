@@ -6,16 +6,20 @@ import copy
 import hashlib
 import json
 import mimetypes
+import re
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
+from markdown_it import MarkdownIt
 
 MINERU_V1_PROTOCOL_LABEL = "mineru_v1"
-MINERU_V1_PROTOCOL_VERSION = "mineru-api-v2"
+MINERU_V1_PROTOCOL_VERSION = "mineru-api-v3"
 DEFAULT_GPUSTACK_MODEL = "mineru4"
+_TABLE_MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
+_HTML_TABLE_START = re.compile(r"\s*<table(?:\s|>)", re.IGNORECASE)
 
 
 def mineru_headers(api_key: str | None, gpustack_model: str | None) -> dict[str, str]:
@@ -172,6 +176,25 @@ def run_v1_task(
                     pass
 
 
+def _normalize_table_body(
+    body: str,
+    *,
+    page_idx: int,
+    block_index: int,
+    error_type: type[RuntimeError],
+) -> str:
+    if not body.strip() or _HTML_TABLE_START.match(body):
+        return body
+    tokens = _TABLE_MARKDOWN.parse(body)
+    # Reject surrounding prose or multiple tables rather than silently treating
+    # a non-table block as a successfully parsed table.
+    if [token.type for token in tokens if token.level == 0] != ["table_open", "table_close"]:
+        raise error_type(
+            f"MinerU 第 {page_idx} 页第 {block_index} 个表格既不是 HTML，也不是有效 Markdown 表格。"
+        )
+    return _TABLE_MARKDOWN.renderer.render(tokens, _TABLE_MARKDOWN.options, {}).strip()
+
+
 def read_structured_archive(
     archive: zipfile.ZipFile,
     safe_members: list[zipfile.ZipInfo],
@@ -241,18 +264,27 @@ def read_structured_archive(
                 detail.get("content")
                 if isinstance(detail, dict) and detail.get("type") == raw_type else None
             )
+            if raw_type == "table" and (
+                not isinstance(detail, dict) or detail.get("bbox") != block.get("bbox")
+            ):
+                detail_content = None
             if detail_content is not None:
                 item["mineru_nested_content"] = styles(detail_content)
             if raw_type == "table":
-                item["table_body"] = text(content)
-                if isinstance(detail_content, list):
+                table_body = text(content)
+                if not _HTML_TABLE_START.match(table_body) and isinstance(detail_content, list):
                     body = next(
-                        (span for span in detail_content
-                         if isinstance(span, dict) and span.get("type") == "table_body"),
+                        (text(span) for span in detail_content
+                         if isinstance(span, dict) and span.get("type") == "table_body"
+                         and _HTML_TABLE_START.match(text(span))),
                         None,
                     )
                     if body is not None:
-                        item["table_body"] = text(body)
+                        table_body = body
+                item["table_body"] = _normalize_table_body(
+                    table_body, page_idx=page_idx, block_index=block_index,
+                    error_type=error_type,
+                )
                 item["table_caption"] = [text(v) for v in block.get("captions", [])]
                 item["table_footnote"] = [text(v) for v in block.get("footnotes", [])]
             elif raw_type in {"image", "chart", "figure"}:
