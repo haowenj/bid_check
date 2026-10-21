@@ -47,12 +47,14 @@ from app.evaluation_rule_extraction import (
 )
 from app.evaluation_summary import load_evaluation_summary
 from app.models import BidCheckTask, FileMetadata
+from app.mineru_settings import MinerUSettingsRepository
 from app.objective_scoring import (
     load_reusable_bid_evidence,
     load_reusable_tender_evidence,
     run_objective_scoring,
 )
 from app.repository import BidCheckRepository
+from app.settings_routes import router as settings_router
 from app.subjective_scoring import (
     DeterministicSubjectiveScoreLLM,
     OpenAICompatibleSubjectiveScoreLLM,
@@ -520,27 +522,40 @@ def build_default_workflow(
     *,
     document_parser: DocumentParser | None = None,
     bid_document_parser: MinerUBidDocumentParser | None = None,
+    mineru_settings: MinerUSettingsRepository | None = None,
 ) -> BidCheckWorkflow:
     configure_llm_concurrency(settings.llm_max_concurrency)
-    parser = document_parser or MinerUDocumentParser(
-        settings.mineru_url,
-        mineru_api_key=settings.mineru_api_key,
-        mineru_gpustack_model=settings.mineru_gpustack_model,
-        timeout_seconds=settings.mineru_timeout_seconds,
-        poll_interval_seconds=settings.mineru_poll_interval_seconds,
-    )
+    connections = mineru_settings or MinerUSettingsRepository(repository.database_path, settings)
+
+    def current_document_parser() -> DocumentParser:
+        if document_parser is not None:
+            return document_parser
+        connection = connections.get()
+        return MinerUDocumentParser(
+            connection.url or None,
+            mineru_api_key=connection.api_key,
+            mineru_gpustack_model=connection.gpustack_model,
+            timeout_seconds=settings.mineru_timeout_seconds,
+            poll_interval_seconds=settings.mineru_poll_interval_seconds,
+        )
+
+    def current_bid_parser() -> MinerUBidDocumentParser:
+        if bid_document_parser is not None:
+            return bid_document_parser
+        connection = connections.get()
+        return MinerUBidDocumentParser(
+            connection.url or None,
+            mineru_api_key=connection.api_key,
+            mineru_gpustack_model=connection.gpustack_model,
+            timeout_seconds=settings.mineru_timeout_seconds,
+            poll_interval_seconds=settings.mineru_poll_interval_seconds,
+        )
+
     cache = JsonRequirementCache(settings.data_dir / "compliance_cache")
     evaluation_cache = JsonRequirementCache(
         settings.data_dir / "evaluation_rule_cache"
     )
     parser_cache = JsonDocumentCache(settings.data_dir / "mineru_cache")
-    bid_parser = bid_document_parser or MinerUBidDocumentParser(
-        settings.mineru_url,
-        mineru_api_key=settings.mineru_api_key,
-        mineru_gpustack_model=settings.mineru_gpustack_model,
-        timeout_seconds=settings.mineru_timeout_seconds,
-        poll_interval_seconds=settings.mineru_poll_interval_seconds,
-    )
     if settings.llm_api_key:
         llm = OpenAICompatibleLLM(
             api_key=settings.llm_api_key,
@@ -595,7 +610,7 @@ def build_default_workflow(
     ):
         return extract_tender_compliance_objects(
             file_metadata,
-            parser=parser,
+            parser=current_document_parser(),
             llm=llm,
             cache=cache,
             parser_cache=parser_cache,
@@ -609,7 +624,7 @@ def build_default_workflow(
     ):
         return extract_tender_compliance_objects(
             file_metadata,
-            parser=parser,
+            parser=current_document_parser(),
             llm=llm,
             cache=None,
             parser_cache=parser_cache,
@@ -623,7 +638,7 @@ def build_default_workflow(
     ):
         return extract_tender_evaluation_rules(
             file_metadata,
-            parser=parser,
+            parser=current_document_parser(),
             llm=evaluation_llm,
             cache=evaluation_cache,
             parser_cache=parser_cache,
@@ -637,7 +652,7 @@ def build_default_workflow(
     ):
         return extract_tender_evaluation_rules(
             file_metadata,
-            parser=parser,
+            parser=current_document_parser(),
             llm=evaluation_llm,
             cache=None,
             parser_cache=parser_cache,
@@ -659,7 +674,7 @@ def build_default_workflow(
             bid_path = Path(bid_file.storage_path).expanduser().resolve()
             clean_bid_document(
                 bid_file,
-                parser=bid_parser,
+                parser=current_bid_parser(),
                 output_dir=bid_path.parent / "bid_document_cleaning",
             )
             evidence = load_reusable_bid_evidence(bid_file)
@@ -707,7 +722,7 @@ def build_default_workflow(
             bid_path = Path(bid_file.storage_path).expanduser().resolve()
             clean_bid_document(
                 bid_file,
-                parser=bid_parser,
+                parser=current_bid_parser(),
                 output_dir=bid_path.parent / "bid_document_cleaning",
             )
             evidence = load_reusable_bid_evidence(bid_file)
@@ -725,12 +740,12 @@ def build_default_workflow(
             recorder=recorder,
         )
 
+    def parse_bid(file_metadata: FileMetadata):
+        return clean_bid_document(file_metadata, parser=current_bid_parser())
+
     services = BidCheckServices(
         extract=extract_requirements,
-        parse=partial(
-            clean_bid_document,
-            parser=bid_parser,
-        ),
+        parse=parse_bid,
         review=partial(
             run_compliance_review_with_attachments,
             template_review_llm=template_review_llm,
@@ -762,9 +777,11 @@ def create_app(
 ) -> FastAPI:
     active_settings = settings or load_settings()
     active_repository = repository or BidCheckRepository(active_settings.database_path)
+    active_mineru_settings = MinerUSettingsRepository(active_repository.database_path, active_settings)
     active_workflow = workflow or build_default_workflow(
         active_settings,
         active_repository,
+        mineru_settings=active_mineru_settings,
     )
 
     @asynccontextmanager
@@ -774,6 +791,7 @@ def create_app(
 
     application = FastAPI(title="标书检查", lifespan=lifespan)
     application.state.settings = active_settings
+    application.state.mineru_settings = active_mineru_settings
     application.state.repository = active_repository
     application.state.workflow = active_workflow
     app_dir = Path(__file__).resolve().parent
@@ -783,6 +801,7 @@ def create_app(
         name="static",
     )
     templates = Jinja2Templates(directory=str(app_dir / "templates"))
+    application.include_router(settings_router)
 
     @application.get("/")
     def root():

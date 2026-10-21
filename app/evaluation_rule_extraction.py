@@ -1326,7 +1326,9 @@ def _evaluation_component_descriptor(component: Any) -> str:
     }
     custom = getattr(component, "cache_descriptor", None)
     if callable(custom):
-        descriptor["custom"] = custom()
+        custom = custom()
+    if custom is not None:
+        descriptor["custom"] = custom
     return json.dumps(descriptor, ensure_ascii=False, sort_keys=True)
 
 

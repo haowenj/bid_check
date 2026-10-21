@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}设置 · 标书检查{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div><h1>设置</h1><p>保存后用于后续解析，无需重启，服务重启后仍然有效。</p></div>
+    <a class="button" href="/bid-check">返回首页</a>
+  </div>
+  {% if error %}<p class="settings-feedback failure" role="alert">{{ error }}</p>{% endif %}
+  {% if request.query_params.get('saved') == '1' %}<p class="settings-feedback success" role="status">MinerU 设置已保存。</p>{% endif %}
+  {% if request.query_params.get('reset') == '1' %}<p class="settings-feedback success" role="status">已恢复环境配置。</p>{% endif %}
+  <section class="card section-card settings-card" aria-labelledby="mineru-title">
+    <div class="section-heading">
+      <h2 id="mineru-title">MinerU</h2>
+      <span class="version-badge">{{ '使用手动配置' if mineru.is_overridden else '使用环境配置' }}</span>
+    </div>
+    <form id="mineru-form" action="/settings/mineru" method="post">
+      <div class="settings-field">
+        <label for="gpustack-base-url">GPUStack 地址</label>
+        <input id="gpustack-base-url" value="{{ gpustack_base_url }}" readonly>
+        <p>读取 LLM_BASE_URL；探测需要 GPUStack 管理员权限。{{ '已配置' if gpustack_key_ready else '未配置' }} LLM_API_KEY。</p>
+      </div>
+      <div class="settings-field">
+        <label for="gpustack-model">MinerU 模型 / 路由名称</label>
+        <div class="settings-input-action">
+          <input id="gpustack-model" name="gpustack_model" value="{{ mineru.gpustack_model }}">
+          <button class="button" id="probe-mineru" type="button">探测实例</button>
+        </div>
+        <p>查询运行中实例的实际 IP 和端口；部署变动后，可重新探测并保存。</p>
+      </div>
+      <div class="settings-field">
+        <label for="mineru-url">MinerU 服务地址</label>
+        <div class="settings-input-action">
+          <input id="mineru-url" name="url" type="url" value="{{ mineru.url }}" placeholder="http://10.0.0.8:40005" required>
+          <button class="button" id="test-mineru" type="button">测试连接</button>
+        </div>
+        <p>探测和测试不会自动保存，也可手动填写服务地址。</p>
+      </div>
+      <div class="settings-field">
+        <label for="mineru-key">MinerU API Key</label>
+        <input id="mineru-key" name="api_key" type="password" autocomplete="new-password" placeholder="{{ '已配置，留空保持不变' if mineru.has_api_key else '可选，留空使用环境配置' }}">
+        <p>直连 MinerU 时使用，默认读取 MINERU_API_KEY。实例探测单独使用 LLM_API_KEY。</p>
+      </div>
+      <p id="mineru-feedback" class="settings-feedback" role="status" aria-live="polite" hidden></p>
+      <button class="button primary" type="submit">保存设置</button>
+    </form>
+    <form action="/settings/mineru/reset" method="post" class="settings-reset">
+      <button class="button" type="submit">恢复环境配置</button>
+      <p>清除页面保存的设置，重新使用 MINERU_* 环境配置。</p>
+    </form>
+  </section>
+{% endblock %}
+{% block scripts %}
+  <script src="{{ url_for('static', path='settings.js') }}" defer></script>
+{% endblock %}

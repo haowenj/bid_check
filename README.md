@@ -54,6 +54,10 @@ MinerU 使用项目既有服务配置：
 
 - `COMPLIANCE_MAX_BATCHES`：候选批次数，范围 1–10，默认 8。
 
+页面右上角“设置”（`/settings`）可修改 MinerU 服务地址、模型或路由名称及 API Key。“探测实例”使用现有 `LLM_BASE_URL` 和 `LLM_API_KEY` 查询 GPUStack 的运行中实例，按模型/实例名称或路由目标查找真实 IP 和端口；需要 GPUStack 管理员 API Key。部署端口变化后可重新探测。若 LLM 服务不是 GPUStack 或无管理员权限，可手动填写 MinerU 地址。
+
+“测试连接”检查当前表单地址下的 `/v1/health`。探测和测试只处理草稿，只有“保存设置”才将配置写入当前 SQLite 数据库；保存后后续解析立即采用新配置，无需重启。正在执行的解析保留其已读取的连接配置。API Key 留空保留已有密钥；“恢复环境配置”清除页面覆盖值。直连 MinerU 使用独立的 `MINERU_API_KEY`，探测使用 `LLM_API_KEY`。
+
 MinerU 仅支持 4.x，服务地址填写 API 基地址（例如 `http://127.0.0.1:7100`）；自定义反向代理路径前缀会完整保留。上传内容固定使用该地址下的 `/v1/uploads/{upload_id}/content`，不使用响应中返回的上传主机或路径。所有请求共用配置的 Bearer Key 和 GPUStack 模型请求头，`MINERU_API_KEY` 独立于 LLM Key 配置。
 
 文档解析使用 `standard` tier 和 `ocr_mode=auto`；图片 OCR 使用 `ocr_mode=ocr`。解析失败直接报错，状态查询连接中断时，在超时范围内继续轮询同一个任务。单文件任务必须完整成功，`partial`、`failed`、`canceled` 都明确失败。
